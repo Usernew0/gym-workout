@@ -1,0 +1,6 @@
+{
+  "name": "Our Home 💕",
+  "description": "A beautiful private hub for couples to celebrate milestones like birthdays, engagements, and anniversaries, complete with high-fidelity heart animations, a memories album, and an interactive dating planner.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,303 @@
+{
+  "entities": {
+    "UserPresence": {
+      "title": "UserPresence",
+      "description": "Online/offline presence, last active, and typing indicators",
+      "type": "object",
+      "properties": {
+        "username": { "type": "string", "maxLength": 100 },
+        "isOnline": { "type": "boolean" },
+        "lastActive": { "type": "string", "maxLength": 64 },
+        "lastReadChatTime": { "type": "number" },
+        "typingIn": { "type": "string" },
+        "typingAt": { "type": "string" },
+        "typingStatus": { "type": "boolean" }
+      },
+      "required": ["username", "lastActive"]
+    },
+    "TypingStatus": {
+      "title": "TypingStatus",
+      "description": "Real-time typing indicator for chat",
+      "type": "object",
+      "properties": {
+        "username": { "type": "string", "maxLength": 100 },
+        "isTyping": { "type": "boolean" },
+        "timestamp": { "type": "number" }
+      },
+      "required": ["username", "isTyping"]
+    },
+    "RealtimeNotification": {
+      "title": "RealtimeNotification",
+      "description": "Real-time instant signals and notifications",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "type": { "type": "string", "maxLength": 64 },
+        "sender": { "type": "string", "maxLength": 100 },
+        "timestamp": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "type", "sender"]
+    },
+    "ChatGroup": {
+      "title": "ChatGroup",
+      "description": "Group chat rooms",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 200 },
+        "createdBy": { "type": "string", "maxLength": 100 },
+        "createdAt": { "type": "string", "maxLength": 64 },
+        "members": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["id", "name", "createdBy", "members"]
+    },
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "description": "Real-time chat messages between partners",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "couple_id": { "type": "string", "maxLength": 128 },
+        "coupleId": { "type": "string", "maxLength": 128 },
+        "sender": { "type": "string", "maxLength": 100 },
+        "content": { "type": "string", "maxLength": 10000 },
+        "timestamp": { "type": "string", "maxLength": 64 },
+        "replyTo": { "type": "object" },
+        "reaction": { "type": "string" },
+        "audioUrl": { "type": "string", "maxLength": 5000000 },
+        "audioDuration": { "type": "number" },
+        "imageUrl": { "type": "string", "maxLength": 5000000 },
+        "pinned": { "type": "boolean" },
+        "pinnedAt": { "type": "string" },
+        "pinnedBy": { "type": "string" }
+      },
+      "required": ["id", "sender", "content", "timestamp"]
+    },
+    "Milestone": {
+      "title": "Milestone",
+      "description": "Relationship milestones and anniversary memories",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "coupleId": { "type": "string", "maxLength": 128 },
+        "category": { "type": "string", "maxLength": 64 },
+        "title": { "type": "string", "maxLength": 200 },
+        "date": { "type": "string", "maxLength": 32 },
+        "description": { "type": "string", "maxLength": 2000 },
+        "sweetMessage": { "type": "string", "maxLength": 2000 },
+        "photos": { "type": "array" },
+        "themeColor": { "type": "string", "maxLength": 100 }
+      },
+      "required": ["id", "category", "title", "date", "description", "sweetMessage", "photos", "themeColor"]
+    },
+    "DatePlan": {
+      "title": "DatePlan",
+      "description": "Curated romantic date night itineraries and scheduler",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "coupleId": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 200 },
+        "category": { "type": "string", "maxLength": 64 },
+        "dateTime": { "type": "string", "maxLength": 64 },
+        "location": { "type": "string", "maxLength": 200 },
+        "description": { "type": "string", "maxLength": 2000 },
+        "checklist": { "type": "array" },
+        "status": { "type": "string", "maxLength": 32 }
+      },
+      "required": ["id", "title", "category", "dateTime", "location", "description", "checklist", "status"]
+    },
+    "Memory": {
+      "title": "Memory",
+      "description": "Shared scrapbook photos and multimedia memories",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "coupleId": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 200 },
+        "type": { "type": "string", "enum": ["image", "video"] },
+        "url": { "type": "string", "maxLength": 5000000 },
+        "description": { "type": "string", "maxLength": 1000 },
+        "date": { "type": "string", "maxLength": 32 },
+        "category": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "title", "type", "url", "description", "date", "category"]
+    },
+    "LoveLetter": {
+      "title": "LoveLetter",
+      "description": "Digital love letters and time-capsule messages",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "coupleId": { "type": "string", "maxLength": 128 },
+        "sender": { "type": "string", "maxLength": 100 },
+        "recipient": { "type": "string", "maxLength": 100 },
+        "subject": { "type": "string", "maxLength": 200 },
+        "content": { "type": "string", "maxLength": 10000 },
+        "template": { "type": "string", "maxLength": 32 },
+        "isOpened": { "type": "boolean" },
+        "date": { "type": "string", "maxLength": 32 }
+      },
+      "required": ["id", "sender", "recipient", "subject", "content", "template", "isOpened", "date"]
+    },
+    "CoupleQuestion": {
+      "title": "CoupleQuestion",
+      "description": "Daily couple reflection questions and answers",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "coupleId": { "type": "string", "maxLength": 128 },
+        "text": { "type": "string", "maxLength": 1000 },
+        "category": { "type": "string", "maxLength": 64 },
+        "createdAt": { "type": "string", "maxLength": 64 },
+        "answers": { "type": "array" }
+      },
+      "required": ["id", "text", "category", "createdAt", "answers"]
+    },
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Partner user account profiles and credentials",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "username": { "type": "string", "minLength": 2, "maxLength": 128 },
+        "password": { "type": "string", "minLength": 4, "maxLength": 256 },
+        "gender": { "type": "string", "maxLength": 32 },
+        "coupleId": { "type": "string", "maxLength": 128 },
+        "role": { "type": "string", "maxLength": 32 }
+      },
+      "required": ["id", "username", "password"]
+    },
+    "AdminSetting": {
+      "title": "AdminSetting",
+      "description": "Platform settings and configurations",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 }
+      },
+      "required": ["id"]
+    },
+    "CoupleTenant": {
+      "title": "CoupleTenant",
+      "description": "Couple tenant space configuration",
+      "type": "object",
+      "properties": {
+        "coupleId": { "type": "string", "maxLength": 128 }
+      },
+      "required": ["coupleId"]
+    },
+    "UserActivityLog": {
+      "title": "UserActivityLog",
+      "description": "Security audit trails and activity logs",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "username": { "type": "string", "maxLength": 100 },
+        "action": { "type": "string", "maxLength": 100 },
+        "details": { "type": "string", "maxLength": 1000 },
+        "timestamp": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "username", "action", "details", "timestamp"]
+    },
+    "CelebrationCard": {
+      "title": "CelebrationCard",
+      "description": "Celebration moments and customized cards collection",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "coupleId": { "type": "string", "maxLength": 128 },
+        "type": { "type": "string", "maxLength": 64 },
+        "title": { "type": "string", "maxLength": 200 },
+        "targetDate": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "type", "title", "targetDate"]
+    },
+    "MusicTrack": {
+      "title": "MusicTrack",
+      "description": "Uploaded couple MP3 music tracks and romantic soundtracks",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "coupleId": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "uploadedBy": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 200 },
+        "artist": { "type": "string", "maxLength": 200 },
+        "url": { "type": "string", "maxLength": 10000000 },
+        "duration": { "type": "string", "maxLength": 32 },
+        "category": { "type": "string", "maxLength": 64 },
+        "dedication": { "type": "string", "maxLength": 2000 },
+        "fileName": { "type": "string", "maxLength": 256 },
+        "fileSize": { "type": "string", "maxLength": 64 },
+        "createdAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "title", "url", "createdAt"]
+    }
+  },
+  "firestore": {
+    "presence": {
+      "schema": { "$ref": "#/entities/UserPresence" },
+      "description": "Online/offline presence and last active signals"
+    },
+    "typingStatus": {
+      "schema": { "$ref": "#/entities/TypingStatus" },
+      "description": "Real-time chat typing indicators"
+    },
+    "notifications": {
+      "schema": { "$ref": "#/entities/RealtimeNotification" },
+      "description": "Real-time instant signals and push alerts"
+    },
+    "chatGroups": {
+      "schema": { "$ref": "#/entities/ChatGroup" },
+      "description": "Multi-member chat rooms"
+    },
+    "chatMessages": {
+      "schema": { "$ref": "#/entities/ChatMessage" },
+      "description": "Real-time chat messages between partners"
+    },
+    "milestones": {
+      "schema": { "$ref": "#/entities/Milestone" },
+      "description": "Relationship milestones and timeline records"
+    },
+    "datePlans": {
+      "schema": { "$ref": "#/entities/DatePlan" },
+      "description": "Romantic date night scheduler and ideas"
+    },
+    "memories": {
+      "schema": { "$ref": "#/entities/Memory" },
+      "description": "Shared scrapbook memories and media vault"
+    },
+    "letters": {
+      "schema": { "$ref": "#/entities/LoveLetter" },
+      "description": "Digital love letters and time-capsule messages"
+    },
+    "coupleQuestions": {
+      "schema": { "$ref": "#/entities/CoupleQuestion" },
+      "description": "Daily couple reflection questions and answers"
+    },
+    "userAccounts": {
+      "schema": { "$ref": "#/entities/UserAccount" },
+      "description": "User accounts and profile credentials"
+    },
+    "adminSettings": {
+      "schema": { "$ref": "#/entities/AdminSetting" },
+      "description": "Platform admin settings and subscription tiers"
+    },
+    "coupleTenants": {
+      "schema": { "$ref": "#/entities/CoupleTenant" },
+      "description": "Couple tenant space configuration"
+    },
+    "activityLogs": {
+      "schema": { "$ref": "#/entities/UserActivityLog" },
+      "description": "Security audit trails and activity logs"
+    },
+    "celebrationCards": {
+      "schema": { "$ref": "#/entities/CelebrationCard" },
+      "description": "Celebration moments and customized cards collection"
+    },
+    "musicTracks": {
+      "schema": { "$ref": "#/entities/MusicTrack" },
+      "description": "Uploaded couple MP3 music tracks and romantic soundtracks"
+    }
+  }
+}

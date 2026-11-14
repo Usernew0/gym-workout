@@ -1,0 +1,5 @@
+Place your romantic MP3 music files here:
+- birthdaysong.mp3
+- odamelnas-hamaki.mp3
+
+These will automatically play during the celebration phases!
