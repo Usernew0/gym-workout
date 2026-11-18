@@ -7,6 +7,7 @@ import {
   query,
   orderBy,
   limit,
+  getDoc,
   getDocs,
   getDocFromServer
 } from 'firebase/firestore';
@@ -14,7 +15,8 @@ import { db, isFirestoreOnline } from './firebase';
 import { 
   UserActivityLog, 
   AdminSetting, 
-  UserAccount 
+  UserAccount,
+  WorkoutPlan
 } from '../types';
 
 export enum OperationType {
@@ -81,6 +83,27 @@ export function cleanUndefined<T>(obj: T): T {
   return obj;
 }
 
+// Recursively strips both undefined AND null object properties (essential when writing PostgreSQL/Supabase rows into Firestore where rules expect absent optional fields or string types)
+export function sanitizeForFirestore<T>(obj: T): T {
+  if (obj === null || obj === undefined) return undefined as unknown as T;
+  if (Array.isArray(obj)) {
+    return obj
+      .filter(item => item !== undefined && item !== null)
+      .map(item => sanitizeForFirestore(item)) as unknown as T;
+  }
+  if (typeof obj === 'object') {
+    const cleaned = {} as any;
+    Object.keys(obj as any).forEach(key => {
+      const val = (obj as any)[key];
+      if (val !== undefined && val !== null) {
+        cleaned[key] = sanitizeForFirestore(val);
+      }
+    });
+    return cleaned;
+  }
+  return obj;
+}
+
 // ==========================================
 // REAL-TIME FIRESTORE ACTIVITY LOGS
 // ==========================================
@@ -101,10 +124,26 @@ export function subscribeToFirestoreActivityLogs(callback: (data: UserActivityLo
 
 export async function saveActivityLogDoc(log: UserActivityLog) {
   try {
-    await setDoc(doc(db, 'activityLogs', log.id), cleanUndefined(log));
+    const docRef = doc(db, 'activityLogs', log.id);
+    const existing = await getDoc(docRef);
+    if (existing.exists()) {
+      // activityLogs are append-only / immutable in firestore.rules (allow update: if false)
+      return;
+    }
+    await setDoc(docRef, sanitizeForFirestore(log));
   } catch (err) {
     console.warn("Firestore activityLog save error:", err);
   }
+}
+
+export async function saveFirestoreActivityLogDocStrict(log: UserActivityLog): Promise<'created' | 'skipped'> {
+  const docRef = doc(db, 'activityLogs', log.id);
+  const existing = await getDoc(docRef);
+  if (existing.exists()) {
+    return 'skipped';
+  }
+  await setDoc(docRef, sanitizeForFirestore(log));
+  return 'created';
 }
 
 export async function getFirestoreActivityLogs(): Promise<UserActivityLog[]> {
@@ -173,7 +212,15 @@ export async function verifyFirestoreConnection(): Promise<{
   } catch (err: any) {
     const latencyMs = Math.round(performance.now() - start);
     const msg = err?.message || String(err);
-    if (msg.includes('offline') || msg.includes('reach') || msg.includes('respond')) {
+    const code = err?.code || '';
+    if (
+      code === 'unavailable' ||
+      code === 'failed-precondition' ||
+      msg.includes('offline') ||
+      msg.includes('unavailable') ||
+      msg.includes('reach') ||
+      msg.includes('respond')
+    ) {
       return {
         online: false,
         latencyMs,
@@ -181,7 +228,7 @@ export async function verifyFirestoreConnection(): Promise<{
         error: msg
       };
     }
-    // If it's a "doc does not exist" or permission/not found error, Firestore is connected!
+    // If it's a "doc does not exist" or permission/not found error, Firestore server actually responded
     return {
       online: isFirestoreOnline,
       latencyMs,
@@ -208,9 +255,10 @@ export function subscribeToFirestoreUserAccounts(callback: (data: UserAccount[])
 
 export async function saveFirestoreUserAccountDoc(user: UserAccount) {
   try {
-    await setDoc(doc(db, 'userAccounts', user.id), cleanUndefined(user));
+    await setDoc(doc(db, 'userAccounts', user.id), sanitizeForFirestore(user));
   } catch (err) {
     console.warn("Firestore saveUserAccountDoc error:", err);
+    throw err;
   }
 }
 
@@ -219,6 +267,7 @@ export async function deleteFirestoreUserAccountDoc(id: string) {
     await deleteDoc(doc(db, 'userAccounts', id));
   } catch (err) {
     console.warn("Firestore deleteUserAccountDoc error:", err);
+    throw err;
   }
 }
 
@@ -240,9 +289,10 @@ export function subscribeToFirestoreAdminSettings(callback: (data: AdminSetting[
 
 export async function saveFirestoreAdminSettingDoc(setting: AdminSetting) {
   try {
-    await setDoc(doc(db, 'adminSettings', setting.id), cleanUndefined(setting));
+    await setDoc(doc(db, 'adminSettings', setting.id), sanitizeForFirestore(setting));
   } catch (err) {
     console.warn("Firestore saveAdminSettingDoc error:", err);
+    throw err;
   }
 }
 
@@ -255,5 +305,30 @@ export async function getFirestoreUserAccounts(): Promise<UserAccount[]> {
   } catch (err) {
     console.warn("Failed to fetch Firestore userAccounts:", err);
     return [];
+  }
+}
+
+// ==========================================
+// FIRESTORE WORKOUT PLANS
+// ==========================================
+
+export async function getFirestoreWorkoutPlans(): Promise<WorkoutPlan[]> {
+  try {
+    const snapshot = await getDocs(collection(db, 'workoutPlans'));
+    const list: WorkoutPlan[] = [];
+    snapshot.forEach(d => list.push(d.data() as WorkoutPlan));
+    return list;
+  } catch (err) {
+    console.warn("Failed to fetch Firestore workoutPlans:", err);
+    return [];
+  }
+}
+
+export async function saveFirestoreWorkoutPlanDoc(plan: WorkoutPlan) {
+  try {
+    await setDoc(doc(db, 'workoutPlans', plan.id), sanitizeForFirestore(plan));
+  } catch (err) {
+    console.warn("Firestore saveWorkoutPlanDoc error:", err);
+    throw err;
   }
 }

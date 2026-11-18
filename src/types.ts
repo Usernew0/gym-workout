@@ -62,6 +62,11 @@ export interface TelegramConfig {
   chatId: string;
   enabled: boolean;
   notifySecurity: boolean;
+  notifyMilestones?: boolean;
+  notifyDates?: boolean;
+  notifyLetters?: boolean;
+  notifyChat?: boolean;
+  notifyCards?: boolean;
   lastTestedAt?: string;
   whitelistedUsernames?: string[]; // e.g. ['@ebrahimayman', '@mariem']
   authorizedUsers?: TelegramAuthorizedUser[]; // Multi-user confirmed access registry
@@ -71,6 +76,33 @@ export interface TelegramConfig {
   webhookEnabled?: boolean;
   webhookLastCheckedAt?: string;
   webhookStatusMessage?: string;
+}
+
+export interface TelegramDiagnosticReport {
+  success: boolean;
+  latencyMs: number;
+  error?: string;
+  checks: {
+    tokenProvided: boolean;
+    apiReachable: boolean;
+    botAuthenticated: boolean;
+    webhookHealthy: boolean;
+  };
+  bot?: {
+    id: number | string;
+    username: string;
+    firstName: string;
+    canJoinGroups?: boolean;
+  };
+  webhook?: {
+    url?: string;
+    pendingUpdateCount?: number;
+    lastErrorMessage?: string;
+  };
+  testMessageSent: boolean;
+  testMessageDelivered: boolean;
+  testMessageError?: string;
+  rawTelegramResponse?: any;
 }
 
 export const DEFAULT_TELEGRAM_CONFIG: TelegramConfig = {

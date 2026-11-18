@@ -21,7 +21,10 @@ import {
   getFirestoreUserAccounts,
   saveFirestoreUserAccountDoc,
   saveFirestoreAdminSettingDoc,
-  saveActivityLogDoc
+  saveFirestoreActivityLogDocStrict,
+  getFirestoreWorkoutPlans,
+  saveFirestoreWorkoutPlanDoc,
+  sanitizeForFirestore
 } from './firebaseService';
 import {
   verifySupabaseConnection,
@@ -36,7 +39,8 @@ import { isSupabaseConfigured, supabase } from './supabase';
 import {
   UserAccount,
   AdminSetting,
-  UserActivityLog
+  UserActivityLog,
+  WorkoutPlan
 } from '../types';
 
 export interface DatabaseConnectionStatus {
@@ -243,6 +247,7 @@ export async function migrateAndDeduplicateFirestoreToSupabase(): Promise<Migrat
 export type SyncTableKey =
   | 'user_accounts'
   | 'admin_settings'
+  | 'workout_plans'
   | 'activity_logs';
 
 export interface TableSyncMeta {
@@ -256,6 +261,7 @@ export interface TableSyncMeta {
 export const SYNC_TABLES_LIST: TableSyncMeta[] = [
   { key: 'user_accounts', label: 'User Accounts', supabaseTable: 'user_accounts', firestoreCollection: 'userAccounts', description: 'Registered account credentials and profiles' },
   { key: 'admin_settings', label: 'Admin Settings', supabaseTable: 'admin_settings', firestoreCollection: 'adminSettings', description: 'Admin panel configs and access permissions' },
+  { key: 'workout_plans', label: 'Workout Plans', supabaseTable: 'workout_plans', firestoreCollection: 'workoutPlans', description: 'Gym workout sheets, exercises, and progress tracking' },
   { key: 'activity_logs', label: 'Activity Logs', supabaseTable: 'activity_logs', firestoreCollection: 'activityLogs', description: 'System audit logs and user activity tracking' },
 ];
 
@@ -289,8 +295,12 @@ export async function syncSingleTableFirestoreToSupabase(tableKey: SyncTableKey)
         for (const u of fs) {
           const dbPayload = mapToDb(u);
           const res = await safeUpsert('user_accounts', dbPayload, 'id');
-          if (res.success) result.syncedCount++;
-          else result.errors.push(`user_account (${u.id}): ${res.error}`);
+          if (res.success) {
+            result.syncedCount++;
+            await safeUpsert('profiles', { id: u.id, username: u.username, display_name: u.username }, 'id');
+          } else {
+            result.errors.push(`user_account (${u.id}): ${res.error}`);
+          }
         }
         break;
       }
@@ -302,6 +312,17 @@ export async function syncSingleTableFirestoreToSupabase(tableKey: SyncTableKey)
           const res = await safeUpsert('admin_settings', dbPayload, 'id');
           if (res.success) result.syncedCount++;
           else result.errors.push(`admin_setting (${s.id}): ${res.error}`);
+        }
+        break;
+      }
+      case 'workout_plans': {
+        const plans = await getFirestoreWorkoutPlans();
+        result.processedCount = plans.length;
+        for (const p of plans) {
+          const dbPayload = mapToDb(p);
+          const res = await safeUpsert('workout_plans', dbPayload, 'id');
+          if (res.success) result.syncedCount++;
+          else result.errors.push(`workout_plan (${p.id}): ${res.error}`);
         }
         break;
       }
@@ -358,29 +379,54 @@ export async function syncSingleTableSupabaseToFirestore(tableKey: SyncTableKey)
 
     switch (tableKey) {
       case 'user_accounts': {
-        const items = data.map(row => mapFromDb<UserAccount>(row));
+        const items = data.map(row => sanitizeForFirestore(mapFromDb<UserAccount>(row)));
 
         for (const item of items) {
-          await saveFirestoreUserAccountDoc(item);
-          result.syncedCount++;
+          try {
+            await saveFirestoreUserAccountDoc(item);
+            result.syncedCount++;
+          } catch (err: any) {
+            result.errors.push(`user_account (${item.id}): ${err?.message || String(err)}`);
+          }
         }
         break;
       }
       case 'admin_settings': {
-        const items = data.map(row => mapFromDb<AdminSetting>(row));
+        const items = data.map(row => sanitizeForFirestore(mapFromDb<AdminSetting>(row)));
 
         for (const item of items) {
-          await saveFirestoreAdminSettingDoc(item);
-          result.syncedCount++;
+          try {
+            await saveFirestoreAdminSettingDoc(item);
+            result.syncedCount++;
+          } catch (err: any) {
+            result.errors.push(`admin_setting (${item.id}): ${err?.message || String(err)}`);
+          }
+        }
+        break;
+      }
+      case 'workout_plans': {
+        const items = data.map(row => sanitizeForFirestore(mapFromDb<WorkoutPlan>(row)));
+
+        for (const item of items) {
+          try {
+            await saveFirestoreWorkoutPlanDoc(item);
+            result.syncedCount++;
+          } catch (err: any) {
+            result.errors.push(`workout_plan (${item.id}): ${err?.message || String(err)}`);
+          }
         }
         break;
       }
       case 'activity_logs': {
-        const items = data.map(row => mapFromDb<UserActivityLog>(row));
+        const items = data.map(row => sanitizeForFirestore(mapFromDb<UserActivityLog>(row)));
 
         for (const item of items) {
-          await saveActivityLogDoc(item);
-          result.syncedCount++;
+          try {
+            await saveFirestoreActivityLogDocStrict(item);
+            result.syncedCount++;
+          } catch (err: any) {
+            result.errors.push(`activity_log (${item.id}): ${err?.message || String(err)}`);
+          }
         }
         break;
       }

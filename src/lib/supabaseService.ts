@@ -8,13 +8,17 @@ import {
 import { 
   subscribeToFirestoreActivityLogs, 
   saveActivityLogDoc,
+  getFirestoreActivityLogs,
   subscribeToFirestoreUserAccounts,
   saveFirestoreUserAccountDoc,
   deleteFirestoreUserAccountDoc,
   getFirestoreUserAccounts,
   subscribeToFirestoreAdminSettings,
   saveFirestoreAdminSettingDoc,
-  getFirestoreAdminSettings
+  getFirestoreAdminSettings,
+  getFirestoreWorkoutPlans,
+  verifyFirestoreConnection,
+  sanitizeForFirestore
 } from './firebaseService';
 
 // Helper to convert snake_case Supabase DB record to camelCase TS object
@@ -123,7 +127,8 @@ export async function checkSupabaseTablesStatus(): Promise<{
     { tableName: 'user_accounts', displayName: 'User Accounts' },
     { tableName: 'profiles', displayName: 'User Profiles' },
     { tableName: 'activity_logs', displayName: 'Activity Logs' },
-    { tableName: 'admin_settings', displayName: 'Admin Settings' }
+    { tableName: 'admin_settings', displayName: 'Admin Settings' },
+    { tableName: 'workout_plans', displayName: 'Workout Plans' }
   ];
 
   if (!isSupabaseConfigured || !supabase) {
@@ -262,15 +267,17 @@ export function subscribeToUserAccounts(callback: (data: UserAccount[]) => void)
 }
 
 export async function saveUserAccountDoc(user: UserAccount) {
-  const savedUser: UserAccount = { ...user };
+  const savedUser: UserAccount = sanitizeForFirestore({ ...user });
+
+  // Persist to Firestore first so failed writes never poison in-memory cache
+  await saveFirestoreUserAccountDoc(savedUser);
+
   const existingIdx = cachedUserAccounts.findIndex(u => u.id === savedUser.id || u.username.toLowerCase() === savedUser.username.toLowerCase());
   const updatedList = existingIdx >= 0
     ? cachedUserAccounts.map((u, i) => (i === existingIdx ? savedUser : u))
     : [...cachedUserAccounts, savedUser];
 
   notifyUserAccountListeners(updatedList);
-
-  await saveFirestoreUserAccountDoc(savedUser);
 
   if (isSupabaseConfigured && supabase) {
     const dbPayload = mapToDb(savedUser);
@@ -290,11 +297,10 @@ export async function saveUserAccountDoc(user: UserAccount) {
 }
 
 export async function deleteUserAccountDoc(id: string) {
-  const updatedList = cachedUserAccounts.filter(u => u.id !== id && u.username.toLowerCase() !== id.toLowerCase());
-
-  notifyUserAccountListeners(updatedList);
-
   await deleteFirestoreUserAccountDoc(id);
+
+  const updatedList = cachedUserAccounts.filter(u => u.id !== id && u.username.toLowerCase() !== id.toLowerCase());
+  notifyUserAccountListeners(updatedList);
 
   if (isSupabaseConfigured && supabase) {
     const { error } = await supabase
@@ -458,30 +464,31 @@ export function subscribeToAdminSettings(callback: (data: AdminSetting[]) => voi
 }
 
 export async function saveAdminSettingDoc(setting: AdminSetting) {
+  const cleanSetting = sanitizeForFirestore(setting);
+
+  // ALWAYS save to Firestore first (source of truth)
+  await saveFirestoreAdminSettingDoc(cleanSetting);
+
   // Reflect the change in the in-memory Firestore cache and notify listeners
-  // immediately, then persist to Firestore (source of truth) and Supabase.
-  const existingIdx = cachedFirestoreAdminSettings.findIndex(s => s.id === setting.id);
+  const existingIdx = cachedFirestoreAdminSettings.findIndex(s => s.id === cleanSetting.id);
   cachedFirestoreAdminSettings = existingIdx >= 0
-    ? cachedFirestoreAdminSettings.map((s, i) => (i === existingIdx ? setting : s))
-    : [...cachedFirestoreAdminSettings, setting];
+    ? cachedFirestoreAdminSettings.map((s, i) => (i === existingIdx ? cleanSetting : s))
+    : [...cachedFirestoreAdminSettings, cleanSetting];
 
   notifyAdminSettingListeners(mergeAdminSettings([cachedSupabaseAdminSettings, cachedFirestoreAdminSettings]));
 
-  // ALWAYS save to Firestore
-  await saveFirestoreAdminSettingDoc(setting);
-
-  // ALWAYS save to Supabase
+  // ALSO mirror to Supabase when configured
   if (isSupabaseConfigured && supabase) {
     try {
-      const dbPayload = mapToDb(setting);
+      const dbPayload = mapToDb(cleanSetting);
       const res = await safeUpsert('admin_settings', dbPayload);
 
       if (!res.success) {
-        if (setting.id === 'adminAccounts' && setting.adminAccounts) {
+        if (cleanSetting.id === 'adminAccounts' && cleanSetting.adminAccounts) {
           const fallbackPayload: any = {
             id: 'adminAccounts',
-            password: JSON.stringify(setting.adminAccounts),
-            visible_tabs: { adminAccounts: setting.adminAccounts }
+            password: JSON.stringify(cleanSetting.adminAccounts),
+            visible_tabs: { adminAccounts: cleanSetting.adminAccounts }
           };
           const fallbackRes = await safeUpsert('admin_settings', fallbackPayload);
           if (!fallbackRes.success) {
@@ -587,9 +594,9 @@ export async function logActivity(username: string, action: string, details: str
   const id = `log_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
   const newLog: UserActivityLog = {
     id,
-    username: username || 'Unknown User',
-    action,
-    details,
+    username: (username || 'Unknown User').slice(0, 100),
+    action: (action || 'event').slice(0, 100),
+    details: (details || '').slice(0, 1000),
     timestamp: new Date().toISOString()
   };
 
@@ -628,17 +635,24 @@ export async function logActivity(username: string, action: string, details: str
 export async function safeUpsert(table: string, payload: any, onConflict: string = 'id'): Promise<{ success: boolean; error?: string }> {
   if (!supabase) return { success: false, error: 'Supabase client not initialized' };
   try {
-    let currentPayload = { ...payload };
+    const currentPayload: any = {};
+    Object.keys(payload || {}).forEach(k => {
+      if (payload[k] !== undefined) {
+        currentPayload[k] = payload[k];
+      }
+    });
 
     // Intelligent retry loop: strips missing schema cache columns or foreign key constraints automatically
-    for (let attempt = 0; attempt < 6; attempt++) {
+    for (let attempt = 0; attempt < 15; attempt++) {
       const { error } = await supabase.from(table).upsert(currentPayload, { onConflict });
       if (!error) return { success: true };
 
       const msg = error.message || String(error);
 
-      // 1. Check if a specific column is missing in Supabase schema cache
-      const colMatch = msg.match(/Could not find the '([^']+)' column/i);
+      // 1. Check if a specific column is missing in Supabase schema cache or Postgres
+      const colMatch =
+        msg.match(/Could not find the '([^']+)' column/i) ||
+        msg.match(/column "([^"]+)" of relation/i);
       if (colMatch && colMatch[1] && colMatch[1] in currentPayload) {
         delete currentPayload[colMatch[1]];
         continue;
@@ -681,53 +695,122 @@ export async function safeUpsert(table: string, payload: any, onConflict: string
 }
 
 export interface SupabaseSyncSummary {
+  mode: 'firestore_and_supabase' | 'firestore_only';
+  firestoreOnline: boolean;
+  supabaseConfigured: boolean;
   userAccountsSynced: number;
   adminSettingsSynced: number;
+  workoutPlansSynced: number;
+  activityLogsSynced: number;
   errors: string[];
 }
 
 /**
- * Explicitly syncs all local & pre-seeded data across all tables to Supabase
+ * Explicitly verifies & syncs all app collections across Firestore and (when configured) Supabase.
  */
-export async function syncAllDataToSupabase(): Promise<SupabaseSyncSummary> {
+export async function syncAllDataToSupabase(seedData?: {
+  userAccounts?: UserAccount[];
+  adminSettings?: AdminSetting[];
+}): Promise<SupabaseSyncSummary> {
   const summary: SupabaseSyncSummary = {
+    mode: isSupabaseConfigured && supabase ? 'firestore_and_supabase' : 'firestore_only',
+    firestoreOnline: false,
+    supabaseConfigured: !!(isSupabaseConfigured && supabase),
     userAccountsSynced: 0,
     adminSettingsSynced: 0,
+    workoutPlansSynced: 0,
+    activityLogsSynced: 0,
     errors: []
   };
 
-  if (!isSupabaseConfigured || !supabase) {
-    summary.errors.push('Supabase is not configured or offline.');
-    return summary;
-  }
-
   try {
-    // 1. User Accounts
-    const users = await getFirestoreUserAccounts();
-    for (const u of users) {
-      const dbPayload = mapToDb(u);
-      const res = await safeUpsert('user_accounts', dbPayload, 'id');
-      if (res.success) summary.userAccountsSynced++;
-      else summary.errors.push(`user_accounts (${u.id}): ${res.error}`);
+    // 1. Verify Firestore connection
+    const fsHealth = await verifyFirestoreConnection();
+    summary.firestoreOnline = fsHealth.online;
+    if (!fsHealth.online) {
+      summary.errors.push(`Firestore: ${fsHealth.error || fsHealth.details}`);
     }
 
-    // 2. Admin Settings
-    const settings = await getFirestoreAdminSettings();
-    for (const s of settings) {
-      let res = await safeUpsert('admin_settings', mapToDb(s));
-      if (!res.success) {
-        if (res.error?.includes('admin_accounts') || s.id === 'adminAccounts') {
-          const fallbackPayload: any = {
-            id: s.id,
-            password: s.adminAccounts ? JSON.stringify(s.adminAccounts) : (s.password || null),
-            username: s.username || null,
-            visible_tabs: s.adminAccounts ? { adminAccounts: s.adminAccounts } : null
-          };
-          res = await safeUpsert('admin_settings', fallbackPayload);
+    // 2. Push any in-memory/seeded user accounts & admin settings to Firestore so both DBs match
+    if (seedData?.userAccounts && seedData.userAccounts.length > 0) {
+      for (const u of seedData.userAccounts) {
+        if (!u?.id || !u?.username) continue;
+        try {
+          await saveFirestoreUserAccountDoc(u);
+        } catch (err: any) {
+          summary.errors.push(`Firestore user (${u.username}): ${err?.message || String(err)}`);
         }
+      }
+    }
+
+    if (seedData?.adminSettings && seedData.adminSettings.length > 0) {
+      for (const s of seedData.adminSettings) {
+        if (!s?.id) continue;
+        try {
+          await saveFirestoreAdminSettingDoc(s);
+        } catch (err: any) {
+          summary.errors.push(`Firestore setting (${s.id}): ${err?.message || String(err)}`);
+        }
+      }
+    }
+
+    // 3. Pull canonical collections from Firestore
+    const [fsUsers, fsSettings, fsWorkouts, fsLogs] = await Promise.all([
+      getFirestoreUserAccounts(),
+      getFirestoreAdminSettings(),
+      getFirestoreWorkoutPlans(),
+      getFirestoreActivityLogs()
+    ]);
+
+    if (!isSupabaseConfigured || !supabase) {
+      // Firestore-only active cloud mode: report verified Firestore collections cleanly without false errors
+      summary.userAccountsSynced = fsUsers.length;
+      summary.adminSettingsSynced = fsSettings.length;
+      summary.workoutPlansSynced = fsWorkouts.length;
+      summary.activityLogsSynced = fsLogs.length;
+      return summary;
+    }
+
+    // 4. Dual-cloud mode: mirror all 4 collections (+ profiles) to Supabase PostgreSQL
+    for (const u of fsUsers) {
+      const res = await safeUpsert('user_accounts', mapToDb(u), 'id');
+      if (res.success) {
+        summary.userAccountsSynced++;
+        await safeUpsert('profiles', {
+          id: u.id,
+          username: u.username,
+          display_name: u.username
+        }, 'id');
+      } else {
+        summary.errors.push(`user_accounts (${u.id}): ${res.error}`);
+      }
+    }
+
+    for (const s of fsSettings) {
+      let res = await safeUpsert('admin_settings', mapToDb(s));
+      if (!res.success && (res.error?.includes('admin_accounts') || s.id === 'adminAccounts')) {
+        const fallbackPayload: any = {
+          id: s.id,
+          password: s.adminAccounts ? JSON.stringify(s.adminAccounts) : (s.password || null),
+          username: s.username || null,
+          visible_tabs: s.adminAccounts ? { adminAccounts: s.adminAccounts } : null
+        };
+        res = await safeUpsert('admin_settings', fallbackPayload);
       }
       if (res.success) summary.adminSettingsSynced++;
       else summary.errors.push(`admin_settings (${s.id}): ${res.error}`);
+    }
+
+    for (const w of fsWorkouts) {
+      const res = await safeUpsert('workout_plans', mapToDb(w), 'id');
+      if (res.success) summary.workoutPlansSynced++;
+      else summary.errors.push(`workout_plans (${w.id}): ${res.error}`);
+    }
+
+    for (const log of fsLogs) {
+      const res = await safeUpsert('activity_logs', mapToDb(log), 'id');
+      if (res.success) summary.activityLogsSynced++;
+      else summary.errors.push(`activity_logs (${log.id}): ${res.error}`);
     }
   } catch (err: any) {
     summary.errors.push(`Global sync error: ${err?.message || String(err)}`);

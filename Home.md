@@ -821,7 +821,19 @@ Expanded and fixed the event trigger architecture to ensure 100% of security eve
    - **Card Created**: Automatically pings the partner when a new card is designed and saved.
    - **Card Celebrated / Opened**: Automatically pings the creator when their partner unlocks and celebrates their card.
 
+---
 
+## 🔄 23. Iron House Database Connection, Push/Put & Admin Sync Hardening
 
-
-
+1. **Strict Firestore Error Propagation & Rule-Safe Sanitization (`src/lib/firebaseService.ts`)**:
+   - `saveFirestoreUserAccountDoc`, `deleteFirestoreUserAccountDoc`, `saveFirestoreAdminSettingDoc`, and `saveFirestoreWorkoutPlanDoc` now rethrow persistence/rule errors rather than swallowing them silently, so Admin Panel sync and CRUD actions accurately display success or failure.
+   - Added `sanitizeForFirestore()` to recursively strip `undefined` and `null` properties (preventing PostgreSQL nullable fields from triggering Firestore `is string` rule rejections).
+   - Added `saveFirestoreActivityLogDocStrict()` checking `getDoc()` before writes on append-only `/activityLogs/{logId}` documents (`allow update: if false`), skipping pre-existing immutable logs cleanly without triggering `PERMISSION_DENIED`.
+   - Added `getFirestoreWorkoutPlans()` and `saveFirestoreWorkoutPlanDoc()` exports and hardened `verifyFirestoreConnection()` offline/unavailable detection.
+2. **Global & Bidirectional Database Sync Engine (`src/lib/supabaseService.ts`, `src/lib/syncService.ts`, `src/lib/gymService.ts`)**:
+   - Updated `syncAllDataToSupabase(seedData?)` to verify Firestore health, push/verify live in-memory `userAccounts` and `adminSettings` to Firestore, read all 4 active collections (`userAccounts`, `adminSettings`, `workoutPlans`, `activityLogs`), report `firestore_only` vs `firestore_and_supabase` mode cleanly without false failure errors when optional Supabase env vars are unset, and mirror all 4 collections (+ `profiles`) when Supabase is configured.
+   - Added `workout_plans` (`workoutPlans`) to `SYNC_TABLES_LIST`, `checkSupabaseTablesStatus()`, single-table/bulk bidirectional sync handlers, `SUPABASE_SCHEMA_FIX_SQL`, and `src/lib/databaseSetup.sql`.
+   - Updated `saveWorkoutPlanDoc` and `deleteWorkoutPlanDoc` in `src/lib/gymService.ts` to sanitize Firestore payloads and optionally mirror changes to `public.workout_plans` when Supabase is configured.
+3. **Admin Panel Sync UI & Telegram Diagnostics (`src/components/AdminPanel.tsx`, `src/types.ts`, `src/lib/telegramService.ts`)**:
+   - Connected `TelegramDiagnosticReport` and `runTelegramBotDiagnostics` into `AdminPanel.tsx` and synced `TelegramConfig` broadcast flags (`notifyMilestones`, `notifyDates`, `notifyLetters`, `notifyChat`, `notifyCards`).
+   - Updated `Sync All Data`, `Fix DB / Auto-Repair`, `Sync User`, `Sync All Users`, and `Sync Admin` buttons and notification banners to display `Users`, `Settings`, `Workouts`, and `Logs` counts and surface exact error feedback.

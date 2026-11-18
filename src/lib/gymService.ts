@@ -6,7 +6,9 @@
 
 import { collection, doc, onSnapshot, setDoc, deleteDoc } from 'firebase/firestore';
 import { db } from './firebase';
-import { cleanUndefined } from './firebaseService';
+import { sanitizeForFirestore } from './firebaseService';
+import { supabase, isSupabaseConfigured } from './supabase';
+import { mapToDb, safeUpsert } from './supabaseService';
 import { WorkoutPlan, WorkoutExercise } from '../types';
 import { ParsedExerciseRow } from './sheetParser';
 
@@ -37,19 +39,35 @@ export function subscribeToWorkoutPlans(callback: (plans: WorkoutPlan[]) => void
 
 export async function saveWorkoutPlanDoc(plan: WorkoutPlan): Promise<void> {
   const now = new Date().toISOString();
-  const stamped: WorkoutPlan = {
+  const stamped: WorkoutPlan = sanitizeForFirestore({
     ...plan,
     createdAt: plan.createdAt || now,
     updatedAt: now,
     weeks: Math.max(1, Number(plan.weeks) || 1),
     exercises: Array.isArray(plan.exercises) ? plan.exercises : [],
-  };
+  });
 
-  await setDoc(doc(db, 'workoutPlans', stamped.id), cleanUndefined(stamped));
+  await setDoc(doc(db, 'workoutPlans', stamped.id), stamped);
+
+  if (isSupabaseConfigured && supabase) {
+    try {
+      await safeUpsert('workout_plans', mapToDb(stamped), 'id');
+    } catch (err) {
+      console.warn('Optional Supabase workout_plans mirror warning:', err);
+    }
+  }
 }
 
 export async function deleteWorkoutPlanDoc(id: string): Promise<void> {
   await deleteDoc(doc(db, 'workoutPlans', id));
+
+  if (isSupabaseConfigured && supabase) {
+    try {
+      await supabase.from('workout_plans').delete().eq('id', id);
+    } catch (err) {
+      console.warn('Optional Supabase workout_plans delete mirror warning:', err);
+    }
+  }
 }
 
 export interface NewWorkoutPlanInput {

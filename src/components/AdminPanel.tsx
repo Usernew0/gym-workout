@@ -16,13 +16,14 @@ import imageCompression from 'browser-image-compression';
 import { 
   UserAccount, AdminSetting, AdminAccount, UserActivityLog,
   TelegramConfig, DEFAULT_TELEGRAM_CONFIG,
-  TelegramAuthorizedUser, TelegramCapturedSender
+  TelegramAuthorizedUser, TelegramCapturedSender, TelegramDiagnosticReport
 } from '../types';
 import { runAutomatedWebsiteTests, FullTestReport, TestCaseResult } from '../utils/autoTester';
 import { 
   getTelegramConfig, 
   saveTelegramConfig as persistTelegramConfig, 
   testTelegramConnection,
+  runTelegramBotDiagnostics,
   setTelegramWebhook,
   getTelegramWebhookInfo,
   deleteTelegramWebhook,
@@ -48,6 +49,7 @@ import { saveUserAccountDoc,
   deleteUserAccountDoc, 
   saveAdminSettingDoc,
   subscribeToActivityLogs,
+  getFirestoreActivityLogs,
   logActivity,
   useDatabaseStatus,
   useSupabaseTableDiagnostics,
@@ -81,14 +83,40 @@ CREATE TABLE IF NOT EXISTS public.user_accounts (
   display_name TEXT,
   gender TEXT,
   role TEXT DEFAULT 'user',
+  visible_tabs JSONB,
+  two_factor_enabled BOOLEAN DEFAULT FALSE,
+  two_factor_secret TEXT,
+  two_factor_backup_codes JSONB DEFAULT '[]'::jsonb,
+  two_factor_created_at TIMESTAMPTZ,
+  telegram_username TEXT,
+  telegram_chat_id TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT FALSE;
+ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS two_factor_secret TEXT;
+ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS two_factor_backup_codes JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS two_factor_created_at TIMESTAMPTZ;
+ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS telegram_username TEXT;
+ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT;
 ALTER TABLE public.user_accounts ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "User accounts access policy" ON public.user_accounts;
 CREATE POLICY "User accounts access policy" ON public.user_accounts FOR ALL USING (true) WITH CHECK (true);
 
--- 8. Activity Logs Table
+-- 2. Profiles Table
+CREATE TABLE IF NOT EXISTS public.profiles (
+  id TEXT PRIMARY KEY,
+  username TEXT UNIQUE NOT NULL,
+  display_name TEXT,
+  avatar_url TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Profiles access policy" ON public.profiles;
+CREATE POLICY "Profiles access policy" ON public.profiles FOR ALL USING (true) WITH CHECK (true);
+
+-- 3. Activity Logs Table
 CREATE TABLE IF NOT EXISTS public.activity_logs (
   id TEXT PRIMARY KEY,
   username TEXT NOT NULL,
@@ -101,23 +129,36 @@ ALTER TABLE public.activity_logs ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Activity logs access policy" ON public.activity_logs;
 CREATE POLICY "Activity logs access policy" ON public.activity_logs FOR ALL USING (true) WITH CHECK (true);
 
--- 9. Admin Settings Table
+-- 4. Admin Settings Table
 CREATE TABLE IF NOT EXISTS public.admin_settings (
   id TEXT PRIMARY KEY,
   password TEXT,
   username TEXT,
   admin_accounts JSONB,
+  visible_tabs JSONB,
   favicon TEXT,
   auto_logout_minutes INT DEFAULT 15,
   auto_logout_enabled BOOLEAN DEFAULT FALSE,
+  login_lockout_seconds INT DEFAULT 60,
+  login_max_attempts INT DEFAULT 5,
+  telegram_config JSONB,
+  two_factor_enabled BOOLEAN DEFAULT FALSE,
+  two_factor_secret TEXT,
+  two_factor_backup_codes JSONB DEFAULT '[]'::jsonb,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS admin_accounts JSONB;
+ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS telegram_config JSONB;
+ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS login_lockout_seconds INT DEFAULT 60;
+ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS login_max_attempts INT DEFAULT 5;
+ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT FALSE;
+ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS two_factor_secret TEXT;
+ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS two_factor_backup_codes JSONB DEFAULT '[]'::jsonb;
 ALTER TABLE public.admin_settings ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Admin settings access policy" ON public.admin_settings;
 CREATE POLICY "Admin settings access policy" ON public.admin_settings FOR ALL USING (true) WITH CHECK (true);
 
--- 10. Workout Plans Table
+-- 5. Workout Plans Table
 CREATE TABLE IF NOT EXISTS public.workout_plans (
   id TEXT PRIMARY KEY,
   owner_username TEXT NOT NULL,
@@ -570,8 +611,19 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   };
 
   // ==========================================
-  // MULTI-USER TELEGRAM CONFIRMATION & ACCESS STATE
+  // UNIFIED TELEGRAM & SECURITY HUB STATE & ACTIONS
   // ==========================================
+  const [telegramHubActiveTab, setTelegramHubActiveTab] = useState<'users' | 'senders' | 'settings'>('users');
+  const [telegramUserSearch, setTelegramUserSearch] = useState('');
+  const [telegramUserFilter, setTelegramUserFilter] = useState<'all' | 'verified' | 'pending' | 'paused'>('all');
+  
+  // Telegram Diagnostics State
+  const [isDiagnosingTelegram, setIsDiagnosingTelegram] = useState(false);
+  const [diagnosticReport, setDiagnosticReport] = useState<TelegramDiagnosticReport | null>(null);
+  const [showDiagnosticModal, setShowDiagnosticModal] = useState(false);
+  const [diagnosticCustomChatId, setDiagnosticCustomChatId] = useState('');
+  const [copyDiagnosticJsonSuccess, setCopyDiagnosticJsonSuccess] = useState(false);
+
   const [newAuthUsername, setNewAuthUsername] = useState('');
   const [newAuthAppUsername, setNewAuthAppUsername] = useState('');
   const [newAuthChatId, setNewAuthChatId] = useState('');
@@ -579,17 +631,163 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   const [testingUserId, setTestingUserId] = useState<string | null>(null);
   const [userActionNotice, setUserActionNotice] = useState<{ [userId: string]: string }>({});
 
+  // Consolidated Telegram Users & Whitelist Directory (No Duplication)
+  const consolidatedTelegramUsers = useMemo(() => {
+    const list: Array<{
+      key: string;
+      telegramUsername: string;
+      id?: string;
+      chatId?: string;
+      appUsername?: string;
+      role: 'partner' | 'admin' | 'guest';
+      confirmed: boolean;
+      confirmedAt?: string;
+      isActive: boolean;
+      source: 'registry' | 'whitelist' | 'profile';
+      profileAccount?: UserAccount;
+    }> = [];
+
+    const processedHandles = new Set<string>();
+
+    // 1. Process authorizedUsers registry
+    (telegramConfig.authorizedUsers || []).forEach(u => {
+      const handleLower = u.telegramUsername.toLowerCase().trim();
+      processedHandles.add(handleLower);
+      const matchedProfile = userAccounts.find(
+        acc => acc.telegramUsername && acc.telegramUsername.toLowerCase().trim().replace(/^@/, '') === handleLower.replace(/^@/, '')
+      ) || (u.appUsername ? userAccounts.find(acc => acc.username.toLowerCase() === u.appUsername!.toLowerCase()) : undefined);
+
+      list.push({
+        key: `auth-${u.id}`,
+        id: u.id,
+        telegramUsername: u.telegramUsername,
+        chatId: u.chatId,
+        appUsername: u.appUsername || matchedProfile?.username,
+        role: u.role || 'partner',
+        confirmed: !!u.confirmed,
+        confirmedAt: u.confirmedAt,
+        isActive: u.isActive !== false,
+        source: matchedProfile ? 'profile' : 'registry',
+        profileAccount: matchedProfile
+      });
+    });
+
+    // 2. Process activeCombinedWhitelist (incorporates manual whitelistedUsernames & profile usernames)
+    activeCombinedWhitelist.forEach(handle => {
+      const handleLower = handle.toLowerCase().trim();
+      if (!processedHandles.has(handleLower)) {
+        processedHandles.add(handleLower);
+        const matchedProfile = userAccounts.find(
+          acc => acc.telegramUsername && acc.telegramUsername.toLowerCase().trim().replace(/^@/, '') === handleLower.replace(/^@/, '')
+        );
+
+        list.push({
+          key: `white-${handleLower}`,
+          telegramUsername: handle,
+          role: 'partner',
+          confirmed: false,
+          isActive: true,
+          source: matchedProfile ? 'profile' : 'whitelist',
+          appUsername: matchedProfile?.username,
+          profileAccount: matchedProfile
+        });
+      }
+    });
+
+    return list;
+  }, [telegramConfig.authorizedUsers, activeCombinedWhitelist, userAccounts]);
+
+  // Filtered Directory for Search & Status
+  const filteredConsolidatedUsers = useMemo(() => {
+    return consolidatedTelegramUsers.filter(u => {
+      // Status filter
+      if (telegramUserFilter === 'verified' && !u.confirmed) return false;
+      if (telegramUserFilter === 'pending' && u.confirmed) return false;
+      if (telegramUserFilter === 'paused' && u.isActive) return false;
+
+      // Text search
+      if (telegramUserSearch.trim()) {
+        const query = telegramUserSearch.toLowerCase().trim();
+        const matchHandle = u.telegramUsername.toLowerCase().includes(query);
+        const matchApp = u.appUsername ? u.appUsername.toLowerCase().includes(query) : false;
+        const matchChat = u.chatId ? u.chatId.includes(query) : false;
+        const matchRole = u.role.toLowerCase().includes(query);
+        if (!matchHandle && !matchApp && !matchChat && !matchRole) return false;
+      }
+
+      return true;
+    });
+  }, [consolidatedTelegramUsers, telegramUserFilter, telegramUserSearch]);
+
+  // Diagnostic Test Runner
+  const handleRunDiagnostics = async (customChat?: string) => {
+    if (!telegramConfig.botToken.trim()) {
+      setTelegramTestStatus({
+        success: false,
+        message: 'Please enter your Telegram Bot Token before running diagnostics.'
+      });
+      return;
+    }
+
+    setIsDiagnosingTelegram(true);
+    setShowDiagnosticModal(true);
+    setDiagnosticReport(null);
+
+    const targetChat = (
+      customChat !== undefined ? customChat : 
+      diagnosticCustomChatId || 
+      telegramConfig.chatId || 
+      (telegramConfig.authorizedUsers || []).find(u => u.chatId && u.confirmed)?.chatId || 
+      ''
+    ).trim();
+
+    try {
+      const report = await runTelegramBotDiagnostics(telegramConfig.botToken, targetChat);
+      setDiagnosticReport(report);
+      if (report.success) {
+        setTelegramTestStatus({
+          success: true,
+          message: `Diagnostics passed! Bot @${report.bot?.username || 'bot'} verified (${report.latencyMs}ms latency).`
+        });
+      } else {
+        setTelegramTestStatus({
+          success: false,
+          message: report.error || 'Diagnostics reported an issue connecting to Telegram.'
+        });
+      }
+    } catch (err: any) {
+      setTelegramTestStatus({
+        success: false,
+        message: `Diagnostics failed: ${err.message || String(err)}`
+      });
+    } finally {
+      setIsDiagnosingTelegram(false);
+    }
+  };
+
   const handleAddTelegramAuthorizedUser = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     const raw = newAuthUsername.trim();
     if (!raw) return;
 
-    const updated = addAuthorizedTelegramUser(telegramConfig, {
-      telegramUsername: raw,
+    const cleanHandle = raw.startsWith('@') ? raw.toLowerCase() : `@${raw.toLowerCase()}`;
+
+    // Add to authorized users
+    let updated = addAuthorizedTelegramUser(telegramConfig, {
+      telegramUsername: cleanHandle,
       chatId: newAuthChatId.trim() || undefined,
       appUsername: newAuthAppUsername.trim() || undefined,
       role: newAuthRole
     });
+
+    // Keep whitelistedUsernames synced as well
+    const currentWhitelist = updated.whitelistedUsernames || [];
+    if (!currentWhitelist.map(w => w.toLowerCase()).includes(cleanHandle)) {
+      updated = {
+        ...updated,
+        whitelistedUsernames: [...currentWhitelist, cleanHandle]
+      };
+    }
 
     setTelegramConfig(updated);
     setNewAuthUsername('');
@@ -601,10 +799,57 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       await persistTelegramConfig(updated, async (setting) => {
         await saveAdminSettingDoc(setting);
       });
-      setTelegramSaveStatus(`Added @${raw.replace(/^@/, '')} to authorized users registry!`);
+      setTelegramSaveStatus(`Added ${cleanHandle} to Telegram & Security Hub!`);
       setTimeout(() => setTelegramSaveStatus(null), 4000);
     } catch (err: any) {
       console.warn("Could not auto-save after adding authorized user:", err);
+    }
+  };
+
+  const handleRemoveConsolidatedUser = async (u: { id?: string; telegramUsername: string }) => {
+    let updated = { ...telegramConfig };
+    if (u.id) {
+      updated = removeAuthorizedTelegramUser(updated, u.id);
+    }
+    const cleanHandle = u.telegramUsername.toLowerCase().trim();
+    updated.whitelistedUsernames = (updated.whitelistedUsernames || []).filter(
+      h => h.toLowerCase().trim() !== cleanHandle
+    );
+
+    setTelegramConfig(updated);
+    try {
+      await persistTelegramConfig(updated, async (setting) => {
+        await saveAdminSettingDoc(setting);
+      });
+      setTelegramSaveStatus(`User ${u.telegramUsername} removed from Telegram & Security Hub.`);
+      setTimeout(() => setTelegramSaveStatus(null), 3000);
+    } catch (err: any) {
+      console.warn("Could not save user removal:", err);
+    }
+  };
+
+  const handlePromoteWhitelistUser = async (handle: string, role: 'partner' | 'admin' | 'guest' = 'partner') => {
+    const clean = handle.startsWith('@') ? handle.toLowerCase() : `@${handle.toLowerCase()}`;
+    const matchedProfile = userAccounts.find(
+      acc => acc.telegramUsername && acc.telegramUsername.toLowerCase().trim().replace(/^@/, '') === clean.replace(/^@/, '')
+    );
+    
+    const updated = addAuthorizedTelegramUser(telegramConfig, {
+      telegramUsername: clean,
+      appUsername: matchedProfile?.username,
+      role,
+      confirmed: true
+    });
+
+    setTelegramConfig(updated);
+    try {
+      await persistTelegramConfig(updated, async (setting) => {
+        await saveAdminSettingDoc(setting);
+      });
+      setTelegramSaveStatus(`Verified and activated ${clean}!`);
+      setTimeout(() => setTelegramSaveStatus(null), 4000);
+    } catch (err: any) {
+      console.warn("Could not save user promotion:", err);
     }
   };
 
@@ -663,36 +908,37 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     }
   };
 
-  const handleTestIndividualUser = async (user: TelegramAuthorizedUser) => {
+  const handleTestIndividualUser = async (user: { id?: string; telegramUsername: string; chatId?: string }) => {
     if (!telegramConfig.botToken) {
       setTelegramTestStatus({ success: false, message: 'Bot Token is required to send tests.' });
       return;
     }
+    const key = user.id || user.telegramUsername;
     if (!user.chatId) {
-      setUserActionNotice(prev => ({ ...prev, [user.id]: 'No Chat ID! Ask user to send /confirm in the bot.' }));
-      setTimeout(() => setUserActionNotice(prev => { const n = { ...prev }; delete n[user.id]; return n; }), 4000);
+      setUserActionNotice(prev => ({ ...prev, [key]: 'No Chat ID! Ask user to send /confirm in the bot.' }));
+      setTimeout(() => setUserActionNotice(prev => { const n = { ...prev }; delete n[key]; return n; }), 4000);
       return;
     }
 
-    setTestingUserId(user.id);
+    setTestingUserId(key);
     try {
-      const pingMessage = `🏋️ <b>Iron House Verification Ping</b>\n\n` +
+      const pingMessage = `✨ <b>Our Home Verification Ping</b> 💕\n\n` +
         `Hello <b>${user.telegramUsername}</b>!\n` +
-        `Your personal Telegram access is <b>Verified & Active</b> in Iron House.\n` +
-        `You will receive workout reminders and training updates directly in this chat!\n\n` +
+        `Your personal Telegram access is <b>Verified & Active</b> in Our Home.\n` +
+        `You will receive milestone countdowns, date night alerts, and love letters directly in this chat! 💌\n\n` +
         `<i>Sent at ${new Date().toLocaleTimeString()}</i>`;
 
       const res = await sendDirectTelegramMessage(telegramConfig.botToken, user.chatId, pingMessage);
       if (res.success) {
-        setUserActionNotice(prev => ({ ...prev, [user.id]: '✅ Test Ping Sent!' }));
+        setUserActionNotice(prev => ({ ...prev, [key]: '✅ Test Ping Sent!' }));
       } else {
-        setUserActionNotice(prev => ({ ...prev, [user.id]: `❌ ${res.error || 'Failed'}` }));
+        setUserActionNotice(prev => ({ ...prev, [key]: `❌ ${res.error || 'Failed'}` }));
       }
     } catch (e: any) {
-      setUserActionNotice(prev => ({ ...prev, [user.id]: `❌ ${e.message || 'Error'}` }));
+      setUserActionNotice(prev => ({ ...prev, [key]: `❌ ${e.message || 'Error'}` }));
     } finally {
       setTestingUserId(null);
-      setTimeout(() => setUserActionNotice(prev => { const n = { ...prev }; delete n[user.id]; return n; }), 4000);
+      setTimeout(() => setUserActionNotice(prev => { const n = { ...prev }; delete n[key]; return n; }), 4000);
     }
   };
 
@@ -838,7 +1084,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setAutoFixMessage(null);
     try {
       await refreshTableDiagnostics();
-      const summary = await syncAllDataToSupabase();
+      const summary = await syncAllDataToSupabase({ userAccounts, adminSettings });
       setSyncDataSummary(summary);
       await refreshDbStatus();
       await refreshTableDiagnostics();
@@ -846,7 +1092,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       if (summary.errors.length === 0) {
         setAutoFixMessage({
           type: 'success',
-          text: 'Database schema repair & sync completed successfully! Diagnostics refreshed.'
+          text: summary.supabaseConfigured
+            ? 'Database schema repair & dual-cloud sync completed successfully! Diagnostics refreshed.'
+            : 'Firestore cloud health & collections verified! (Optional Supabase env vars not configured.)'
         });
       } else {
         setAutoFixMessage({
@@ -947,6 +1195,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         : await syncSingleTableSupabaseToFirestore(tableKey);
       
       setTableSyncResults(prev => ({ ...prev, [tableKey]: res }));
+      if (res.errors.length > 0) {
+        setMigrationError(`${tableKey} sync notice: ${res.errors[0]}`);
+      }
       logActivity('Admin', `Sync ${tableKey}`, `Synced ${tableKey} (${direction === 'firestore_to_supabase' ? 'Firestore ➔ Supabase' : 'Supabase ➔ Firestore'}) - ${res.syncedCount} items.`);
       refreshDbStatus();
       refreshTableDiagnostics();
@@ -989,13 +1240,22 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setIsSyncingAllData(true);
     setMigrationError(null);
     try {
-      const summary = await syncAllDataToSupabase();
+      const summary = await syncAllDataToSupabase({ userAccounts, adminSettings });
       setSyncDataSummary(summary);
-      logActivity('Admin', 'Supabase Data Sync', 'Synchronized all local & default app data into Supabase tables.');
-      refreshDbStatus();
-      refreshTableDiagnostics();
+      if (summary.errors.length > 0) {
+        setMigrationError(`Database sync notices (${summary.errors.length}): ${summary.errors[0]}`);
+      }
+      await logActivity(
+        'Admin',
+        'Database Sync',
+        summary.mode === 'firestore_and_supabase'
+          ? `Synchronized ${summary.userAccountsSynced} users, ${summary.adminSettingsSynced} settings, ${summary.workoutPlansSynced} workouts across Firestore & Supabase.`
+          : `Verified & synced ${summary.userAccountsSynced} users, ${summary.adminSettingsSynced} settings, ${summary.workoutPlansSynced} workouts in Firestore cloud.`
+      );
+      await refreshDbStatus();
+      await refreshTableDiagnostics();
     } catch (err: any) {
-      setMigrationError(err?.message || 'Failed to sync data to Supabase.');
+      setMigrationError(err?.message || 'Failed to synchronize database.');
     } finally {
       setIsSyncingAllData(false);
     }
@@ -1232,108 +1492,6 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     }
   };
 
-  const handleConnectCoupleTenant = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setUserSuccessMsg(null);
-    setUserErrorMsg(null);
-
-    const p1 = pairPartner1.trim();
-    const p2 = pairPartner2.trim();
-    const cName = pairCoupleName.trim() || `${p1} & ${p2}`;
-
-    if (!p1 || !p2) {
-      setUserErrorMsg('Please select two user accounts to link as partners.');
-      return;
-    }
-    if (p1.toLowerCase() === p2.toLowerCase()) {
-      setUserErrorMsg('Partner 1 and Partner 2 must be different user accounts.');
-      return;
-    }
-
-    setIsSyncing(true);
-    try {
-      const existingTenant = coupleTenants.find(
-        t => (t.partner1.toLowerCase() === p1.toLowerCase() && t.partner2.toLowerCase() === p2.toLowerCase()) ||
-             (t.partner1.toLowerCase() === p2.toLowerCase() && t.partner2.toLowerCase() === p1.toLowerCase())
-      );
-      const coupleId = existingTenant ? existingTenant.coupleId : `couple_${Date.now()}`;
-
-      const newTenant: CoupleTenant = {
-        coupleId,
-        coupleName: cName,
-        partner1: p1,
-        partner2: p2,
-        plan: pairPlan,
-        created_at: new Date().toISOString()
-      };
-
-      // 1. Save Couple Tenant doc
-      await saveCoupleTenantDoc(newTenant);
-
-      // 2. Update partner 1 account with coupleId
-      const u1 = userAccounts.find(u => u.username.toLowerCase() === p1.toLowerCase());
-      const oldCoupleId1 = u1?.coupleId || '';
-      if (u1) {
-        await saveUserAccountDoc({ ...u1, coupleId });
-      }
-
-      // 3. Update partner 2 account with coupleId
-      const u2 = userAccounts.find(u => u.username.toLowerCase() === p2.toLowerCase());
-      const oldCoupleId2 = u2?.coupleId || '';
-      if (u2) {
-        await saveUserAccountDoc({ ...u2, coupleId });
-      }
-
-      // 4. Update existing user data across database with the new coupleId
-      await updateDataCoupleId(oldCoupleId1, coupleId, [p1, p2]);
-      if (oldCoupleId2 && oldCoupleId2 !== oldCoupleId1) {
-        await updateDataCoupleId(oldCoupleId2, coupleId, [p1, p2]);
-      }
-
-      const currentAdmin = localStorage.getItem('love_app_username') || 'Admin';
-      await logActivity(currentAdmin, 'couple_tenant_created', `Connected partners "${p1}" and "${p2}" into couple tenant "${cName}" (${coupleId}).`);
-
-      setUserSuccessMsg(`Successfully connected partners "${p1}" and "${p2}" as couple "${cName}"!`);
-      setIsPairingCouple(false);
-      setPairPartner1('');
-      setPairPartner2('');
-      setPairCoupleName('');
-      setTimeout(() => setUserSuccessMsg(null), 4000);
-    } catch (err) {
-      setUserErrorMsg('Failed to connect couple tenant.');
-    } finally {
-      setIsSyncing(false);
-    }
-  };
-
-  const handleUnlinkCouple = async (tenant: CoupleTenant) => {
-    setUserSuccessMsg(null);
-    setUserErrorMsg(null);
-    setIsSyncing(true);
-    try {
-      // 1. Unlink user accounts if they refer to this coupleId
-      const affectedUsers = userAccounts.filter(u => u.coupleId === tenant.coupleId || 
-        u.username.toLowerCase() === tenant.partner1.toLowerCase() || 
-        u.username.toLowerCase() === tenant.partner2.toLowerCase());
-      for (const u of affectedUsers) {
-        const individualCoupleId = `couple_${u.username.toLowerCase()}_${Date.now()}`;
-        await saveUserAccountDoc({ ...u, coupleId: individualCoupleId });
-      }
-      // 2. Delete couple tenant doc
-      await deleteCoupleTenantDoc(tenant.coupleId);
-
-      const currentAdmin = localStorage.getItem('love_app_username') || 'Admin';
-      await logActivity(currentAdmin, 'couple_tenant_unlinked', `Unlinked couple tenant "${tenant.coupleName}" (${tenant.coupleId}).`);
-
-      setUserSuccessMsg(`Unlinked couple tenant "${tenant.coupleName}".`);
-      setTimeout(() => setUserSuccessMsg(null), 4000);
-    } catch (err) {
-      setUserErrorMsg('Failed to unlink couple tenant.');
-    } finally {
-      setIsSyncing(false);
-    }
-  };
-
   const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
     setUserSuccessMsg(null);
@@ -1362,60 +1520,24 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setIsSyncing(true);
     try {
       const uPass = await hashPassword(rawPass);
-      let coupleId = `couple_${Date.now()}`;
-      let partnerAccount: UserAccount | undefined;
-
-      if (newUserPartner) {
-        partnerAccount = userAccounts.find(u => u.username.toLowerCase() === newUserPartner.toLowerCase());
-        if (partnerAccount && partnerAccount.coupleId) {
-          coupleId = partnerAccount.coupleId;
-        }
-      }
 
       const newUser: UserAccount = {
         id: `user_${Date.now()}`,
         username: newUsername.trim(),
         password: uPass,
         gender: newUserGender,
-        coupleId
+        role: 'user'
       };
       await saveUserAccountDoc(newUser);
 
-      // If partner was selected, create/update couple tenant and update partner account
-      if (partnerAccount) {
-        const cTenant: CoupleTenant = {
-          coupleId,
-          coupleName: `${newUser.username} & ${partnerAccount.username}`,
-          partner1: newUser.username,
-          partner2: partnerAccount.username,
-          plan: newUserPlan || 'pro',
-          created_at: new Date().toISOString()
-        };
-        await saveCoupleTenantDoc(cTenant);
-        await saveUserAccountDoc({ ...partnerAccount, coupleId });
-      } else {
-        // Create a new couple tenant record for this standalone user
-        const cTenant: CoupleTenant = {
-          coupleId,
-          coupleName: `${newUser.username}'s Couple`,
-          partner1: newUser.username,
-          partner2: '',
-          plan: newUserPlan || 'pro',
-          created_at: new Date().toISOString()
-        };
-        await saveCoupleTenantDoc(cTenant);
-      }
-
       setNewUsername('');
       setNewPassword('');
-      setNewUserPartner('');
-      setNewUserPlan('pro');
       setNewUserGender('male');
-      setUserSuccessMsg(`User account "${newUser.username}" created successfully with ${newUserPlan.toUpperCase()} plan (Password Cryptographically Hashed)!${partnerAccount ? ` (Linked with partner "${partnerAccount.username}")` : ''}`);
+      setUserSuccessMsg(`User account "${newUser.username}" created successfully (Password Cryptographically Hashed)!`);
       
       setTimeout(() => setUserSuccessMsg(null), 4000);
-    } catch (err) {
-      setUserErrorMsg('Failed to save user account to database.');
+    } catch (err: any) {
+      setUserErrorMsg(`Failed to save user account: ${err?.message || String(err)}`);
     } finally {
       setIsSyncing(false);
     }
@@ -1437,43 +1559,21 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setIsSyncing(true);
     try {
       const uPass = await hashPassword(rawPass);
-      const newCoupleId = editingUserCoupleId || editingUser.coupleId || `couple_${Date.now()}`;
-      const oldCoupleId = editingUser.coupleId;
       const updated: UserAccount = {
         ...editingUser,
         password: uPass,
-        gender: editingUserGender,
-        coupleId: newCoupleId
+        gender: editingUserGender
       };
       await saveUserAccountDoc(updated);
-      if (oldCoupleId && oldCoupleId !== newCoupleId) {
-        await updateDataCoupleId(oldCoupleId, newCoupleId, [editingUser.username]);
-      }
-
-      // Update tenant plan if specified
-      if (newCoupleId) {
-        const existingTenant = allLinkedCoupleTenants.find(t => t.coupleId === newCoupleId);
-        const updatedTenant: CoupleTenant = {
-          coupleId: newCoupleId,
-          coupleName: existingTenant?.coupleName || `${editingUser.username}'s Space`,
-          partner1: existingTenant?.partner1 || editingUser.username,
-          partner2: existingTenant?.partner2 || '',
-          plan: editingUserPlan || existingTenant?.plan || 'pro',
-          created_at: existingTenant?.created_at || new Date().toISOString()
-        };
-        await saveCoupleTenantDoc(updatedTenant);
-      }
 
       setUserSuccessMsg(`User account "${editingUser.username}" updated successfully!`);
       setEditingUser(null);
       setEditingPassword('');
-      setEditingUserCoupleId('');
-      setEditingUserPlan('pro');
       setEditingUserGender('male');
       
       setTimeout(() => setUserSuccessMsg(null), 4000);
-    } catch (err) {
-      setUserErrorMsg('Failed to update user account.');
+    } catch (err: any) {
+      setUserErrorMsg(`Failed to update user account: ${err?.message || String(err)}`);
     } finally {
       setIsSyncing(false);
     }
@@ -1486,14 +1586,15 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setUserErrorMsg(null);
     setSyncingUserId(user.id);
     setIsSyncing(true);
+    const targetDesc = isSupabaseConfigured ? 'Firestore and Supabase' : 'Firestore';
     try {
       await saveUserAccountDoc(user);
       const currentAdmin = localStorage.getItem('love_app_username') || 'Admin';
-      await logActivity(currentAdmin, 'user_synced', `Synchronized account "${user.username}" across Firestore and Supabase databases.`);
-      setUserSuccessMsg(`User account "${user.username}" synchronized to database successfully!`);
+      await logActivity(currentAdmin, 'user_synced', `Synchronized account "${user.username}" to ${targetDesc}.`);
+      setUserSuccessMsg(`User account "${user.username}" synchronized to ${targetDesc} successfully!`);
       setTimeout(() => setUserSuccessMsg(null), 4000);
-    } catch (err) {
-      setUserErrorMsg(`Failed to synchronize user account "${user.username}".`);
+    } catch (err: any) {
+      setUserErrorMsg(`Failed to synchronize user account "${user.username}": ${err?.message || String(err)}`);
     } finally {
       setSyncingUserId(null);
       setIsSyncing(false);
@@ -1508,16 +1609,17 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setUserSuccessMsg(null);
     setUserErrorMsg(null);
     setIsSyncing(true);
+    const targetDesc = isSupabaseConfigured ? 'Firestore and Supabase' : 'Firestore';
     try {
       for (const user of userAccounts) {
         await saveUserAccountDoc(user);
       }
       const currentAdmin = localStorage.getItem('love_app_username') || 'Admin';
-      await logActivity(currentAdmin, 'all_users_synced', `Synchronized all ${userAccounts.length} user accounts across Firestore and Supabase databases.`);
-      setUserSuccessMsg(`All ${userAccounts.length} user accounts synchronized to Firestore and Supabase successfully!`);
+      await logActivity(currentAdmin, 'all_users_synced', `Synchronized all ${userAccounts.length} user accounts to ${targetDesc}.`);
+      setUserSuccessMsg(`All ${userAccounts.length} user accounts synchronized to ${targetDesc} successfully!`);
       setTimeout(() => setUserSuccessMsg(null), 4000);
-    } catch (err) {
-      setUserErrorMsg('Failed to synchronize all user accounts.');
+    } catch (err: any) {
+      setUserErrorMsg(`Failed to synchronize all user accounts: ${err?.message || String(err)}`);
     } finally {
       setIsSyncing(false);
     }
@@ -1532,8 +1634,8 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       setUserSuccessMsg(`User "${user.username}" deleted successfully.`);
       setUserToDelete(null);
       setTimeout(() => setUserSuccessMsg(null), 4000);
-    } catch (err) {
-      setUserErrorMsg('Failed to delete user.');
+    } catch (err: any) {
+      setUserErrorMsg(`Failed to delete user: ${err?.message || String(err)}`);
     } finally {
       setIsSyncing(false);
     }
@@ -1561,11 +1663,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
       setAdminAccountsList(updatedList);
       const currentAdmin = localStorage.getItem('love_app_username') || 'Admin';
-      await logActivity(currentAdmin, 'admin_credentials_updated', logMsg || 'Updated admin credentials in Firestore & Supabase.');
+      await logActivity(currentAdmin, 'admin_credentials_updated', logMsg || `Updated admin credentials in ${isSupabaseConfigured ? 'Firestore & Supabase' : 'Firestore'}.`);
       setAdminSuccessMsg('Admin portal credentials synchronized to database successfully!');
       setTimeout(() => setAdminSuccessMsg(null), 4000);
-    } catch (err) {
-      setAdminErrorMsg('Failed to save admin credentials to database.');
+    } catch (err: any) {
+      setAdminErrorMsg(`Failed to save admin credentials: ${err?.message || String(err)}`);
     } finally {
       setIsSyncing(false);
     }
@@ -1963,7 +2065,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2 text-teal-300 font-bold">
                   <CheckCircle className="w-4 h-4 text-teal-400 shrink-0" />
-                  <span>All Tables & Sections Synchronized to Database</span>
+                  <span>
+                    {syncDataSummary.mode === 'firestore_and_supabase'
+                      ? 'All Collections Synchronized (Firestore + Supabase)'
+                      : 'All Collections Synchronized (Firestore Cloud Active)'}
+                  </span>
                 </div>
                 <button
                   onClick={() => setSyncDataSummary(null)}
@@ -1974,27 +2080,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 </button>
               </div>
 
-              <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2 text-[10px]">
-                <div className="bg-black/40 p-2 rounded-xl border border-teal-500/20 flex flex-col items-center">
-                  <span className="text-neutral-400">Questions</span>
-                  <strong className="text-teal-300 text-xs mt-0.5">{syncDataSummary?.coupleQuestionsSynced ?? 0}</strong>
-                </div>
-                <div className="bg-black/40 p-2 rounded-xl border border-teal-500/20 flex flex-col items-center">
-                  <span className="text-neutral-400">Date Plans</span>
-                  <strong className="text-teal-300 text-xs mt-0.5">{syncDataSummary?.datePlansSynced ?? 0}</strong>
-                </div>
-                <div className="bg-black/40 p-2 rounded-xl border border-teal-500/20 flex flex-col items-center">
-                  <span className="text-neutral-400">Letters</span>
-                  <strong className="text-teal-300 text-xs mt-0.5">{syncDataSummary?.lettersSynced ?? 0}</strong>
-                </div>
-                <div className="bg-black/40 p-2 rounded-xl border border-teal-500/20 flex flex-col items-center">
-                  <span className="text-neutral-400">Memories</span>
-                  <strong className="text-teal-300 text-xs mt-0.5">{syncDataSummary?.memoriesSynced ?? 0}</strong>
-                </div>
-                <div className="bg-black/40 p-2 rounded-xl border border-teal-500/20 flex flex-col items-center">
-                  <span className="text-neutral-400">Milestones</span>
-                  <strong className="text-teal-300 text-xs mt-0.5">{syncDataSummary?.milestonesSynced ?? 0}</strong>
-                </div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[10px]">
                 <div className="bg-black/40 p-2 rounded-xl border border-teal-500/20 flex flex-col items-center">
                   <span className="text-neutral-400">Users</span>
                   <strong className="text-teal-300 text-xs mt-0.5">{syncDataSummary?.userAccountsSynced ?? 0}</strong>
@@ -2002,6 +2088,14 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 <div className="bg-black/40 p-2 rounded-xl border border-teal-500/20 flex flex-col items-center">
                   <span className="text-neutral-400">Settings</span>
                   <strong className="text-teal-300 text-xs mt-0.5">{syncDataSummary?.adminSettingsSynced ?? 0}</strong>
+                </div>
+                <div className="bg-black/40 p-2 rounded-xl border border-teal-500/20 flex flex-col items-center">
+                  <span className="text-neutral-400">Workouts</span>
+                  <strong className="text-teal-300 text-xs mt-0.5">{syncDataSummary?.workoutPlansSynced ?? 0}</strong>
+                </div>
+                <div className="bg-black/40 p-2 rounded-xl border border-teal-500/20 flex flex-col items-center">
+                  <span className="text-neutral-400">Logs</span>
+                  <strong className="text-teal-300 text-xs mt-0.5">{syncDataSummary?.activityLogsSynced ?? 0}</strong>
                 </div>
               </div>
 
@@ -2069,132 +2163,6 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               )}
             </AnimatePresence>
 
-            {/* Quick Action: Connect Couple Partners Button */}
-            <div className="mb-6 flex items-center justify-between bg-gradient-to-r from-pink-500/10 via-rose-500/10 to-indigo-500/10 border border-pink-500/20 p-4 rounded-2xl">
-              <div className="flex items-center gap-3">
-                <div className="p-2 bg-pink-500/20 rounded-xl text-pink-400">
-                  <HeartHandshake className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3 className="text-xs font-semibold text-white uppercase tracking-wider font-mono">Couple & Partner Management</h3>
-                  <p className="text-[11px] text-neutral-400">Pair users together into couple tenants to connect their partners</p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => setIsPairingCouple(!isPairingCouple)}
-                className="text-xs font-semibold px-3 py-1.5 rounded-xl bg-pink-500/20 hover:bg-pink-500/30 text-pink-300 border border-pink-500/30 transition-all flex items-center gap-1.5 cursor-pointer shadow-sm"
-              >
-                <Link className="w-3.5 h-3.5" />
-                <span>{isPairingCouple ? 'Close Partner Linker' : 'Connect Partners'}</span>
-              </button>
-            </div>
-
-            {/* Connect Couple Partners Box */}
-            <AnimatePresence>
-              {isPairingCouple && (
-                <motion.div
-                  initial={{ opacity: 0, height: 0 }}
-                  animate={{ opacity: 1, height: 'auto' }}
-                  exit={{ opacity: 0, height: 0 }}
-                  className="mb-8 p-5 bg-pink-950/20 border border-pink-500/30 rounded-2xl space-y-4 overflow-hidden"
-                >
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-xs font-bold text-pink-300 uppercase tracking-widest font-mono flex items-center gap-2">
-                      <HeartHandshake className="w-4 h-4 text-pink-400" />
-                      Link Two Users as Connected Partners
-                    </h3>
-                    <button
-                      type="button"
-                      onClick={() => setIsPairingCouple(false)}
-                      className="text-neutral-400 hover:text-white p-1 rounded-lg"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  </div>
-
-                  <form onSubmit={handleConnectCoupleTenant} className="space-y-4">
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                      <div className="space-y-1.5">
-                        <label className="text-[10px] text-pink-300 uppercase tracking-wider font-mono">Select Partner 1</label>
-                        <select
-                          value={pairPartner1}
-                          onChange={(e) => setPairPartner1(e.target.value)}
-                          className="w-full bg-neutral-950/90 border border-pink-500/30 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-pink-500"
-                          required
-                        >
-                          <option value="">-- Choose First Partner --</option>
-                          {userAccounts
-                            .filter(u => !isUserConnectedToPartner(u.username, pairPartner2))
-                            .map((u, idx) => (
-                              <option key={`pair-p1-${u.id || u.username}-${idx}`} value={u.username}>👤 {u.username}</option>
-                            ))
-                          }
-                        </select>
-                      </div>
-
-                      <div className="space-y-1.5">
-                        <label className="text-[10px] text-pink-300 uppercase tracking-wider font-mono">Select Partner 2</label>
-                        <select
-                          value={pairPartner2}
-                          onChange={(e) => setPairPartner2(e.target.value)}
-                          className="w-full bg-neutral-950/90 border border-pink-500/30 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-pink-500"
-                          required
-                        >
-                          <option value="">-- Choose Second Partner --</option>
-                          {userAccounts
-                            .filter(u => u.username !== pairPartner1 && !isUserConnectedToPartner(u.username, pairPartner1))
-                            .map((u, idx) => (
-                              <option key={`pair-p2-${u.id || u.username}-${idx}`} value={u.username}>👤 {u.username}</option>
-                            ))
-                          }
-                        </select>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                      <div className="space-y-1.5">
-                        <label className="text-[10px] text-pink-300 uppercase tracking-wider font-mono">Couple Display Name (Optional)</label>
-                        <input
-                          type="text"
-                          value={pairCoupleName}
-                          onChange={(e) => setPairCoupleName(e.target.value)}
-                          placeholder="e.g. Alex & Sam"
-                          className="w-full bg-neutral-950/90 border border-pink-500/30 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-pink-500"
-                        />
-                      </div>
-
-                      <div className="space-y-1.5">
-                        <label className="text-[10px] text-pink-300 uppercase tracking-wider font-mono">Subscription Plan</label>
-                        <select
-                          value={pairPlan}
-                          onChange={(e) => setPairPlan(e.target.value)}
-                          className="w-full bg-neutral-950/90 border border-pink-500/30 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-pink-500"
-                        >
-                          {subscriptionPlans.map((plan, idx) => (
-                            <option key={`pair-plan-${plan.id}-${idx}`} value={plan.id}>
-                              {plan.name} ({plan.price})
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                    </div>
-
-                    <div className="flex justify-end pt-2">
-                      <button
-                        type="submit"
-                        disabled={isSyncing}
-                        className="bg-gradient-to-r from-pink-600 to-rose-600 hover:from-pink-500 hover:to-rose-500 text-white font-semibold text-xs py-2.5 px-5 rounded-xl transition-all cursor-pointer flex items-center gap-2 shadow-lg disabled:opacity-50"
-                      >
-                        <HeartHandshake className="w-4 h-4" />
-                        <span>Link Partners & Create Couple Tenant</span>
-                      </button>
-                    </div>
-                  </form>
-                </motion.div>
-              )}
-            </AnimatePresence>
-
             {/* Create / Edit Form */}
             <div className="mb-8 p-5 bg-neutral-950/40 border border-white/5 rounded-2xl">
               {editingUser ? (
@@ -2208,7 +2176,6 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                       onClick={() => {
                         setEditingUser(null);
                         setEditingPassword('');
-                        setEditingUserCoupleId('');
                         setUserErrorMsg(null);
                       }}
                       className="text-xs text-neutral-400 hover:text-white transition-all"
@@ -2216,7 +2183,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                       Cancel Edit
                     </button>
                   </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div className="space-y-1.5">
                       <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">New Password</label>
                       <div className="relative">
@@ -2251,32 +2218,6 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         <option value="other">Other 🧑</option>
                       </select>
                     </div>
-
-                    <div className="space-y-1.5">
-                      <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">Subscription Plan</label>
-                      <select
-                        value={editingUserPlan}
-                        onChange={(e) => setEditingUserPlan(e.target.value)}
-                        className="w-full bg-neutral-950/80 border border-indigo-500/30 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-indigo-500"
-                      >
-                        {subscriptionPlans.map((plan, idx) => (
-                          <option key={`edit-user-plan-${plan.id}-${idx}`} value={plan.id}>
-                            {plan.name} ({plan.price})
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">Couple Tenant ID</label>
-                      <input
-                        type="text"
-                        value={editingUserCoupleId}
-                        onChange={(e) => setEditingUserCoupleId(e.target.value)}
-                        placeholder={editingUser.coupleId || "e.g., couple_12345"}
-                        className="w-full bg-neutral-950/80 border border-white/10 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/60 font-mono"
-                      />
-                    </div>
                   </div>
 
                   <div className="flex justify-end pt-2">
@@ -2296,7 +2237,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     <UserPlus className="w-3.5 h-3.5" />
                     Create New Website User
                   </h3>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                     <div className="space-y-1.5">
                       <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">Username</label>
                       <input
@@ -2339,35 +2280,6 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         <option value="male">Male 👨</option>
                         <option value="female">Female 👩</option>
                         <option value="other">Other 🧑</option>
-                      </select>
-                    </div>
-                    <div className="space-y-1.5">
-                      <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">Subscription Plan</label>
-                      <select
-                        value={newUserPlan}
-                        onChange={(e) => setNewUserPlan(e.target.value)}
-                        className="w-full bg-neutral-950/80 border border-indigo-500/30 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-indigo-500"
-                      >
-                        {subscriptionPlans.map((plan, idx) => (
-                          <option key={`new-user-plan-${plan.id}-${idx}`} value={plan.id}>
-                            {plan.name} ({plan.price})
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="space-y-1.5">
-                      <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">Connect Partner (Optional)</label>
-                      <select
-                        value={newUserPartner}
-                        onChange={(e) => setNewUserPartner(e.target.value)}
-                        className="w-full bg-neutral-950/80 border border-white/10 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-indigo-500/60"
-                      >
-                        <option value="">None (Unlinked Single)</option>
-                        {userAccounts
-                          .filter(u => !isUserConnectedToPartner(u.username))
-                          .map((u, idx) => (
-                            <option key={`new-user-partner-${u.id || u.username}-${idx}`} value={u.username}>💕 Pair with {u.username}</option>
-                          ))}
                       </select>
                     </div>
                   </div>
@@ -2437,17 +2349,6 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     return uniqueUsers.map((user, uIdx) => {
                     const isPasswordVisible = showAllUserPasswords || !!visiblePasswordIds[user.id];
 
-                    // Find matching tenant for this user
-                    const tenant = allLinkedCoupleTenants.find(t => 
-                      (t.coupleId && user.coupleId && t.coupleId === user.coupleId) ||
-                      t.partner1.toLowerCase() === user.username.toLowerCase() ||
-                      (t.partner2 && t.partner2.toLowerCase() === user.username.toLowerCase())
-                    );
-
-                    const partnerName = tenant 
-                      ? (tenant.partner1.toLowerCase() === user.username.toLowerCase() ? tenant.partner2 : tenant.partner1)
-                      : userAccounts.find(u => u.id !== user.id && u.coupleId && u.coupleId === user.coupleId)?.username;
-
                     return (
                       <div key={`user-row-${user.id || user.username}-${uIdx}`} className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:bg-white/5 transition-all">
                         <div className="flex items-start gap-3">
@@ -2460,11 +2361,6 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                               {user.gender && (
                                 <span className="text-[10px] font-mono text-purple-300 bg-purple-500/15 border border-purple-500/30 px-2 py-0.5 rounded-md capitalize">
                                   {user.gender === 'male' ? '👨 Male' : user.gender === 'female' ? '👩 Female' : `🧑 ${user.gender}`}
-                                </span>
-                              )}
-                              {user.coupleId && (
-                                <span className="text-[10px] font-mono text-neutral-400 bg-neutral-800 px-2 py-0.5 rounded-md border border-neutral-700">
-                                  ID: {user.coupleId}
                                 </span>
                               )}
                             </div>
@@ -2489,25 +2385,8 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                               </button>
                             </div>
 
-                            {/* Relationship & Partner Badge */}
+                            {/* Security & 2FA Badge */}
                             <div className="mt-2 flex items-center gap-2 flex-wrap">
-                              {partnerName ? (
-                                <span className="inline-flex items-center gap-1.5 text-xs font-medium bg-pink-500/15 border border-pink-500/30 text-pink-300 px-2.5 py-0.5 rounded-full shadow-sm">
-                                  <Heart className="w-3 h-3 fill-pink-400 text-pink-400" />
-                                  <span>Partner: <strong className="capitalize text-white">{partnerName}</strong></span>
-                                </span>
-                              ) : (
-                                <span className="inline-flex items-center gap-1 text-[10px] font-mono bg-neutral-800/80 border border-neutral-700/50 text-neutral-400 px-2 py-0.5 rounded-full">
-                                  <span>Single / Unlinked User</span>
-                                </span>
-                              )}
-
-                              {tenant && (
-                                <span className="inline-flex items-center gap-1 text-[10px] font-mono bg-indigo-500/10 border border-indigo-500/20 text-indigo-300 px-2 py-0.5 rounded-full">
-                                  <span>Couple: {tenant.coupleName} ({tenant.plan.toUpperCase()})</span>
-                                </span>
-                              )}
-
                               {user.twoFactorEnabled ? (
                                 <button
                                   type="button"
@@ -2546,20 +2425,6 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                           >
                             <ShieldCheck className="w-3.5 h-3.5" />
                           </button>
-                          {!partnerName && (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setIsPairingCouple(true);
-                                setPairPartner1(user.username);
-                              }}
-                              className="text-xs px-2.5 py-1 rounded-lg border border-pink-500/30 bg-pink-500/10 hover:bg-pink-500/20 text-pink-300 font-mono flex items-center gap-1 transition-all cursor-pointer"
-                              title={`Connect partner for ${user.username}`}
-                            >
-                              <Link className="w-3 h-3" />
-                              <span>Link Partner</span>
-                            </button>
-                          )}
                           <button
                             onClick={() => handleSyncUser(user)}
                             disabled={isSyncing || syncingUserId === user.id}
@@ -2572,10 +2437,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                             onClick={() => {
                               setEditingUser(user);
                               setEditingPassword(user.password || '');
-                              setEditingUserCoupleId(user.coupleId || '');
                               setEditingUserGender(user.gender || 'male');
-                              const userTenant = allLinkedCoupleTenants.find(t => t.coupleId === user.coupleId);
-                              setEditingUserPlan(userTenant?.plan || 'pro');
                             }}
                             className="p-1.5 rounded-lg border border-white/10 hover:bg-white/5 text-neutral-400 hover:text-white transition-all cursor-pointer"
                             title="Edit Account Details"
@@ -2697,8 +2559,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               activityLogs={logs}
               defaultCollapsed={true}
               onRefreshLogs={() => {
-                const current = storage.getActivityLogs();
-                setLogs(current);
+                getFirestoreActivityLogs().then(setLogs).catch(() => {});
               }}
               onSimulateTestAlert={handleSimulateTestAlert}
             />
@@ -3008,632 +2869,455 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
           </div>
 
           {/* TELEGRAM BOT & REAL-TIME ALERTS SECTION */}
+          {/* ========================================================= */}
+          {/* UNIFIED TELEGRAM & SECURITY HUB                            */}
+          {/* ========================================================= */}
           <div id="telegram_alerts_section" className="bg-neutral-900/60 border border-white/10 rounded-3xl p-6 sm:p-7 relative shadow-xl backdrop-blur-xl transition-all hover:border-white/15 scroll-mt-24 space-y-6">
-            <div className="flex items-center justify-between flex-wrap gap-3">
+            
+            {/* Header: Title, KPI Badges, Master Switch & Quick Diagnostic */}
+            <div className="flex items-center justify-between flex-wrap gap-4 border-b border-white/5 pb-5">
               <div className="flex items-center gap-3">
-                <div className="p-2.5 bg-sky-500/15 border border-sky-500/25 rounded-2xl text-sky-400 shadow-inner">
+                <div className="p-2.5 bg-gradient-to-br from-sky-500/20 to-indigo-500/20 border border-sky-500/30 rounded-2xl text-sky-400 shadow-inner">
                   <Send className="w-5 h-5" />
                 </div>
                 <div>
-                  <div className="flex items-center gap-2">
-                    <h2 className="text-lg font-serif font-bold text-white tracking-wide">Telegram Bot & Alert Reminders</h2>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-lg font-serif font-bold text-white tracking-wide">
+                      Telegram & Security Hub
+                    </h2>
                     <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-bold border ${telegramConfig.enabled ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' : 'bg-neutral-800 text-neutral-400 border-white/10'}`}>
                       {telegramConfig.enabled ? 'Active 🟢' : 'Disabled ⚪'}
                     </span>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold bg-sky-500/15 text-sky-300 border border-sky-500/25">
+                      {consolidatedTelegramUsers.length} Users
+                    </span>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold bg-purple-500/15 text-purple-300 border border-purple-500/25">
+                      {consolidatedTelegramUsers.filter(u => u.confirmed && u.isActive).length} Verified 🟢
+                    </span>
+                    {consolidatedTelegramUsers.filter(u => !u.confirmed).length > 0 && (
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold bg-amber-500/15 text-amber-300 border border-amber-500/25">
+                        {consolidatedTelegramUsers.filter(u => !u.confirmed).length} Pending ⏳
+                      </span>
+                    )}
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold bg-neutral-800 text-neutral-300 border border-white/10">
+                      {detectedSenders.length} Inbound Msgs
+                    </span>
                   </div>
-                  <p className="text-[11px] text-neutral-400 font-mono mt-0.5">Automated couple reminders & security alerts sent to Telegram</p>
+                  <p className="text-[11px] text-neutral-400 font-mono mt-0.5">
+                    Unified access control, whitelist directory, live sender detection & real-time couple event alerts
+                  </p>
                 </div>
               </div>
 
-              {/* Master Enable/Disable Toggle */}
-              <div className="flex items-center gap-2.5 bg-neutral-950/60 border border-white/10 px-3.5 py-2 rounded-xl">
-                <span className="text-xs font-mono text-neutral-300">Bot Broadcast</span>
+              {/* Header Right Actions: Quick Diagnostic & Master Broadcast Toggle */}
+              <div className="flex items-center gap-3 flex-wrap">
                 <button
                   type="button"
-                  onClick={() => setTelegramConfig(prev => ({ ...prev, enabled: !prev.enabled }))}
-                  className={`w-11 h-6 flex items-center rounded-full p-0.5 transition-colors cursor-pointer ${telegramConfig.enabled ? 'bg-sky-500' : 'bg-neutral-800'}`}
+                  onClick={() => handleRunDiagnostics()}
+                  disabled={isDiagnosingTelegram || !telegramConfig.botToken.trim()}
+                  className="px-3.5 py-1.5 bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50 shadow-md shadow-sky-500/20"
+                  title="Run end-to-end bot connection audit, API key check, and ping test"
                 >
-                  <div className={`bg-white w-5 h-5 rounded-full shadow-md transform transition-transform ${telegramConfig.enabled ? 'translate-x-5' : 'translate-x-0'}`} />
-                </button>
-              </div>
-            </div>
-
-            {/* Step-by-Step Setup Guide */}
-            <div className="bg-sky-950/20 border border-sky-500/25 rounded-2xl p-4 sm:p-5 text-xs text-neutral-300 space-y-2.5">
-              <div className="flex items-center gap-2 font-semibold text-sky-300">
-                <Sparkles className="w-4 h-4 text-sky-400" />
-                <span>How to connect your Telegram Bot in 3 simple steps:</span>
-              </div>
-              <ol className="list-decimal list-inside space-y-1.5 text-neutral-300 pl-1 leading-relaxed">
-                <li>Open Telegram, search for <code className="bg-black/50 text-sky-300 px-1.5 py-0.5 rounded font-mono">@BotFather</code>, and send <code className="bg-black/50 text-sky-300 px-1.5 py-0.5 rounded font-mono">/newbot</code> to create a bot and copy your <b>Bot Token</b>.</li>
-                <li>Create your shared couple Telegram group, add your newly created bot to the group, and send a message.</li>
-                <li>Find your <b>Chat ID</b> by forwarding a message from the group to <code className="bg-black/50 text-sky-300 px-1.5 py-0.5 rounded font-mono">@userinfobot</code> or checking <code className="bg-black/50 text-sky-300 px-1.5 py-0.5 rounded font-mono">https://api.telegram.org/bot&lt;TOKEN&gt;/getUpdates</code> (group chat IDs start with <code className="font-mono">-100...</code>).</li>
-              </ol>
-            </div>
-
-            {/* Form: Credentials and Toggles */}
-            <form onSubmit={handleSaveTelegramConfig} className="space-y-6">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {/* Bot Token */}
-                <div>
-                  <label className="text-xs font-semibold text-neutral-300 mb-1.5 block">
-                    Telegram Bot Token (HTTP API)
-                  </label>
-                  <div className="relative">
-                    <input
-                      type={showBotToken ? "text" : "password"}
-                      value={telegramConfig.botToken}
-                      onChange={(e) => setTelegramConfig(prev => ({ ...prev, botToken: e.target.value }))}
-                      placeholder="123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
-                      className="w-full bg-neutral-950/80 border border-white/10 rounded-xl pl-3.5 pr-10 py-2.5 text-xs text-white focus:outline-none focus:border-sky-500/60 transition-all font-mono"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowBotToken(!showBotToken)}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-white cursor-pointer"
-                    >
-                      {showBotToken ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                    </button>
-                  </div>
-                </div>
-
-                {/* Primary Group Chat ID (Optional) */}
-                <div>
-                  <div className="flex items-center justify-between mb-1.5">
-                    <label className="text-xs font-semibold text-neutral-300 block">
-                      Primary Group Chat ID <span className="text-[10px] text-neutral-500 font-mono font-normal">(Optional for groups)</span>
-                    </label>
-                  </div>
-                  <input
-                    type="text"
-                    value={telegramConfig.chatId}
-                    onChange={(e) => setTelegramConfig(prev => ({ ...prev, chatId: e.target.value }))}
-                    placeholder="-100... (Optional for shared couple group chats)"
-                    className="w-full bg-neutral-950/80 border border-white/10 rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-sky-500/60 transition-all font-mono"
-                  />
-                  <p className="text-[10px] text-neutral-500 font-mono mt-1">
-                    Optional. Multi-users below receive alerts automatically in their personal chats by their @usernames.
-                  </p>
-                </div>
-              </div>
-
-              {/* Event Category Notification Toggles */}
-              <div>
-                <label className="text-xs font-semibold text-neutral-300 mb-2.5 block">
-                  Broadcast Event Triggers & Reminders
-                </label>
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                  <label className="flex items-center gap-2.5 bg-neutral-950/60 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
-                    <input
-                      type="checkbox"
-                      checked={telegramConfig.notifyMilestones}
-                      onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifyMilestones: e.target.checked }))}
-                      className="rounded border-white/20 text-sky-500 focus:ring-0"
-                    />
-                    <div>
-                      <span className="text-xs font-semibold text-white block">💍 Milestones & Anniversaries</span>
-                      <span className="text-[10px] text-neutral-400 font-mono">Countdowns & celebration pings</span>
-                    </div>
-                  </label>
-
-                  <label className="flex items-center gap-2.5 bg-neutral-950/60 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
-                    <input
-                      type="checkbox"
-                      checked={telegramConfig.notifyDates}
-                      onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifyDates: e.target.checked }))}
-                      className="rounded border-white/20 text-sky-500 focus:ring-0"
-                    />
-                    <div>
-                      <span className="text-xs font-semibold text-white block">🗓️ Date Night Reminders</span>
-                      <span className="text-[10px] text-neutral-400 font-mono">Itineraries & checklist alerts</span>
-                    </div>
-                  </label>
-
-                  <label className="flex items-center gap-2.5 bg-neutral-950/60 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
-                    <input
-                      type="checkbox"
-                      checked={telegramConfig.notifyLetters}
-                      onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifyLetters: e.target.checked }))}
-                      className="rounded border-white/20 text-sky-500 focus:ring-0"
-                    />
-                    <div>
-                      <span className="text-xs font-semibold text-white block">💌 Sealed Love Letters</span>
-                      <span className="text-[10px] text-neutral-400 font-mono">Alert when partner seals a letter</span>
-                    </div>
-                  </label>
-
-                  <label className="flex items-center gap-2.5 bg-neutral-950/60 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
-                    <input
-                      type="checkbox"
-                      checked={telegramConfig.notifyChat}
-                      onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifyChat: e.target.checked }))}
-                      className="rounded border-white/20 text-sky-500 focus:ring-0"
-                    />
-                    <div>
-                      <span className="text-xs font-semibold text-white block">💬 Sweet Chat Messages</span>
-                      <span className="text-[10px] text-neutral-400 font-mono">Direct message partner notices</span>
-                    </div>
-                  </label>
-
-                  <label className="flex items-center gap-2.5 bg-neutral-950/60 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
-                    <input
-                      type="checkbox"
-                      checked={telegramConfig.notifySecurity}
-                      onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifySecurity: e.target.checked }))}
-                      className="rounded border-white/20 text-sky-500 focus:ring-0"
-                    />
-                    <div>
-                      <span className="text-xs font-semibold text-white block">🛡️ Security & Login Alerts</span>
-                      <span className="text-[10px] text-neutral-400 font-mono">Suspicious login & tamper alerts</span>
-                    </div>
-                  </label>
-
-                  <label className="flex items-center gap-2.5 bg-neutral-950/60 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
-                    <input
-                      type="checkbox"
-                      checked={telegramConfig.notifyCards !== false}
-                      onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifyCards: e.target.checked }))}
-                      className="rounded border-white/20 text-sky-500 focus:ring-0"
-                    />
-                    <div>
-                      <span className="text-xs font-semibold text-white block">🎉 Choose Moment & Cards</span>
-                      <span className="text-[10px] text-neutral-400 font-mono">Interactive cards & celebrations</span>
-                    </div>
-                  </label>
-                </div>
-              </div>
-
-              {/* ========================================================= */}
-              {/* TELEGRAM MULTI-WHITELIST USERNAME MANAGER                  */}
-              {/* ========================================================= */}
-              <div className="bg-neutral-950/70 border border-white/10 rounded-2xl p-4 sm:p-5 space-y-4">
-                <div className="flex items-center justify-between flex-wrap gap-3 pb-3 border-b border-white/5">
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-2 rounded-xl bg-sky-500/10 text-sky-400 border border-sky-500/20">
-                      <Users className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <h4 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
-                          Telegram Whitelist Users ({activeCombinedWhitelist.length})
-                        </h4>
-                        <span className="text-[10px] px-2 py-0.5 rounded-full font-mono font-bold bg-sky-500/20 text-sky-300 border border-sky-500/30">
-                          Multi-Whitelist
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-neutral-400">
-                        Authorize partner and admin Telegram accounts to receive bot notifications and commands
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Auto-Sync Profiles Toggle */}
-                  <label className="flex items-center gap-2 bg-neutral-900 px-3 py-1.5 rounded-xl border border-white/10 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={telegramConfig.autoSyncProfiles !== false}
-                      onChange={(e) => setTelegramConfig(prev => ({ ...prev, autoSyncProfiles: e.target.checked }))}
-                      className="rounded border-white/20 text-sky-500 focus:ring-0"
-                    />
-                    <span className="text-[11px] text-neutral-300 font-mono">
-                      Auto-Sync from User Profiles
-                    </span>
-                  </label>
-                </div>
-
-                {/* Input to manually add whitelist username */}
-                <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
-                  <div className="relative flex-1 min-w-[200px]">
-                    <span className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-neutral-500 font-mono text-xs">
-                      @
-                    </span>
-                    <input
-                      type="text"
-                      placeholder="username (e.g. ebrahimayman)"
-                      value={newWhitelistUsername}
-                      onChange={(e) => setNewWhitelistUsername(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          e.preventDefault();
-                          handleAddWhitelistUsername();
-                        }
-                      }}
-                      className="w-full bg-neutral-900 border border-white/10 rounded-xl pl-8 pr-3 py-2 text-xs text-white placeholder-neutral-500 font-mono focus:outline-none focus:border-sky-500/60"
-                    />
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={handleAddWhitelistUsername}
-                    disabled={!newWhitelistUsername.trim()}
-                    className="px-3.5 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50 shrink-0"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    <span>Add to Whitelist</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={handleSyncAllProfilesToWhitelist}
-                    className="px-3.5 py-2 bg-neutral-800 hover:bg-neutral-700 border border-white/10 text-neutral-300 hover:text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer shrink-0"
-                    title="Import and lock all Telegram usernames entered by users in their profile modal"
-                  >
-                    <RefreshCw className="w-3.5 h-3.5 text-sky-400" />
-                    <span>Auto-Import {discoveredProfileUsernames.length} Profile(s)</span>
-                  </button>
-                </div>
-
-                {/* Whitelist Tag Chips */}
-                <div className="flex flex-wrap gap-2 pt-1">
-                  {activeCombinedWhitelist.map((username, idx) => {
-                    const matchedProfile = discoveredProfileUsernames.find(
-                      p => p.username.toLowerCase() === username.toLowerCase()
-                    );
-                    const isManual = (telegramConfig.whitelistedUsernames || []).includes(username);
-
-                    return (
-                      <div
-                        key={`tg-whitelist-${username}-${idx}`}
-                        className="flex items-center gap-2 bg-neutral-900 border border-white/10 hover:border-sky-500/30 px-3 py-1.5 rounded-xl transition-all text-xs"
-                      >
-                        <span className="font-mono text-sky-300 font-semibold">{username}</span>
-                        
-                        {matchedProfile ? (
-                          <span className="text-[9px] font-mono bg-purple-500/20 text-purple-300 border border-purple-500/30 px-1.5 py-0.5 rounded-md">
-                            Profile: {matchedProfile.accountName}
-                          </span>
-                        ) : (
-                          <span className="text-[9px] font-mono bg-neutral-800 text-neutral-400 px-1.5 py-0.5 rounded-md">
-                            Manual
-                          </span>
-                        )}
-
-                        {isManual && (
-                          <button
-                            type="button"
-                            onClick={() => handleRemoveWhitelistUsername(username)}
-                            className="text-neutral-500 hover:text-rose-400 transition-colors cursor-pointer ml-0.5"
-                            title="Remove from whitelist"
-                          >
-                            <X className="w-3.5 h-3.5" />
-                          </button>
-                        )}
-                      </div>
-                    );
-                  })}
-
-                  {activeCombinedWhitelist.length === 0 && (
-                    <p className="text-xs text-neutral-500 italic font-mono py-1">
-                      No Telegram usernames in whitelist yet. Add usernames above or users will be automatically added when saving their profile!
-                    </p>
+                  {isDiagnosingTelegram ? (
+                    <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  ) : (
+                    <Bug className="w-3.5 h-3.5" />
                   )}
+                  <span>🔍 Run Bot Diagnostics</span>
+                </button>
+
+                <div className="flex items-center gap-2 bg-neutral-950/60 border border-white/10 px-3 py-1.5 rounded-xl">
+                  <span className="text-xs font-mono text-neutral-300">Bot Broadcast</span>
+                  <button
+                    type="button"
+                    onClick={() => setTelegramConfig(prev => ({ ...prev, enabled: !prev.enabled }))}
+                    className={`w-10 h-5 flex items-center rounded-full p-0.5 transition-colors cursor-pointer ${telegramConfig.enabled ? 'bg-sky-500' : 'bg-neutral-800'}`}
+                  >
+                    <div className={`bg-white w-4 h-4 rounded-full shadow-md transform transition-transform ${telegramConfig.enabled ? 'translate-x-5' : 'translate-x-0'}`} />
+                  </button>
                 </div>
               </div>
+            </div>
 
-              {/* ========================================================= */}
-              {/* TELEGRAM WEBHOOK & TWO-WAY INTERACTION ENGINE              */}
-              {/* ========================================================= */}
-              <div className="bg-neutral-950/70 border border-white/10 rounded-2xl p-4 sm:p-5 space-y-4">
-                <div className="flex items-center justify-between flex-wrap gap-3 pb-3 border-b border-white/5">
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-2 rounded-xl bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
-                      <Sparkles className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <h4 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
-                          Telegram Webhook Engine (Two-Way Auto-Discovery)
-                        </h4>
-                        <span className={`text-[10px] px-2 py-0.5 rounded-full font-mono font-bold border ${telegramConfig.webhookEnabled ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' : 'bg-neutral-800 text-neutral-400 border-white/10'}`}>
-                          {telegramConfig.webhookEnabled ? 'Webhook Active 🟢' : 'Direct Push ⚪'}
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-neutral-400">
-                        Receives updates when partners send <code className="text-sky-300">/start</code> or <code className="text-sky-300">/chatid</code> to the bot and auto-replies with their Chat ID
-                      </p>
-                    </div>
-                  </div>
+            {/* Step-by-Step Setup Guide Banner */}
+            <div className="bg-gradient-to-r from-sky-950/30 via-indigo-950/20 to-neutral-950/40 border border-sky-500/20 rounded-2xl p-4 text-xs text-neutral-300 space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 font-semibold text-sky-300">
+                  <Sparkles className="w-4 h-4 text-sky-400" />
+                  <span>Telegram Bot Setup & Access Guide:</span>
                 </div>
-
-                {/* Webhook URL Input */}
-                <div className="space-y-1.5">
-                  <label className="text-xs font-semibold text-neutral-300 block">
-                    Public Webhook Endpoint URL
-                  </label>
-                  <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
-                    <input
-                      type="text"
-                      value={webhookInputUrl}
-                      onChange={(e) => setWebhookInputUrl(e.target.value)}
-                      placeholder="https://your-domain.vercel.app/api/telegram/webhook"
-                      className="w-full bg-neutral-900 border border-white/10 rounded-xl px-3.5 py-2 text-xs text-white placeholder-neutral-500 font-mono focus:outline-none focus:border-indigo-500/60"
-                    />
-
-                    <button
-                      type="button"
-                      disabled={isManagingWebhook || !telegramConfig.botToken || !webhookInputUrl}
-                      onClick={handleSetWebhook}
-                      className="px-3.5 py-2 bg-gradient-to-r from-indigo-600 to-sky-600 hover:from-indigo-500 hover:to-sky-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50 shrink-0"
-                    >
-                      {isManagingWebhook ? (
-                        <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                      ) : (
-                        <Sparkles className="w-3.5 h-3.5" />
-                      )}
-                      <span>Activate Webhook</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      disabled={isManagingWebhook || !telegramConfig.botToken}
-                      onClick={handleCheckWebhookInfo}
-                      className="px-3.5 py-2 bg-neutral-800 hover:bg-neutral-700 border border-white/10 text-neutral-300 hover:text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer shrink-0"
-                    >
-                      <span>Inspect Info</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      disabled={isManagingWebhook || !telegramConfig.botToken}
-                      onClick={handleDeleteWebhook}
-                      className="px-3 py-2 bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/20 rounded-xl text-xs font-semibold transition-all cursor-pointer shrink-0"
-                      title="Remove webhook and return to polling"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
+                <span className="text-[10px] font-mono text-neutral-400">Step-by-step connection</span>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-1 text-[11px] leading-relaxed">
+                <div className="bg-black/30 p-2.5 rounded-xl border border-white/5 space-y-1">
+                  <div className="font-semibold text-white flex items-center gap-1.5">
+                    <span className="w-4 h-4 rounded-full bg-sky-500/20 text-sky-300 flex items-center justify-center text-[10px] font-mono font-bold">1</span>
+                    <span>Get Bot Token</span>
                   </div>
-                  <p className="text-[10px] text-neutral-500 font-mono">
-                    Must be a publicly accessible HTTPS URL. Works with Vercel serverless function at <code className="text-sky-300">/api/telegram/webhook</code> or Express backend.
+                  <p className="text-neutral-400">
+                    Search <code className="text-sky-300">@BotFather</code> in Telegram, send <code className="text-sky-300">/newbot</code>, and copy your HTTP API Bot Token.
                   </p>
                 </div>
-
-                {/* Webhook Notice / Info output */}
-                {webhookStatusNotice && (
-                  <div className={`p-3 rounded-xl text-xs flex items-center gap-2 ${webhookStatusNotice.success ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-300' : 'bg-rose-500/10 border border-rose-500/20 text-rose-300'}`}>
-                    {webhookStatusNotice.success ? <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" /> : <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />}
-                    <span>{webhookStatusNotice.message}</span>
+                <div className="bg-black/30 p-2.5 rounded-xl border border-white/5 space-y-1">
+                  <div className="font-semibold text-white flex items-center gap-1.5">
+                    <span className="w-4 h-4 rounded-full bg-sky-500/20 text-sky-300 flex items-center justify-center text-[10px] font-mono font-bold">2</span>
+                    <span>Authorize Users</span>
                   </div>
-                )}
-
-                {webhookInfoData && (
-                  <div className="bg-black/50 p-3 rounded-xl border border-white/5 text-[11px] font-mono space-y-1 text-neutral-300">
-                    <div><b>Active URL:</b> <span className="text-sky-300">{webhookInfoData.url || 'None'}</span></div>
-                    <div><b>Pending Updates:</b> {webhookInfoData.pending_update_count || 0}</div>
-                    {webhookInfoData.last_error_message && (
-                      <div className="text-rose-400"><b>Last Error:</b> {webhookInfoData.last_error_message}</div>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              {/* ========================================================= */}
-              {/* MULTI-USER CONFIRMATION & ACCESS REGISTRY                 */}
-              {/* ========================================================= */}
-              <div className="bg-neutral-950/70 border border-white/10 rounded-2xl p-4 sm:p-5 space-y-4">
-                <div className="flex items-center justify-between flex-wrap gap-3 pb-3 border-b border-white/5">
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-2 rounded-xl bg-purple-500/10 text-purple-400 border border-purple-500/20">
-                      <Users className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <h4 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
-                          Multi-User Access & Confirmation Registry
-                        </h4>
-                        <span className="text-[10px] px-2 py-0.5 rounded-full font-mono font-bold bg-purple-500/20 text-purple-300 border border-purple-500/30">
-                          {telegramConfig.authorizedUsers?.length || 0} Users
-                        </span>
-                        <span className="text-[10px] px-2 py-0.5 rounded-full font-mono font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                          {telegramConfig.authorizedUsers?.filter(u => u.confirmed && u.isActive).length || 0} Active 🟢
-                        </span>
-                        {(telegramConfig.authorizedUsers?.filter(u => !u.confirmed).length || 0) > 0 && (
-                          <span className="text-[10px] px-2 py-0.5 rounded-full font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">
-                            {telegramConfig.authorizedUsers?.filter(u => !u.confirmed).length} Pending ⏳
-                          </span>
-                        )}
-                      </div>
-                      <p className="text-[11px] text-neutral-400">
-                        Authorize multiple partners and users by Telegram username. Users confirm access by sending <code className="text-sky-300">/confirm</code> to the bot.
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <button
-                      type="button"
-                      onClick={handleReleaseWebhookAndPull}
-                      disabled={isRefreshingSenders || !telegramConfig.botToken.trim()}
-                      className="px-3 py-2 bg-neutral-900 hover:bg-neutral-850 border border-white/10 text-neutral-300 hover:text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50"
-                      title="Deletes active Telegram webhook lock and pulls all unread messages from your bot"
-                    >
-                      <RefreshCw className={`w-3.5 h-3.5 text-sky-400 ${isRefreshingSenders ? 'animate-spin' : ''}`} />
-                      <span>Unlock Webhook & Pull</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={handleAutoResolveChatIds}
-                      disabled={isResolvingChatIds || !telegramConfig.botToken.trim()}
-                      className="px-3.5 py-2 bg-gradient-to-r from-purple-600 to-sky-600 hover:from-purple-500 hover:to-sky-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50 shadow-md shadow-purple-500/20"
-                      title="Inspect Telegram updates to auto-detect numeric Chat IDs for every username"
-                    >
-                      {isResolvingChatIds ? (
-                        <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                      ) : (
-                        <Sparkles className="w-3.5 h-3.5" />
-                      )}
-                      <span>Auto-Detect Chat IDs</span>
-                    </button>
-                  </div>
-
+                  <p className="text-neutral-400">
+                    Add Telegram usernames below. Users simply open your bot and send <code className="text-sky-300 font-mono">/start</code> or <code className="text-sky-300 font-mono">/confirm</code> to activate.
+                  </p>
                 </div>
-
-                {/* Auto-Resolve Status Notice */}
-                {autoResolveStatus && (
-                  <div className="p-3 bg-purple-500/10 border border-purple-500/20 rounded-xl text-xs text-purple-300 flex items-center gap-2">
-                    <CheckCircle className="w-4 h-4 text-purple-400 shrink-0" />
-                    <span>{autoResolveStatus}</span>
+                <div className="bg-black/30 p-2.5 rounded-xl border border-white/5 space-y-1">
+                  <div className="font-semibold text-white flex items-center gap-1.5">
+                    <span className="w-4 h-4 rounded-full bg-sky-500/20 text-sky-300 flex items-center justify-center text-[10px] font-mono font-bold">3</span>
+                    <span>Couple & Security Alerts</span>
                   </div>
-                )}
+                  <p className="text-neutral-400">
+                    Partners receive instant alerts for milestone countdowns, date nights, sealed love letters, chat messages, and cards!
+                  </p>
+                </div>
+              </div>
+            </div>
 
-                {/* Form: Add New Authorized User */}
-                <div className="bg-neutral-900/80 border border-white/10 rounded-xl p-3.5 space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold text-white flex items-center gap-1.5">
-                      <Plus className="w-3.5 h-3.5 text-purple-400" />
-                      <span>Authorize New Telegram User</span>
-                    </span>
-                    <span className="text-[10px] text-neutral-500 font-mono">Instant bot access authorization</span>
-                  </div>
+            {/* Unified Hub Sub-Navigation Tabs */}
+            <div className="flex items-center gap-2 p-1 bg-neutral-950/70 border border-white/10 rounded-2xl flex-wrap sm:flex-nowrap">
+              <button
+                type="button"
+                onClick={() => setTelegramHubActiveTab('users')}
+                className={`flex-1 py-2.5 px-4 rounded-xl text-xs font-semibold flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                  telegramHubActiveTab === 'users'
+                    ? 'bg-gradient-to-r from-sky-600 to-indigo-600 text-white shadow-md'
+                    : 'text-neutral-400 hover:text-white hover:bg-neutral-900'
+                }`}
+              >
+                <Users className="w-4 h-4" />
+                <span>👥 Authorized Users & Whitelist</span>
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-bold ${
+                  telegramHubActiveTab === 'users' ? 'bg-white/20 text-white' : 'bg-neutral-800 text-neutral-300'
+                }`}>
+                  {consolidatedTelegramUsers.length}
+                </span>
+              </button>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
-                    {/* Telegram Username */}
-                    <div>
-                      <label className="text-[10px] font-semibold text-neutral-400 block mb-1 font-mono uppercase">
-                        Telegram Username *
-                      </label>
-                      <div className="relative">
-                        <span className="absolute inset-y-0 left-0 pl-2.5 flex items-center pointer-events-none text-neutral-500 font-mono text-xs">
-                          @
-                        </span>
-                        <input
-                          type="text"
-                          placeholder="username (e.g. mariem)"
-                          value={newAuthUsername}
-                          onChange={(e) => setNewAuthUsername(e.target.value)}
-                          className="w-full bg-neutral-950 border border-white/10 rounded-xl pl-7 pr-3 py-1.5 text-xs text-white placeholder-neutral-500 font-mono focus:outline-none focus:border-purple-500/60"
-                        />
-                      </div>
-                    </div>
+              <button
+                type="button"
+                onClick={() => setTelegramHubActiveTab('senders')}
+                className={`flex-1 py-2.5 px-4 rounded-xl text-xs font-semibold flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                  telegramHubActiveTab === 'senders'
+                    ? 'bg-gradient-to-r from-sky-600 to-indigo-600 text-white shadow-md'
+                    : 'text-neutral-400 hover:text-white hover:bg-neutral-900'
+                }`}
+              >
+                <Send className="w-4 h-4" />
+                <span>📥 Detected Senders & Messages</span>
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-bold ${
+                  telegramHubActiveTab === 'senders' ? 'bg-white/20 text-white' : 'bg-neutral-800 text-neutral-300'
+                }`}>
+                  {detectedSenders.length}
+                </span>
+              </button>
 
-                    {/* Linked App Account */}
-                    <div>
-                      <label className="text-[10px] font-semibold text-neutral-400 block mb-1 font-mono uppercase">
-                        Linked App Profile
-                      </label>
-                      <select
-                        value={newAuthAppUsername}
-                        onChange={(e) => setNewAuthAppUsername(e.target.value)}
-                        className="w-full bg-neutral-950 border border-white/10 rounded-xl px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-purple-500/60"
-                      >
-                        <option value="">-- Choose Account --</option>
-                        {userAccounts.map(acc => (
-                          <option key={`opt-acc-${acc.id}`} value={acc.username}>
-                            {acc.username} {acc.gender ? `(${acc.gender})` : ''}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
+              <button
+                type="button"
+                onClick={() => setTelegramHubActiveTab('settings')}
+                className={`flex-1 py-2.5 px-4 rounded-xl text-xs font-semibold flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                  telegramHubActiveTab === 'settings'
+                    ? 'bg-gradient-to-r from-sky-600 to-indigo-600 text-white shadow-md'
+                    : 'text-neutral-400 hover:text-white hover:bg-neutral-900'
+                }`}
+              >
+                <Sliders className="w-4 h-4" />
+                <span>⚙️ Bot Config, Webhook & Triggers</span>
+              </button>
+            </div>
 
-                    {/* Optional Direct Chat ID */}
-                    <div>
-                      <label className="text-[10px] font-semibold text-neutral-400 block mb-1 font-mono uppercase">
-                        Chat ID (Optional)
-                      </label>
+            {/* ========================================================================= */}
+            {/* SUB-VIEW 1: AUTHORIZED USERS & WHITELIST DIRECTORY                        */}
+            {/* ========================================================================= */}
+            {telegramHubActiveTab === 'users' && (
+              <div className="space-y-4">
+                {/* Directory Controls: Search, Status Filters & Action Buttons */}
+                <div className="bg-neutral-950/70 border border-white/10 rounded-2xl p-4 space-y-3">
+                  <div className="flex items-center justify-between flex-wrap gap-3">
+                    {/* Search filter input */}
+                    <div className="relative flex-1 min-w-[220px]">
+                      <Search className="w-3.5 h-3.5 text-neutral-500 absolute left-3 top-1/2 -translate-y-1/2" />
                       <input
                         type="text"
-                        placeholder="Auto-captured on /confirm"
-                        value={newAuthChatId}
-                        onChange={(e) => setNewAuthChatId(e.target.value)}
-                        className="w-full bg-neutral-950 border border-white/10 rounded-xl px-2.5 py-1.5 text-xs text-white placeholder-neutral-500 font-mono focus:outline-none focus:border-purple-500/60"
+                        value={telegramUserSearch}
+                        onChange={(e) => setTelegramUserSearch(e.target.value)}
+                        placeholder="Search directory by @handle, account, or role..."
+                        className="w-full bg-neutral-900 border border-white/10 rounded-xl pl-9 pr-3 py-1.5 text-xs text-white placeholder-neutral-500 font-mono focus:outline-none focus:border-sky-500/60"
                       />
+                      {telegramUserSearch && (
+                        <button
+                          type="button"
+                          onClick={() => setTelegramUserSearch('')}
+                          className="absolute right-2.5 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-white"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      )}
                     </div>
 
-                    {/* Role & Submit */}
-                    <div className="flex items-end gap-2">
-                      <div className="flex-1">
-                        <label className="text-[10px] font-semibold text-neutral-400 block mb-1 font-mono uppercase">
-                          Access Role
-                        </label>
-                        <select
-                          value={newAuthRole}
-                          onChange={(e) => setNewAuthRole(e.target.value as any)}
-                          className="w-full bg-neutral-950 border border-white/10 rounded-xl px-2 py-1.5 text-xs text-white focus:outline-none focus:border-purple-500/60"
-                        >
-                          <option value="partner">Partner 💖</option>
-                          <option value="admin">Admin 🛡️</option>
-                          <option value="guest">Guest 👤</option>
-                        </select>
-                      </div>
+                    {/* Filter Pills */}
+                    <div className="flex items-center gap-1.5 bg-neutral-900 p-1 rounded-xl border border-white/5 flex-wrap">
+                      <button
+                        type="button"
+                        onClick={() => setTelegramUserFilter('all')}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-mono font-medium transition-all cursor-pointer ${
+                          telegramUserFilter === 'all' ? 'bg-sky-500/20 text-sky-300 border border-sky-500/30' : 'text-neutral-400 hover:text-white'
+                        }`}
+                      >
+                        All ({consolidatedTelegramUsers.length})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setTelegramUserFilter('verified')}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-mono font-medium transition-all cursor-pointer ${
+                          telegramUserFilter === 'verified' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' : 'text-neutral-400 hover:text-white'
+                        }`}
+                      >
+                        Verified ({consolidatedTelegramUsers.filter(u => u.confirmed && u.isActive).length})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setTelegramUserFilter('pending')}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-mono font-medium transition-all cursor-pointer ${
+                          telegramUserFilter === 'pending' ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30' : 'text-neutral-400 hover:text-white'
+                        }`}
+                      >
+                        Pending ({consolidatedTelegramUsers.filter(u => !u.confirmed).length})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setTelegramUserFilter('paused')}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-mono font-medium transition-all cursor-pointer ${
+                          telegramUserFilter === 'paused' ? 'bg-neutral-800 text-neutral-300 border border-white/10' : 'text-neutral-400 hover:text-white'
+                        }`}
+                      >
+                        Paused ({consolidatedTelegramUsers.filter(u => !u.isActive).length})
+                      </button>
+                    </div>
+
+                    {/* Toolbar Actions */}
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <label className="flex items-center gap-2 bg-neutral-900 px-3 py-1.5 rounded-xl border border-white/10 cursor-pointer" title="Automatically imports and links usernames saved in user profiles">
+                        <input
+                          type="checkbox"
+                          checked={telegramConfig.autoSyncProfiles !== false}
+                          onChange={(e) => setTelegramConfig(prev => ({ ...prev, autoSyncProfiles: e.target.checked }))}
+                          className="rounded border-white/20 text-sky-500 focus:ring-0"
+                        />
+                        <span className="text-[11px] text-neutral-300 font-mono">
+                          Auto-Sync Profiles
+                        </span>
+                      </label>
 
                       <button
                         type="button"
-                        onClick={handleAddTelegramAuthorizedUser}
-                        disabled={!newAuthUsername.trim()}
-                        className="px-3.5 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1 transition-all cursor-pointer disabled:opacity-50 shrink-0 h-[32px]"
+                        onClick={handleReleaseWebhookAndPull}
+                        disabled={isRefreshingSenders || !telegramConfig.botToken.trim()}
+                        className="px-3 py-1.5 bg-neutral-900 hover:bg-neutral-800 border border-white/10 text-neutral-300 hover:text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50"
+                        title="Deletes active Telegram webhook lock and pulls unread messages"
                       >
-                        <Plus className="w-3.5 h-3.5" />
-                        <span>Authorize</span>
+                        <RefreshCw className={`w-3.5 h-3.5 text-sky-400 ${isRefreshingSenders ? 'animate-spin' : ''}`} />
+                        <span>Unlock & Pull</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleAutoResolveChatIds}
+                        disabled={isResolvingChatIds || !telegramConfig.botToken.trim()}
+                        className="px-3.5 py-1.5 bg-gradient-to-r from-purple-600 to-sky-600 hover:from-purple-500 hover:to-sky-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50 shadow-md shadow-purple-500/20"
+                        title="Inspect Telegram updates to auto-detect numeric Chat IDs for every username"
+                      >
+                        {isResolvingChatIds ? (
+                          <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                        ) : (
+                          <Sparkles className="w-3.5 h-3.5" />
+                        )}
+                        <span>Auto-Detect Chat IDs</span>
                       </button>
                     </div>
                   </div>
+
+                  {/* Auto-Resolve Status Notice */}
+                  {autoResolveStatus && (
+                    <div className="p-3 bg-purple-500/10 border border-purple-500/20 rounded-xl text-xs text-purple-300 flex items-center gap-2">
+                      <CheckCircle className="w-4 h-4 text-purple-400 shrink-0" />
+                      <span>{autoResolveStatus}</span>
+                    </div>
+                  )}
+
+                  {/* Unified Add/Authorize User Input Row */}
+                  <form onSubmit={handleAddTelegramAuthorizedUser} className="bg-neutral-900/90 border border-white/10 rounded-xl p-3 pt-2.5 space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold text-white flex items-center gap-1.5">
+                        <Plus className="w-3.5 h-3.5 text-sky-400" />
+                        <span>Authorize & Whitelist New Telegram Account</span>
+                      </span>
+                      <span className="text-[10px] text-neutral-400 font-mono">
+                        Instant bot access & couple alerts authorization
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+                      {/* Telegram Username */}
+                      <div>
+                        <label className="text-[10px] font-semibold text-neutral-400 block mb-1 font-mono uppercase">
+                          Telegram Username *
+                        </label>
+                        <div className="relative">
+                          <span className="absolute inset-y-0 left-0 pl-2.5 flex items-center pointer-events-none text-neutral-500 font-mono text-xs">
+                            @
+                          </span>
+                          <input
+                            type="text"
+                            placeholder="username (e.g. mariem)"
+                            value={newAuthUsername}
+                            onChange={(e) => setNewAuthUsername(e.target.value)}
+                            className="w-full bg-neutral-950 border border-white/10 rounded-xl pl-7 pr-3 py-1.5 text-xs text-white placeholder-neutral-500 font-mono focus:outline-none focus:border-sky-500/60"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Linked App Account */}
+                      <div>
+                        <label className="text-[10px] font-semibold text-neutral-400 block mb-1 font-mono uppercase">
+                          Linked App Profile
+                        </label>
+                        <select
+                          value={newAuthAppUsername}
+                          onChange={(e) => setNewAuthAppUsername(e.target.value)}
+                          className="w-full bg-neutral-950 border border-white/10 rounded-xl px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-500/60 font-mono"
+                        >
+                          <option value="">-- Choose Account (Optional) --</option>
+                          {userAccounts.map(acc => (
+                            <option key={`opt-acc-${acc.id}`} value={acc.username}>
+                              {acc.username} {acc.gender ? `(${acc.gender})` : ''}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {/* Optional Chat ID */}
+                      <div>
+                        <label className="text-[10px] font-semibold text-neutral-400 block mb-1 font-mono uppercase">
+                          Chat ID (Optional)
+                        </label>
+                        <input
+                          type="text"
+                          placeholder="Auto-captured on /confirm"
+                          value={newAuthChatId}
+                          onChange={(e) => setNewAuthChatId(e.target.value)}
+                          className="w-full bg-neutral-950 border border-white/10 rounded-xl px-2.5 py-1.5 text-xs text-white placeholder-neutral-500 font-mono focus:outline-none focus:border-sky-500/60"
+                        />
+                      </div>
+
+                      {/* Role & Submit */}
+                      <div className="flex items-end gap-2">
+                        <div className="flex-1">
+                          <label className="text-[10px] font-semibold text-neutral-400 block mb-1 font-mono uppercase">
+                            Access Role
+                          </label>
+                          <select
+                            value={newAuthRole}
+                            onChange={(e) => setNewAuthRole(e.target.value as any)}
+                            className="w-full bg-neutral-950 border border-white/10 rounded-xl px-2 py-1.5 text-xs text-white focus:outline-none focus:border-sky-500/60 font-mono"
+                          >
+                            <option value="partner">Partner 💖</option>
+                            <option value="admin">Admin 🛡️</option>
+                            <option value="guest">Guest 👤</option>
+                          </select>
+                        </div>
+
+                        <button
+                          type="submit"
+                          disabled={!newAuthUsername.trim()}
+                          className="px-3.5 py-1.5 bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1 transition-all cursor-pointer disabled:opacity-50 shrink-0 h-[32px] shadow-sm"
+                        >
+                          <Plus className="w-3.5 h-3.5" />
+                          <span>Authorize</span>
+                        </button>
+                      </div>
+                    </div>
+                  </form>
                 </div>
 
-                {/* How Confirmation Works Guide Callout */}
-                <div className="bg-purple-950/20 border border-purple-500/25 rounded-xl p-3 text-[11px] text-neutral-300 flex items-start gap-2.5">
-                  <Sparkles className="w-4 h-4 text-purple-400 shrink-0 mt-0.5" />
-                  <div className="leading-relaxed">
-                    <b className="text-purple-300">How users confirm access via the bot:</b>
-                    <p className="mt-0.5 text-neutral-400">
-                      1. Once added here, the user opens your bot in Telegram and sends <code className="text-sky-300 font-mono font-bold">/confirm</code> or <code className="text-sky-300 font-mono font-bold">/start</code>.
-                      <br />
-                      2. The bot verifies their username, captures their Chat ID, grants them full access, and marks them <span className="text-emerald-400 font-semibold">Verified & Active 🟢</span>!
-                    </p>
-                  </div>
-                </div>
-
-                {/* Table / List of Authorized Users */}
+                {/* Unified User Directory List */}
                 <div className="space-y-2">
-                  {(telegramConfig.authorizedUsers || []).map((user) => {
-                    const notice = userActionNotice[user.id];
-                    const isTesting = testingUserId === user.id;
+                  {filteredConsolidatedUsers.map((user) => {
+                    const noticeKey = user.id || user.telegramUsername;
+                    const notice = userActionNotice[noticeKey];
+                    const isTesting = testingUserId === noticeKey;
 
                     return (
                       <div
-                        key={`auth-usr-${user.id}`}
-                        className={`p-3 rounded-xl border transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
-                          user.isActive 
-                            ? 'bg-neutral-900/90 border-white/10 hover:border-purple-500/30' 
+                        key={user.key}
+                        className={`p-3.5 rounded-2xl border transition-all flex flex-col md:flex-row md:items-center justify-between gap-3.5 ${
+                          user.isActive
+                            ? 'bg-neutral-950/70 border-white/10 hover:border-sky-500/30'
                             : 'bg-neutral-950/40 border-white/5 opacity-60'
                         }`}
                       >
-                        {/* User identity & badge */}
-                        <div className="flex items-center gap-3 min-w-0">
-                          <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-xs shrink-0 ${
-                            user.confirmed 
-                              ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' 
+                        {/* User Identity & Badges */}
+                        <div className="flex items-start sm:items-center gap-3 min-w-0">
+                          <div className={`w-9 h-9 rounded-full flex items-center justify-center font-bold text-xs shrink-0 mt-0.5 sm:mt-0 ${
+                            user.confirmed
+                              ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
                               : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
                           }`}>
                             {user.confirmed ? '✓' : '⏳'}
                           </div>
 
-                          <div className="min-w-0">
+                          <div className="min-w-0 space-y-1">
                             <div className="flex items-center gap-2 flex-wrap">
-                              <span className="font-mono text-xs font-bold text-white tracking-wide">
-                                {user.telegramUsername}
-                              </span>
+                              <a
+                                href={`https://t.me/${user.telegramUsername.replace(/^@/, '')}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="font-mono text-xs font-bold text-sky-300 hover:underline flex items-center gap-1"
+                              >
+                                <span>{user.telegramUsername}</span>
+                                <ExternalLink className="w-3 h-3 opacity-60" />
+                              </a>
 
-                              <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-300 border border-purple-500/20 uppercase font-semibold">
-                                {user.role || 'partner'}
+                              <span className="text-[9px] font-mono px-2 py-0.5 rounded-md bg-purple-500/15 text-purple-300 border border-purple-500/25 uppercase font-semibold">
+                                {user.role}
                               </span>
 
                               {user.confirmed ? (
-                                <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.2 rounded-full flex items-center gap-1">
-                                  <span>Verified & Active</span>
+                                <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded-full flex items-center gap-1">
+                                  <span>Verified & Active 🟢</span>
                                 </span>
                               ) : (
-                                <span className="text-[10px] font-mono text-amber-400 bg-amber-500/10 border border-amber-500/20 px-2 py-0.2 rounded-full">
-                                  Awaiting /confirm in bot
+                                <span className="text-[10px] font-mono text-amber-400 bg-amber-500/10 border border-amber-500/20 px-2 py-0.5 rounded-full">
+                                  Awaiting /confirm in bot ⏳
+                                </span>
+                              )}
+
+                              {user.source === 'profile' && (
+                                <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/20">
+                                  Profile Linked
                                 </span>
                               )}
                             </div>
 
-                            <div className="flex items-center gap-2 text-[10px] text-neutral-400 font-mono mt-0.5 flex-wrap">
+                            <div className="flex items-center gap-2 text-[11px] text-neutral-400 font-mono flex-wrap">
                               {user.appUsername && (
-                                <span>Profile: <strong className="text-neutral-200">@{user.appUsername}</strong></span>
+                                <span>Profile: <strong className="text-white">@{user.appUsername}</strong></span>
                               )}
                               <span>•</span>
-                              <span>Chat ID: <code className="text-sky-300">{user.chatId || 'Pending'}</code></span>
+                              <span>
+                                Chat ID: {user.chatId ? (
+                                  <code className="text-sky-300 font-bold bg-neutral-900 px-1.5 py-0.5 rounded border border-white/5">
+                                    {user.chatId}
+                                  </code>
+                                ) : (
+                                  <span className="text-neutral-500 italic">Pending /confirm in bot</span>
+                                )}
+                              </span>
                               {user.confirmedAt && (
                                 <>
                                   <span>•</span>
@@ -3643,7 +3327,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                             </div>
 
                             {notice && (
-                              <p className="text-[10px] font-mono mt-1 text-sky-400 animate-pulse">
+                              <p className="text-[10px] font-mono text-sky-400 animate-pulse">
                                 {notice}
                               </p>
                             )}
@@ -3651,26 +3335,32 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         </div>
 
                         {/* Action buttons */}
-                        <div className="flex items-center gap-2 self-end sm:self-center shrink-0">
-                          {/* Manual Confirm Button if pending */}
+                        <div className="flex items-center gap-2 self-end md:self-center shrink-0 flex-wrap">
+                          {/* Manual Confirm / Promote Button */}
                           {!user.confirmed && (
                             <button
                               type="button"
-                              onClick={() => handleManualConfirmUser(user.id)}
+                              onClick={() => {
+                                if (user.id) {
+                                  handleManualConfirmUser(user.id);
+                                } else {
+                                  handlePromoteWhitelistUser(user.telegramUsername, user.role);
+                                }
+                              }}
                               className="px-2.5 py-1 bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 rounded-lg text-[10px] font-semibold transition-all cursor-pointer"
-                              title="Manually verify and grant access without waiting for bot /confirm"
+                              title="Manually verify and grant access without waiting for /confirm"
                             >
                               Verify Access
                             </button>
                           )}
 
-                          {/* Send Individual Test Ping */}
+                          {/* Individual Diagnostic Ping Button */}
                           <button
                             type="button"
                             disabled={isTesting || !user.chatId}
                             onClick={() => handleTestIndividualUser(user)}
-                            className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 border border-white/10 text-neutral-200 rounded-lg text-[10px] font-semibold flex items-center gap-1 transition-all cursor-pointer disabled:opacity-40"
-                            title={user.chatId ? "Send a direct test alert to this user's personal Telegram chat" : "Chat ID not linked yet"}
+                            className="px-2.5 py-1 bg-neutral-900 hover:bg-neutral-800 border border-white/10 text-neutral-200 rounded-lg text-[10px] font-semibold flex items-center gap-1 transition-all cursor-pointer disabled:opacity-40"
+                            title={user.chatId ? `Send a direct test alert to ${user.telegramUsername}` : "User has not messaged bot yet"}
                           >
                             {isTesting ? (
                               <div className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />
@@ -3680,26 +3370,28 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                             <span>Test Ping</span>
                           </button>
 
-                          {/* Toggle Active Switch */}
-                          <button
-                            type="button"
-                            onClick={() => handleToggleAuthorizedUser(user.id, user.isActive)}
-                            className={`px-2 py-1 rounded-lg text-[10px] font-semibold border transition-all cursor-pointer ${
-                              user.isActive 
-                                ? 'bg-sky-500/15 border-sky-500/30 text-sky-300' 
-                                : 'bg-neutral-800 border-white/5 text-neutral-500'
-                            }`}
-                            title={user.isActive ? "Pause alerts for this user" : "Resume alerts for this user"}
-                          >
-                            {user.isActive ? 'Active' : 'Paused'}
-                          </button>
+                          {/* Toggle Active Switch if user has id */}
+                          {user.id && (
+                            <button
+                              type="button"
+                              onClick={() => handleToggleAuthorizedUser(user.id!, user.isActive)}
+                              className={`px-2 py-1 rounded-lg text-[10px] font-semibold border transition-all cursor-pointer ${
+                                user.isActive
+                                  ? 'bg-sky-500/15 border-sky-500/30 text-sky-300'
+                                  : 'bg-neutral-800 border-white/5 text-neutral-500'
+                              }`}
+                              title={user.isActive ? "Pause alerts for this user" : "Resume alerts"}
+                            >
+                              {user.isActive ? 'Active' : 'Paused'}
+                            </button>
+                          )}
 
-                          {/* Delete button */}
+                          {/* Delete button (removes cleanly from both registry and whitelist) */}
                           <button
                             type="button"
-                            onClick={() => handleRemoveAuthorizedUser(user.id)}
-                            className="p-1 text-neutral-500 hover:text-rose-400 rounded-lg hover:bg-rose-500/10 transition-colors cursor-pointer"
-                            title="Remove authorized user"
+                            onClick={() => handleRemoveConsolidatedUser(user)}
+                            className="p-1.5 text-neutral-500 hover:text-rose-400 rounded-lg hover:bg-rose-500/10 transition-colors cursor-pointer"
+                            title="Remove user from Telegram & Security Hub"
                           >
                             <Trash2 className="w-3.5 h-3.5" />
                           </button>
@@ -3708,68 +3400,64 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     );
                   })}
 
-                  {(telegramConfig.authorizedUsers || []).length === 0 && (
-                    <div className="p-4 rounded-xl border border-dashed border-white/10 text-center space-y-1">
-                      <p className="text-xs text-neutral-400 font-medium">No multi-users registered in registry yet.</p>
-                      <p className="text-[10px] text-neutral-500 font-mono">
-                        Add your partner's Telegram username above or have them save it in their user profile to grant them personal bot access!
+                  {filteredConsolidatedUsers.length === 0 && (
+                    <div className="p-6 rounded-2xl border border-dashed border-white/10 text-center space-y-2">
+                      <p className="text-xs text-neutral-300 font-semibold">
+                        {telegramUserSearch ? 'No matching users found in directory.' : 'No users registered in Telegram & Security Hub yet.'}
+                      </p>
+                      <p className="text-[11px] text-neutral-400 max-w-md mx-auto">
+                        Add a partner's Telegram username above or have them save their Telegram handle in their User Profile to grant access!
                       </p>
                     </div>
                   )}
                 </div>
               </div>
+            )}
 
-              {/* ========================================================= */}
-              {/* LIVE DETECTED TELEGRAM SENDERS & RECENT BOT MESSAGES      */}
-              {/* ========================================================= */}
-              <div className="bg-neutral-950/70 border border-white/10 rounded-2xl p-4 sm:p-5 space-y-4">
-                <div className="flex items-center justify-between flex-wrap gap-3 pb-3 border-b border-white/5">
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-2 rounded-xl bg-sky-500/10 text-sky-400 border border-sky-500/20">
-                      <Send className="w-4 h-4" />
-                    </div>
+            {/* ========================================================================= */}
+            {/* SUB-VIEW 2: DETECTED TELEGRAM SENDERS & LIVE MESSAGES                     */}
+            {/* ========================================================================= */}
+            {telegramHubActiveTab === 'senders' && (
+              <div className="space-y-4">
+                <div className="bg-neutral-950/70 border border-white/10 rounded-2xl p-4 space-y-3">
+                  <div className="flex items-center justify-between flex-wrap gap-3">
                     <div>
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <h4 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
-                          Detected Telegram Senders ({detectedSenders.length})
-                        </h4>
-                        <span className="text-[10px] px-2 py-0.5 rounded-full font-mono font-bold bg-sky-500/20 text-sky-300 border border-sky-500/30">
-                          Live Feed
-                        </span>
-                      </div>
+                      <h4 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
+                        Live Detected Telegram Senders ({detectedSenders.length})
+                      </h4>
                       <p className="text-[11px] text-neutral-400">
-                        Recent users who messaged your bot with <code className="text-sky-300 font-mono">start</code>, <code className="text-sky-300 font-mono">confirm</code>, or any text. Link any user instantly with 1 click.
+                        Inbound messages sent to your bot (<code className="text-sky-300 font-mono">/start</code>, <code className="text-sky-300 font-mono">/confirm</code>). Link any sender to an account with 1 click.
                       </p>
                     </div>
-                  </div>
 
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <button
-                      type="button"
-                      onClick={handleRefreshDetectedSenders}
-                      disabled={isRefreshingSenders || !telegramConfig.botToken.trim()}
-                      className="px-3 py-1.5 bg-neutral-900 hover:bg-neutral-800 border border-white/10 text-neutral-300 hover:text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50"
-                      title="Fetch latest updates and webhook messages"
-                    >
-                      <RefreshCw className={`w-3.5 h-3.5 text-sky-400 ${isRefreshingSenders ? 'animate-spin' : ''}`} />
-                      <span>Refresh Messages</span>
-                    </button>
-
-                    {detectedSenders.length > 0 && (
+                    <div className="flex items-center gap-2">
                       <button
                         type="button"
-                        onClick={handleClearDetectedSenders}
-                        className="px-2.5 py-1.5 bg-neutral-900 hover:bg-neutral-800 border border-white/10 text-neutral-400 hover:text-rose-400 rounded-xl text-xs font-semibold flex items-center gap-1 transition-all cursor-pointer"
-                        title="Clear recent message log"
+                        onClick={handleRefreshDetectedSenders}
+                        disabled={isRefreshingSenders || !telegramConfig.botToken.trim()}
+                        className="px-3 py-1.5 bg-neutral-900 hover:bg-neutral-800 border border-white/10 text-neutral-300 hover:text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50"
+                        title="Fetch latest updates and unread messages"
                       >
-                        <Trash2 className="w-3.5 h-3.5" />
-                        <span>Clear</span>
+                        <RefreshCw className={`w-3.5 h-3.5 text-sky-400 ${isRefreshingSenders ? 'animate-spin' : ''}`} />
+                        <span>Refresh Messages</span>
                       </button>
-                    )}
+
+                      {detectedSenders.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={handleClearDetectedSenders}
+                          className="px-2.5 py-1.5 bg-neutral-900 hover:bg-neutral-800 border border-white/10 text-neutral-400 hover:text-rose-400 rounded-xl text-xs font-semibold flex items-center gap-1 transition-all cursor-pointer"
+                          title="Clear message history"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>Clear Log</span>
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
 
-                {/* Senders List */}
+                {/* Senders Cards */}
                 <div className="space-y-2.5">
                   {detectedSenders.map((sender, idx) => {
                     const isLinked = (telegramConfig.authorizedUsers || []).some(
@@ -3784,10 +3472,10 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     return (
                       <div
                         key={`det-snd-${sender.chatId}-${idx}`}
-                        className={`p-3.5 rounded-xl border transition-all flex flex-col md:flex-row md:items-center justify-between gap-3 ${
+                        className={`p-3.5 rounded-2xl border transition-all flex flex-col md:flex-row md:items-center justify-between gap-3.5 ${
                           isLinked 
-                            ? 'bg-neutral-900/60 border-emerald-500/20' 
-                            : 'bg-neutral-900/90 border-white/10 hover:border-sky-500/30'
+                            ? 'bg-neutral-950/70 border-emerald-500/20' 
+                            : 'bg-neutral-950/90 border-white/10 hover:border-sky-500/30'
                         }`}
                       >
                         {/* Sender info */}
@@ -3835,7 +3523,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
                             {/* Message details & Chat ID */}
                             <div className="flex items-center gap-2 text-[11px] font-mono text-neutral-300 flex-wrap">
-                              <div className="flex items-center gap-1.5 bg-neutral-950/80 px-2 py-0.5 rounded-md border border-white/5">
+                              <div className="flex items-center gap-1.5 bg-neutral-900 px-2 py-0.5 rounded-md border border-white/5">
                                 <span className="text-neutral-500">Chat ID:</span>
                                 <code className="text-sky-300 font-bold">{sender.chatId}</code>
                                 <button
@@ -3849,8 +3537,8 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                               </div>
 
                               {sender.text && (
-                                <div className="bg-neutral-950/80 px-2 py-0.5 rounded-md border border-white/5 text-neutral-400 truncate max-w-[220px]">
-                                  <span>Message: </span>
+                                <div className="bg-neutral-900 px-2 py-0.5 rounded-md border border-white/5 text-neutral-300 truncate max-w-[240px]">
+                                  <span>Msg: </span>
                                   <strong className="text-white">"{sender.text}"</strong>
                                 </div>
                               )}
@@ -3870,9 +3558,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                             <select
                               value={selectedLinkTargets[sender.chatId] || sender.username || activeCombinedWhitelist[0] || ''}
                               onChange={(e) => setSelectedLinkTargets(prev => ({ ...prev, [sender.chatId]: e.target.value }))}
-                              className="bg-neutral-950 border border-white/10 rounded-xl px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-500/60 font-mono"
+                              className="bg-neutral-900 border border-white/10 rounded-xl px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-500/60 font-mono"
                             >
-                              <optgroup label="Whitelist Usernames">
+                              <optgroup label="Whitelist Handles">
                                 {activeCombinedWhitelist.map(u => (
                                   <option key={`wh-tgt-${u}`} value={u}>{u}</option>
                                 ))}
@@ -3910,78 +3598,574 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                   })}
 
                   {detectedSenders.length === 0 && (
-                    <div className="p-4 rounded-xl border border-dashed border-white/10 text-center space-y-1.5">
+                    <div className="p-6 rounded-2xl border border-dashed border-white/10 text-center space-y-2">
                       <p className="text-xs text-neutral-300 font-semibold">No recent Telegram bot messages captured yet.</p>
-                      <p className="text-[11px] text-neutral-400 leading-relaxed max-w-lg mx-auto">
-                        Open Telegram on your phone or computer, open your bot, and send <code className="text-sky-300 font-mono font-bold">start</code> or <code className="text-sky-300 font-mono font-bold">confirm</code>. Then click <b>"Refresh Messages"</b> or <b>"Auto-Detect Chat IDs"</b> above!
+                      <p className="text-[11px] text-neutral-400 max-w-lg mx-auto">
+                        Open your bot in Telegram and send <code className="text-sky-300 font-mono font-bold">/start</code> or <code className="text-sky-300 font-mono font-bold">/confirm</code>. Then click <b>"Refresh Messages"</b> or <b>"Auto-Detect Chat IDs"</b> above!
                       </p>
                     </div>
                   )}
                 </div>
               </div>
+            )}
 
+            {/* ========================================================================= */}
+            {/* SUB-VIEW 3: BOT CREDENTIALS, WEBHOOK & EVENT TRIGGERS                     */}
+            {/* ========================================================================= */}
+            {telegramHubActiveTab === 'settings' && (
+              <div className="space-y-6">
+                {/* Credentials Grid */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {/* Bot Token */}
+                  <div className="bg-neutral-950/70 border border-white/10 rounded-2xl p-4 space-y-2">
+                    <label className="text-xs font-semibold text-neutral-300 block">
+                      Telegram Bot Token (HTTP API)
+                    </label>
+                    <div className="relative">
+                      <input
+                        type={showBotToken ? "text" : "password"}
+                        value={telegramConfig.botToken}
+                        onChange={(e) => setTelegramConfig(prev => ({ ...prev, botToken: e.target.value }))}
+                        placeholder="123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+                        className="w-full bg-neutral-900 border border-white/10 rounded-xl pl-3.5 pr-10 py-2.5 text-xs text-white focus:outline-none focus:border-sky-500/60 transition-all font-mono"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowBotToken(!showBotToken)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-white cursor-pointer"
+                      >
+                        {showBotToken ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-neutral-500 font-mono">
+                      Generated by Telegram's @BotFather when creating your bot.
+                    </p>
+                  </div>
 
-              {/* Status Feedback */}
-              {telegramTestStatus && (
-                <div className={`p-3 rounded-xl text-xs flex items-center gap-2 ${telegramTestStatus.success ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-300' : 'bg-rose-500/10 border border-rose-500/20 text-rose-300'}`}>
-                  {telegramTestStatus.success ? <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" /> : <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />}
-                  <span>{telegramTestStatus.message}</span>
+                  {/* Primary Group Chat ID (Optional) */}
+                  <div className="bg-neutral-950/70 border border-white/10 rounded-2xl p-4 space-y-2">
+                    <label className="text-xs font-semibold text-neutral-300 block">
+                      Primary Group Chat ID <span className="text-[10px] text-neutral-500 font-mono font-normal">(Optional for shared groups)</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={telegramConfig.chatId}
+                      onChange={(e) => setTelegramConfig(prev => ({ ...prev, chatId: e.target.value }))}
+                      placeholder="-100... (Optional for shared couple group chats)"
+                      className="w-full bg-neutral-900 border border-white/10 rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-sky-500/60 transition-all font-mono"
+                    />
+                    <p className="text-[10px] text-neutral-500 font-mono">
+                      Optional. Authorized users receive alerts in their personal chats automatically by their @usernames.
+                    </p>
+                  </div>
                 </div>
-              )}
 
-              {telegramSaveStatus && (
-                <div className="p-3 bg-emerald-500/10 border border-emerald-500/20 rounded-xl text-xs text-emerald-300 flex items-center gap-2">
-                  <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
-                  <span>{telegramSaveStatus}</span>
+                {/* Event Category Notification Toggles */}
+                <div className="bg-neutral-950/70 border border-white/10 rounded-2xl p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h4 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
+                        Broadcast Event Triggers & Reminders
+                      </h4>
+                      <p className="text-[11px] text-neutral-400">
+                        Choose which romance, couple celebration, and security events trigger automated Telegram alerts
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                    <label className="flex items-center gap-2.5 bg-neutral-900 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
+                      <input
+                        type="checkbox"
+                        checked={telegramConfig.notifyMilestones}
+                        onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifyMilestones: e.target.checked }))}
+                        className="rounded border-white/20 text-sky-500 focus:ring-0"
+                      />
+                      <div>
+                        <span className="text-xs font-semibold text-white block">💍 Milestones & Anniversaries</span>
+                        <span className="text-[10px] text-neutral-400 font-mono">Countdowns & celebration pings</span>
+                      </div>
+                    </label>
+
+                    <label className="flex items-center gap-2.5 bg-neutral-900 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
+                      <input
+                        type="checkbox"
+                        checked={telegramConfig.notifyDates}
+                        onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifyDates: e.target.checked }))}
+                        className="rounded border-white/20 text-sky-500 focus:ring-0"
+                      />
+                      <div>
+                        <span className="text-xs font-semibold text-white block">🗓️ Date Night Reminders</span>
+                        <span className="text-[10px] text-neutral-400 font-mono">Itineraries & checklist alerts</span>
+                      </div>
+                    </label>
+
+                    <label className="flex items-center gap-2.5 bg-neutral-900 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
+                      <input
+                        type="checkbox"
+                        checked={telegramConfig.notifyLetters}
+                        onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifyLetters: e.target.checked }))}
+                        className="rounded border-white/20 text-sky-500 focus:ring-0"
+                      />
+                      <div>
+                        <span className="text-xs font-semibold text-white block">💌 Sealed Love Letters</span>
+                        <span className="text-[10px] text-neutral-400 font-mono">Alert when partner seals a letter</span>
+                      </div>
+                    </label>
+
+                    <label className="flex items-center gap-2.5 bg-neutral-900 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
+                      <input
+                        type="checkbox"
+                        checked={telegramConfig.notifyChat}
+                        onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifyChat: e.target.checked }))}
+                        className="rounded border-white/20 text-sky-500 focus:ring-0"
+                      />
+                      <div>
+                        <span className="text-xs font-semibold text-white block">💬 Sweet Chat Messages</span>
+                        <span className="text-[10px] text-neutral-400 font-mono">Direct message partner notices</span>
+                      </div>
+                    </label>
+
+                    <label className="flex items-center gap-2.5 bg-neutral-900 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
+                      <input
+                        type="checkbox"
+                        checked={telegramConfig.notifySecurity}
+                        onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifySecurity: e.target.checked }))}
+                        className="rounded border-white/20 text-sky-500 focus:ring-0"
+                      />
+                      <div>
+                        <span className="text-xs font-semibold text-white block">🛡️ Security & Login Alerts</span>
+                        <span className="text-[10px] text-neutral-400 font-mono">Suspicious login & lockout alerts</span>
+                      </div>
+                    </label>
+
+                    <label className="flex items-center gap-2.5 bg-neutral-900 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
+                      <input
+                        type="checkbox"
+                        checked={telegramConfig.notifyCards !== false}
+                        onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifyCards: e.target.checked }))}
+                        className="rounded border-white/20 text-sky-500 focus:ring-0"
+                      />
+                      <div>
+                        <span className="text-xs font-semibold text-white block">🎉 Choose Moment & Cards</span>
+                        <span className="text-[10px] text-neutral-400 font-mono">Interactive cards & celebrations</span>
+                      </div>
+                    </label>
+                  </div>
                 </div>
-              )}
 
-              {/* Buttons: Test Connection & Save */}
-              <div className="flex items-center gap-3 pt-2 flex-wrap">
-                <button
-                  type="button"
-                  disabled={isTestingTelegram || !telegramConfig.botToken.trim()}
-                  onClick={handleTestTelegramConnection}
-                  className="px-4 py-2.5 bg-neutral-800 hover:bg-neutral-700 border border-white/10 text-white rounded-xl text-xs font-semibold flex items-center gap-2 transition-all cursor-pointer disabled:opacity-50"
-                  title="Dispatches a test alert to all confirmed user chat IDs simultaneously"
-                >
-                  {isTestingTelegram ? (
-                    <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                  ) : (
-                    <Send className="w-3.5 h-3.5 text-sky-400" />
-                  )}
-                  <span>Broadcast Test Alert to All Users</span>
-                </button>
+                {/* Telegram Webhook Engine */}
+                <div className="bg-neutral-950/70 border border-white/10 rounded-2xl p-4 space-y-3">
+                  <div className="flex items-center justify-between flex-wrap gap-2">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <h4 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
+                          Telegram Webhook Engine (Two-Way Auto-Discovery)
+                        </h4>
+                        <span className={`text-[10px] px-2 py-0.5 rounded-full font-mono font-bold border ${telegramConfig.webhookEnabled ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' : 'bg-neutral-800 text-neutral-400 border-white/10'}`}>
+                          {telegramConfig.webhookEnabled ? 'Webhook Active 🟢' : 'Direct Polling ⚪'}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-neutral-400">
+                        Receives updates when partners send <code className="text-sky-300">/start</code> or <code className="text-sky-300">/confirm</code> to the bot and auto-replies
+                      </p>
+                    </div>
+                  </div>
 
-                <button
-                  type="button"
-                  disabled={isResolvingChatIds || !telegramConfig.botToken.trim()}
-                  onClick={handleAutoResolveChatIds}
-                  className="px-4 py-2.5 bg-purple-950/60 hover:bg-purple-900/60 border border-purple-500/30 text-purple-200 rounded-xl text-xs font-semibold flex items-center gap-2 transition-all cursor-pointer disabled:opacity-50"
-                  title="Auto-detects Chat IDs for all whitelisted usernames from Telegram bot updates"
-                >
-                  {isResolvingChatIds ? (
-                    <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                  ) : (
-                    <Sparkles className="w-3.5 h-3.5 text-purple-400" />
-                  )}
-                  <span>Auto-Detect Chat IDs</span>
-                </button>
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-semibold text-neutral-300 block">
+                      Public Webhook Endpoint URL
+                    </label>
+                    <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
+                      <input
+                        type="text"
+                        value={webhookInputUrl}
+                        onChange={(e) => setWebhookInputUrl(e.target.value)}
+                        placeholder="https://your-domain.app/api/telegram/webhook"
+                        className="w-full bg-neutral-900 border border-white/10 rounded-xl px-3.5 py-2 text-xs text-white placeholder-neutral-500 font-mono focus:outline-none focus:border-indigo-500/60"
+                      />
 
-                <button
-                  type="submit"
-                  disabled={isSavingTelegram}
-                  className="px-5 py-2.5 bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white rounded-xl text-xs font-semibold flex items-center gap-2 transition-all cursor-pointer shadow-md shadow-sky-500/15"
-                >
-                  {isSavingTelegram ? (
-                    <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                  ) : (
-                    <Check className="w-3.5 h-3.5" />
+                      <button
+                        type="button"
+                        disabled={isManagingWebhook || !telegramConfig.botToken || !webhookInputUrl}
+                        onClick={handleSetWebhook}
+                        className="px-3.5 py-2 bg-gradient-to-r from-indigo-600 to-sky-600 hover:from-indigo-500 hover:to-sky-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50 shrink-0 shadow-sm"
+                      >
+                        {isManagingWebhook ? (
+                          <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                        ) : (
+                          <Sparkles className="w-3.5 h-3.5" />
+                        )}
+                        <span>Activate Webhook</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={isManagingWebhook || !telegramConfig.botToken}
+                        onClick={handleCheckWebhookInfo}
+                        className="px-3.5 py-2 bg-neutral-800 hover:bg-neutral-700 border border-white/10 text-neutral-300 hover:text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer shrink-0"
+                      >
+                        <span>Inspect Info</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={isManagingWebhook || !telegramConfig.botToken}
+                        onClick={handleDeleteWebhook}
+                        className="px-3 py-2 bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/20 rounded-xl text-xs font-semibold transition-all cursor-pointer shrink-0"
+                        title="Remove webhook and return to polling"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {webhookStatusNotice && (
+                    <div className={`p-3 rounded-xl text-xs flex items-center gap-2 ${webhookStatusNotice.success ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-300' : 'bg-rose-500/10 border border-rose-500/20 text-rose-300'}`}>
+                      {webhookStatusNotice.success ? <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" /> : <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />}
+                      <span>{webhookStatusNotice.message}</span>
+                    </div>
                   )}
-                  <span>Save Telegram Settings</span>
-                </button>
+
+                  {webhookInfoData && (
+                    <div className="bg-black/50 p-3 rounded-xl border border-white/5 text-[11px] font-mono space-y-1 text-neutral-300">
+                      <div><b>Active URL:</b> <span className="text-sky-300">{webhookInfoData.url || 'None'}</span></div>
+                      <div><b>Pending Updates:</b> {webhookInfoData.pending_update_count || 0}</div>
+                      {webhookInfoData.last_error_message && (
+                        <div className="text-rose-400"><b>Last Error:</b> {webhookInfoData.last_error_message}</div>
+                      )}
+                    </div>
+                  )}
+                </div>
               </div>
-            </form>
+            )}
+
+            {/* Status Feedback */}
+            {telegramTestStatus && (
+              <div className={`p-3.5 rounded-2xl text-xs flex items-center gap-2.5 ${telegramTestStatus.success ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-300' : 'bg-rose-500/10 border border-rose-500/20 text-rose-300'}`}>
+                {telegramTestStatus.success ? <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" /> : <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />}
+                <span className="leading-relaxed">{telegramTestStatus.message}</span>
+              </div>
+            )}
+
+            {telegramSaveStatus && (
+              <div className="p-3.5 bg-emerald-500/10 border border-emerald-500/20 rounded-2xl text-xs text-emerald-300 flex items-center gap-2.5">
+                <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span>{telegramSaveStatus}</span>
+              </div>
+            )}
+
+            {/* Bottom Primary Actions Bar */}
+            <div className="flex items-center gap-3 pt-3 flex-wrap border-t border-white/5">
+              {/* DIAGNOSTIC BUTTON: Sends test message & audits connection */}
+              <button
+                type="button"
+                disabled={isDiagnosingTelegram || !telegramConfig.botToken.trim()}
+                onClick={() => handleRunDiagnostics()}
+                className="px-4 py-2.5 bg-gradient-to-r from-sky-600 via-indigo-600 to-purple-600 hover:from-sky-500 hover:to-purple-500 text-white rounded-xl text-xs font-semibold flex items-center gap-2 transition-all cursor-pointer disabled:opacity-50 shadow-md shadow-sky-500/20"
+                title="Sends a test diagnostic message and audits Bot API connection, latency, and keys"
+              >
+                {isDiagnosingTelegram ? (
+                  <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                ) : (
+                  <Bug className="w-3.5 h-3.5" />
+                )}
+                <span>🔍 Run Bot Diagnostics & API Ping</span>
+              </button>
+
+              <button
+                type="button"
+                disabled={isTestingTelegram || !telegramConfig.botToken.trim()}
+                onClick={handleTestTelegramConnection}
+                className="px-4 py-2.5 bg-neutral-800 hover:bg-neutral-700 border border-white/10 text-white rounded-xl text-xs font-semibold flex items-center gap-2 transition-all cursor-pointer disabled:opacity-50"
+                title="Dispatches a test alert to all confirmed user chat IDs simultaneously"
+              >
+                {isTestingTelegram ? (
+                  <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                ) : (
+                  <Send className="w-3.5 h-3.5 text-sky-400" />
+                )}
+                <span>📢 Broadcast Alert to All Users</span>
+              </button>
+
+              <button
+                type="button"
+                disabled={isResolvingChatIds || !telegramConfig.botToken.trim()}
+                onClick={handleAutoResolveChatIds}
+                className="px-4 py-2.5 bg-purple-950/60 hover:bg-purple-900/60 border border-purple-500/30 text-purple-200 rounded-xl text-xs font-semibold flex items-center gap-2 transition-all cursor-pointer disabled:opacity-50"
+                title="Auto-detects Chat IDs for all whitelisted usernames from Telegram bot updates"
+              >
+                {isResolvingChatIds ? (
+                  <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                ) : (
+                  <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+                )}
+                <span>⚡ Auto-Detect Chat IDs</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleSaveTelegramConfig()}
+                disabled={isSavingTelegram}
+                className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-semibold flex items-center gap-2 transition-all cursor-pointer shadow-md shadow-emerald-500/15 ml-auto"
+              >
+                {isSavingTelegram ? (
+                  <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                ) : (
+                  <Check className="w-3.5 h-3.5" />
+                )}
+                <span>💾 Save Telegram Settings</span>
+              </button>
+            </div>
+
+            {/* ========================================================================= */}
+            {/* COMPREHENSIVE BOT DIAGNOSTIC & API TEST MODAL                             */}
+            {/* ========================================================================= */}
+            {showDiagnosticModal && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in duration-200">
+                <div className="bg-neutral-900 border border-white/15 rounded-3xl max-w-2xl w-full max-h-[90vh] overflow-y-auto p-6 space-y-5 shadow-2xl relative">
+                  
+                  {/* Modal Header */}
+                  <div className="flex items-center justify-between border-b border-white/10 pb-4">
+                    <div className="flex items-center gap-3">
+                      <div className="p-2.5 bg-sky-500/20 text-sky-400 rounded-2xl border border-sky-500/30">
+                        <Bug className="w-5 h-5" />
+                      </div>
+                      <div>
+                        <h3 className="text-base font-bold text-white font-serif">
+                          Telegram Bot Connection Diagnostics & Audit
+                        </h3>
+                        <p className="text-xs text-neutral-400 font-mono">
+                          API key validation, latency check & live test message delivery
+                        </p>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => setShowDiagnosticModal(false)}
+                      className="p-2 text-neutral-400 hover:text-white rounded-xl hover:bg-white/5 transition-colors cursor-pointer"
+                    >
+                      <X className="w-5 h-5" />
+                    </button>
+                  </div>
+
+                  {/* Execution Spinner if running */}
+                  {isDiagnosingTelegram && (
+                    <div className="py-12 text-center space-y-3">
+                      <div className="w-10 h-10 border-3 border-sky-500/30 border-t-sky-400 rounded-full animate-spin mx-auto" />
+                      <p className="text-xs font-mono text-sky-300">
+                        Auditing Telegram API cloud connection & bot credentials...
+                      </p>
+                    </div>
+                  )}
+
+                  {/* Diagnostic Results Report */}
+                  {!isDiagnosingTelegram && diagnosticReport && (
+                    <div className="space-y-4">
+                      {/* Overall Health Summary Banner */}
+                      <div className={`p-4 rounded-2xl border flex items-center justify-between flex-wrap gap-3 ${
+                        diagnosticReport.success
+                          ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                          : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+                      }`}>
+                        <div className="flex items-center gap-3">
+                          {diagnosticReport.success ? (
+                            <CheckCircle2 className="w-6 h-6 text-emerald-400 shrink-0" />
+                          ) : (
+                            <XCircle className="w-6 h-6 text-rose-400 shrink-0" />
+                          )}
+                          <div>
+                            <h4 className="text-sm font-bold">
+                              {diagnosticReport.success ? 'Diagnostic Passed: Telegram Bot Online 🟢' : 'Diagnostic Alert: Connection Issue Detected 🔴'}
+                            </h4>
+                            <p className="text-xs opacity-90 font-mono mt-0.5">
+                              {diagnosticReport.success 
+                                ? `Bot @${diagnosticReport.bot?.username || 'bot'} verified and responding normally.` 
+                                : diagnosticReport.error || 'Failed to authenticate with Telegram API.'}
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <span className="px-3 py-1 bg-black/40 rounded-xl text-xs font-mono font-bold border border-white/10 text-white">
+                            ⚡ {diagnosticReport.latencyMs} ms latency
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Custom Chat ID or Username Input to Re-Test with specific recipient */}
+                      <div className="bg-neutral-950 p-3.5 rounded-2xl border border-white/10 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <label className="text-xs font-semibold text-neutral-300 block">
+                            Test Message Destination (Chat ID or @username)
+                          </label>
+                          <span className="text-[10px] text-sky-400 font-mono">Supports Chat ID & @username</span>
+                        </div>
+                        <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
+                          <input
+                            type="text"
+                            value={diagnosticCustomChatId}
+                            onChange={(e) => setDiagnosticCustomChatId(e.target.value)}
+                            placeholder="Enter numeric Chat ID (e.g. -100...) or @username"
+                            className="flex-1 bg-neutral-900 border border-white/10 rounded-xl px-3 py-1.5 text-xs text-white placeholder-neutral-500 font-mono focus:outline-none focus:border-sky-500/60"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleRunDiagnostics(diagnosticCustomChatId)}
+                            className="px-3.5 py-1.5 bg-sky-600 hover:bg-sky-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer shrink-0"
+                          >
+                            <Send className="w-3.5 h-3.5" />
+                            <span>Dispatch Diagnostic Ping</span>
+                          </button>
+                        </div>
+                        <p className="text-[10px] text-neutral-400 font-mono">
+                          ℹ️ If you enter a username (e.g. <code className="text-sky-300">@ebrahimayman</code>), the system automatically resolves its Chat ID from recent bot updates or cache.
+                        </p>
+                      </div>
+
+                      {/* Diagnostic Checklist */}
+                      <div className="bg-neutral-950 p-4 rounded-2xl border border-white/10 space-y-2.5">
+                        <h4 className="text-xs font-bold text-neutral-300 uppercase tracking-wider font-mono">
+                          Verification Checklist
+                        </h4>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs font-mono">
+                          <div className="flex items-center gap-2 p-2 bg-neutral-900/60 rounded-xl border border-white/5">
+                            {diagnosticReport.checks.tokenProvided ? (
+                              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                            ) : (
+                              <XCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                            )}
+                            <span className="text-neutral-300">Bot Token Configured</span>
+                          </div>
+
+                          <div className="flex items-center gap-2 p-2 bg-neutral-900/60 rounded-xl border border-white/5">
+                            {diagnosticReport.checks.apiReachable ? (
+                              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                            ) : (
+                              <XCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                            )}
+                            <span className="text-neutral-300">Telegram Cloud Reachable</span>
+                          </div>
+
+                          <div className="flex items-center gap-2 p-2 bg-neutral-900/60 rounded-xl border border-white/5">
+                            {diagnosticReport.checks.botAuthenticated ? (
+                              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                            ) : (
+                              <XCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                            )}
+                            <span className="text-neutral-300">
+                              Auth: @{diagnosticReport.bot?.username || 'unknown'}
+                            </span>
+                          </div>
+
+                          <div className="flex items-center gap-2 p-2 bg-neutral-900/60 rounded-xl border border-white/5">
+                            {diagnosticReport.checks.webhookHealthy ? (
+                              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                            ) : (
+                              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                            )}
+                            <span className="text-neutral-300">
+                              Webhook: {diagnosticReport.webhook?.url ? 'Active' : 'Polling Mode'}
+                            </span>
+                          </div>
+
+                          <div className="flex items-center gap-2 p-2 bg-neutral-900/60 rounded-xl border border-white/5 sm:col-span-2">
+                            {diagnosticReport.testMessageSent ? (
+                              diagnosticReport.testMessageDelivered ? (
+                                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                              ) : (
+                                <XCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                              )
+                            ) : (
+                              <div className="w-4 h-4 rounded-full border border-neutral-600 flex items-center justify-center text-[10px] text-neutral-400">⚪</div>
+                            )}
+                            <span className="text-neutral-300">
+                              {diagnosticReport.testMessageSent 
+                                ? (diagnosticReport.testMessageDelivered ? 'Test Message Delivered to Chat ID ✅' : `Delivery Failed: ${diagnosticReport.testMessageError || 'Chat not found'}`)
+                                : 'No Destination Chat ID entered (message test skipped)'}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Bot Details Card */}
+                      {diagnosticReport.bot && (
+                        <div className="bg-neutral-950 p-4 rounded-2xl border border-white/10 space-y-2 text-xs font-mono">
+                          <h4 className="text-xs font-bold text-neutral-300 uppercase tracking-wider font-mono">
+                            Bot Identity & Permissions
+                          </h4>
+                          <div className="grid grid-cols-2 gap-2 text-neutral-400">
+                            <div><b>Bot ID:</b> <span className="text-white">{diagnosticReport.bot.id}</span></div>
+                            <div><b>Username:</b> <span className="text-sky-300">@{diagnosticReport.bot.username}</span></div>
+                            <div><b>Display Name:</b> <span className="text-white">{diagnosticReport.bot.firstName}</span></div>
+                            <div><b>Join Groups:</b> <span className={diagnosticReport.bot.canJoinGroups ? 'text-emerald-400' : 'text-neutral-500'}>{diagnosticReport.bot.canJoinGroups ? 'Allowed' : 'Disabled'}</span></div>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Raw Telegram API Response Payload */}
+                      {diagnosticReport.rawTelegramResponse && (
+                        <div className="bg-neutral-950 p-4 rounded-2xl border border-white/10 space-y-2 text-xs font-mono">
+                          <div className="flex items-center justify-between">
+                            <h4 className="text-xs font-bold text-neutral-300 uppercase tracking-wider font-mono flex items-center gap-1.5">
+                              <Terminal className="w-3.5 h-3.5 text-sky-400" />
+                              <span>Raw Telegram Response Payload</span>
+                            </h4>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                navigator.clipboard.writeText(JSON.stringify(diagnosticReport.rawTelegramResponse, null, 2));
+                                setCopyDiagnosticJsonSuccess(true);
+                                setTimeout(() => setCopyDiagnosticJsonSuccess(false), 2000);
+                              }}
+                              className="text-neutral-400 hover:text-white flex items-center gap-1 cursor-pointer"
+                            >
+                              {copyDiagnosticJsonSuccess ? (
+                                <>
+                                  <Check className="w-3 h-3 text-emerald-400" />
+                                  <span className="text-emerald-400 text-[10px]">Copied!</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-3 h-3" />
+                                  <span className="text-[10px]">Copy JSON</span>
+                                </>
+                              )}
+                            </button>
+                          </div>
+                          <pre className="bg-black/60 p-3 rounded-xl border border-white/5 text-[10px] text-sky-300 overflow-x-auto max-h-48 leading-relaxed">
+                            {JSON.stringify(diagnosticReport.rawTelegramResponse, null, 2)}
+                          </pre>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Modal Footer */}
+                  <div className="flex items-center justify-between pt-3 border-t border-white/10">
+                    <button
+                      type="button"
+                      onClick={() => handleRunDiagnostics()}
+                      disabled={isDiagnosingTelegram}
+                      className="px-3.5 py-2 bg-neutral-800 hover:bg-neutral-700 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isDiagnosingTelegram ? 'animate-spin' : ''}`} />
+                      <span>Re-Run Audit</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setShowDiagnosticModal(false)}
+                      className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-xl text-xs font-semibold transition-all cursor-pointer"
+                    >
+                      Close Diagnostics
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
           </div>
 
           {/* ALL ADMIN CREDENTIALS & ACCESS CONTROL CARD */}
@@ -4375,7 +4559,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 </div>
               </div>
               <p className="text-xs text-indigo-200/90 leading-relaxed">
-                If any Supabase PostgreSQL tables or columns (like <code className="text-white font-mono bg-black/50 px-1.5 py-0.5 rounded border border-indigo-500/30">public.user_accounts</code> or <code className="text-white font-mono bg-black/50 px-1.5 py-0.5 rounded border border-indigo-500/30">couple_tenants.animation_song_link</code>) are missing or not updated in remote Supabase, click <strong className="text-amber-200">Fix DB / Auto-Repair</strong> to automatically heal schema fields, or click <strong className="text-sky-200">View SQL Fix Code</strong> to copy and run the complete SQL script in your Supabase SQL Editor.
+                If any Supabase PostgreSQL tables or columns (like <code className="text-white font-mono bg-black/50 px-1.5 py-0.5 rounded border border-indigo-500/30">public.user_accounts</code>, <code className="text-white font-mono bg-black/50 px-1.5 py-0.5 rounded border border-indigo-500/30">public.admin_settings</code>, or <code className="text-white font-mono bg-black/50 px-1.5 py-0.5 rounded border border-indigo-500/30">public.workout_plans</code>) are missing or need updating in remote Supabase, click <strong className="text-amber-200">Fix DB / Auto-Repair</strong> to synchronize, or click <strong className="text-sky-200">View SQL Fix Code</strong> to copy and run the SQL script in your Supabase SQL Editor.
               </p>
               {autoFixMessage && (
                 <div className={`p-2.5 rounded-xl text-xs font-mono flex items-center gap-2 ${
@@ -4397,7 +4581,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 </div>
                 <div>
                   <h2 className="text-base font-serif font-bold text-white">Database Maintenance & Clean</h2>
-                  <p className="text-[10px] text-neutral-400 font-mono uppercase tracking-wider">Sync & Purge Firestore Data</p>
+                  <p className="text-[10px] text-neutral-400 font-mono uppercase tracking-wider">Verify & Sync Collections</p>
                 </div>
               </div>
               <button
@@ -4412,7 +4596,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
             </div>
 
             <p className="text-xs text-neutral-400 leading-relaxed mb-3">
-              Check database health, verify connectivity, deduplicate activity logs & settings, and safely purge old Firestore documents to keep Firestore focused purely on realtime chat & presence.
+              Check database health, verify Firestore connectivity, deduplicate activity logs & settings, and mirror data cleanly when dual-cloud Supabase is configured.
             </p>
 
             {/* Connection latency details in compact row */}
@@ -4430,8 +4614,8 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               <div className="p-2.5 bg-neutral-950/50 border border-white/5 rounded-2xl flex items-center justify-between">
                 <div>
                   <span className="text-[9px] text-neutral-500 uppercase tracking-widest font-mono block">Supabase DB</span>
-                  <span className={`text-xs font-semibold ${dbStatus.supabase.online ? 'text-emerald-400' : 'text-amber-400'}`}>
-                    {dbStatus.supabase.online ? 'Connected' : 'Local Fallback'}
+                  <span className={`text-xs font-semibold ${dbStatus.supabase.online ? 'text-emerald-400' : dbStatus.supabase.configured ? 'text-rose-400' : 'text-amber-400'}`}>
+                    {dbStatus.supabase.online ? 'Connected' : dbStatus.supabase.configured ? 'Unreachable' : 'Not Configured'}
                   </span>
                 </div>
                 <span className="text-[10px] text-neutral-400 font-mono px-1.5 py-0.5 bg-white/5 rounded-md">{dbStatus.supabase.latencyMs}ms</span>
@@ -4441,8 +4625,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
             <div className="grid grid-cols-1 gap-2">
               <button
                 onClick={handleRunMigration}
-                disabled={isMigrating}
+                disabled={isMigrating || !isSupabaseConfigured}
                 className="w-full bg-gradient-to-r from-indigo-600 to-rose-600 hover:from-indigo-500 hover:to-rose-500 text-white font-semibold text-xs py-2.5 px-4 rounded-2xl transition-all cursor-pointer flex items-center justify-center gap-2 shadow-lg disabled:opacity-50"
+                title={!isSupabaseConfigured ? 'Requires Supabase credentials in .env to migrate logs from Firestore' : 'Migrate & deduplicate activity logs to Supabase'}
               >
                 <RefreshCw className={`w-4 h-4 ${isMigrating ? 'animate-spin' : ''}`} />
                 {isMigrating ? 'Processing Deduplication & Purge...' : 'Run Migration & Purge Old Firestore Data'}
@@ -4458,7 +4643,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     Bidirectional Data Table Synchronization
                   </h3>
                   <p className="text-[11px] text-neutral-400 mt-0.5">
-                    Sync specific Firestore & Supabase tables individually in either direction.
+                    {isSupabaseConfigured
+                      ? 'Sync specific Firestore & Supabase tables individually in either direction.'
+                      : 'Firestore cloud is active. Add VITE_SUPABASE_URL & VITE_SUPABASE_ANON_KEY to enable Supabase mirroring.'}
                   </p>
                 </div>
 
@@ -4466,9 +4653,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => handleBulkSyncTables('firestore_to_supabase')}
-                    disabled={isSyncingAllData}
-                    className="px-3 py-1.5 bg-gradient-to-r from-teal-600 to-emerald-600 hover:from-teal-500 hover:to-emerald-500 text-white font-medium text-[11px] rounded-xl transition-all cursor-pointer flex items-center gap-1.5 shadow disabled:opacity-50"
-                    title="Sync all Firestore & local tables to Supabase"
+                    disabled={isSyncingAllData || !isSupabaseConfigured}
+                    className="px-3 py-1.5 bg-gradient-to-r from-teal-600 to-emerald-600 hover:from-teal-500 hover:to-emerald-500 text-white font-medium text-[11px] rounded-xl transition-all cursor-pointer flex items-center gap-1.5 shadow disabled:opacity-40"
+                    title="Sync all Firestore collections to Supabase"
                   >
                     <Upload className={`w-3.5 h-3.5 ${bulkSyncDirection === 'to_supabase' ? 'animate-spin' : ''}`} />
                     <span>Sync All ➔ Supabase</span>
@@ -4476,9 +4663,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
                   <button
                     onClick={() => handleBulkSyncTables('supabase_to_firestore')}
-                    disabled={isSyncingAllData}
-                    className="px-3 py-1.5 bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white font-medium text-[11px] rounded-xl transition-all cursor-pointer flex items-center gap-1.5 shadow disabled:opacity-50"
-                    title="Sync all Supabase tables to Firestore & local state"
+                    disabled={isSyncingAllData || !isSupabaseConfigured}
+                    className="px-3 py-1.5 bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white font-medium text-[11px] rounded-xl transition-all cursor-pointer flex items-center gap-1.5 shadow disabled:opacity-40"
+                    title="Sync all Supabase tables to Firestore"
                   >
                     <Download className={`w-3.5 h-3.5 ${bulkSyncDirection === 'to_firestore' ? 'animate-spin' : ''}`} />
                     <span>Sync All ➔ Firestore</span>
@@ -4487,11 +4674,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               </div>
 
               {/* INDIVIDUAL TABLE CARDS GRID */}
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2.5 w-full">
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-2.5 w-full">
                 {SYNC_TABLES_LIST.map((table, idx) => {
                   const isSyncingToSupa = syncingTableState[table.key] === 'to_supabase';
                   const isSyncingToFire = syncingTableState[table.key] === 'to_firestore';
-                  const isBusy = isSyncingToSupa || isSyncingToFire || isSyncingAllData;
+                  const isBusy = isSyncingToSupa || isSyncingToFire || isSyncingAllData || !isSupabaseConfigured;
                   const lastResult = tableSyncResults[table.key];
                   const diagStatus = tableDiagnostics?.tables?.find(t => t.tableName === table.supabaseTable);
 
@@ -4553,7 +4740,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                           onClick={() => handleSyncSingleTable(table.key, 'firestore_to_supabase')}
                           disabled={isBusy}
                           className="w-full bg-teal-500/10 hover:bg-teal-500/20 border border-teal-500/30 text-teal-300 hover:text-teal-100 text-[11px] font-medium py-1.5 px-2 rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 disabled:opacity-40"
-                          title={`Sync Firestore/Local ${table.label} to Supabase`}
+                          title={`Sync Firestore ${table.label} to Supabase`}
                         >
                           <Upload className={`w-3 h-3 ${isSyncingToSupa ? 'animate-spin' : ''}`} />
                           <span>{isSyncingToSupa ? 'Uploading...' : 'FS ➔ Supabase'}</span>
@@ -4563,7 +4750,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                           onClick={() => handleSyncSingleTable(table.key, 'supabase_to_firestore')}
                           disabled={isBusy}
                           className="w-full bg-sky-500/10 hover:bg-sky-500/20 border border-sky-500/30 text-sky-300 hover:text-sky-100 text-[11px] font-medium py-1.5 px-2 rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 disabled:opacity-40"
-                          title={`Sync Supabase ${table.label} to Firestore & Local`}
+                          title={`Sync Supabase ${table.label} to Firestore`}
                         >
                           <Download className={`w-3.5 h-3.5 ${isSyncingToFire ? 'animate-spin' : ''}`} />
                           <span>{isSyncingToFire ? 'Downloading...' : 'Supabase ➔ FS'}</span>
@@ -4586,7 +4773,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                   <div className="flex items-center justify-between pb-2 border-b border-teal-500/20 gap-2">
                     <div className="flex items-center gap-1.5 text-teal-300 font-bold truncate">
                       <CheckCircle className="w-4 h-4 text-teal-400 shrink-0" />
-                      <span className="truncate">Supabase Data Sync Completed</span>
+                      <span className="truncate">
+                        {syncDataSummary.mode === 'firestore_and_supabase'
+                          ? 'Firestore + Supabase Data Sync Completed'
+                          : 'Firestore Cloud Sync Verified'}
+                      </span>
                     </div>
                     <button 
                       onClick={() => setSyncDataSummary(null)}
@@ -4597,30 +4788,22 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     </button>
                   </div>
 
-                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 text-[10px]">
-                    <div className="bg-neutral-950/40 p-1.5 rounded-lg border border-teal-500/10 flex justify-between">
-                      <span className="text-neutral-400">Questions:</span>
-                      <strong className="text-teal-300">{syncDataSummary?.coupleQuestionsSynced ?? 0}</strong>
-                    </div>
-                    <div className="bg-neutral-950/40 p-1.5 rounded-lg border border-teal-500/10 flex justify-between">
-                      <span className="text-neutral-400">Date Plans:</span>
-                      <strong className="text-teal-300">{syncDataSummary?.datePlansSynced ?? 0}</strong>
-                    </div>
-                    <div className="bg-neutral-950/40 p-1.5 rounded-lg border border-teal-500/10 flex justify-between">
-                      <span className="text-neutral-400">Letters:</span>
-                      <strong className="text-teal-300">{syncDataSummary?.lettersSynced ?? 0}</strong>
-                    </div>
-                    <div className="bg-neutral-950/40 p-1.5 rounded-lg border border-teal-500/10 flex justify-between">
-                      <span className="text-neutral-400">Memories:</span>
-                      <strong className="text-teal-300">{syncDataSummary?.memoriesSynced ?? 0}</strong>
-                    </div>
-                    <div className="bg-neutral-950/40 p-1.5 rounded-lg border border-teal-500/10 flex justify-between">
-                      <span className="text-neutral-400">Milestones:</span>
-                      <strong className="text-teal-300">{syncDataSummary?.milestonesSynced ?? 0}</strong>
-                    </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-[10px]">
                     <div className="bg-neutral-950/40 p-1.5 rounded-lg border border-teal-500/10 flex justify-between">
                       <span className="text-neutral-400">User Accounts:</span>
                       <strong className="text-teal-300">{syncDataSummary?.userAccountsSynced ?? 0}</strong>
+                    </div>
+                    <div className="bg-neutral-950/40 p-1.5 rounded-lg border border-teal-500/10 flex justify-between">
+                      <span className="text-neutral-400">Admin Settings:</span>
+                      <strong className="text-teal-300">{syncDataSummary?.adminSettingsSynced ?? 0}</strong>
+                    </div>
+                    <div className="bg-neutral-950/40 p-1.5 rounded-lg border border-teal-500/10 flex justify-between">
+                      <span className="text-neutral-400">Workout Plans:</span>
+                      <strong className="text-teal-300">{syncDataSummary?.workoutPlansSynced ?? 0}</strong>
+                    </div>
+                    <div className="bg-neutral-950/40 p-1.5 rounded-lg border border-teal-500/10 flex justify-between">
+                      <span className="text-neutral-400">Activity Logs:</span>
+                      <strong className="text-teal-300">{syncDataSummary?.activityLogsSynced ?? 0}</strong>
                     </div>
                   </div>
 
@@ -5515,400 +5698,6 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         )}
       </AnimatePresence>
 
-      {/* ADD / EDIT SUBSCRIPTION PLAN MODAL */}
-      <AnimatePresence>
-        {showPlanModal && (
-          <div 
-            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md overflow-y-auto"
-            onClick={() => setShowPlanModal(false)}
-          >
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.95 }}
-              onClick={(e) => e.stopPropagation()}
-              className="bg-neutral-900 border border-amber-500/30 rounded-2xl p-5 max-w-md w-full text-white shadow-2xl relative space-y-4 my-auto max-h-[90vh] overflow-y-auto"
-            >
-              <div className="flex items-center justify-between pb-3 border-b border-white/10">
-                <div className="flex items-center gap-2">
-                  <Crown className="w-5 h-5 text-amber-400" />
-                  <h3 className="text-base font-bold font-serif">
-                    {editingPlan ? 'Edit Subscription Tier' : 'Create New Subscription Tier'}
-                  </h3>
-                </div>
-                <button
-                  onClick={() => setShowPlanModal(false)}
-                  className="p-1 text-neutral-400 hover:text-white rounded-lg transition-colors cursor-pointer"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-
-              <div className="space-y-4 text-xs">
-                <div>
-                  <label className="block text-neutral-400 mb-1 font-semibold">Tier Unique ID (lowercase, e.g. 'free', 'pro', 'vip'):</label>
-                  <input
-                    type="text"
-                    disabled={!!editingPlan}
-                    placeholder="e.g. pro_plus"
-                    value={planForm.id}
-                    onChange={(e) => setPlanForm({ ...planForm, id: e.target.value })}
-                    className="w-full bg-neutral-950 border border-white/10 rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-amber-500 disabled:opacity-50"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-neutral-400 mb-1 font-semibold">Display Plan Name:</label>
-                  <input
-                    type="text"
-                    placeholder="e.g. Pro Lover Plan"
-                    value={planForm.name}
-                    onChange={(e) => setPlanForm({ ...planForm, name: e.target.value })}
-                    className="w-full bg-neutral-950 border border-white/10 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
-                  />
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-neutral-400 mb-1 font-semibold">Price Badge Label:</label>
-                    <input
-                      type="text"
-                      placeholder="e.g. $4.99/month"
-                      value={planForm.price}
-                      onChange={(e) => setPlanForm({ ...planForm, price: e.target.value })}
-                      className="w-full bg-neutral-950 border border-white/10 rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-amber-500"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-neutral-400 mb-1 font-semibold">Badge Theme Color:</label>
-                    <select
-                      value={planForm.badgeColor}
-                      onChange={(e) => setPlanForm({ ...planForm, badgeColor: e.target.value })}
-                      className="w-full bg-neutral-950 border border-white/10 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
-                    >
-                      <option value="emerald">Emerald Green</option>
-                      <option value="amber">Amber Gold</option>
-                      <option value="pink">Romantic Pink</option>
-                      <option value="purple">Royal Purple</option>
-                      <option value="indigo">Deep Indigo</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-neutral-400 mb-1 font-semibold">
-                      Validity Period (Days):
-                    </label>
-                    <input
-                      type="number"
-                      placeholder="-1 for infinite, 30 for monthly, 365 for annual"
-                      value={planForm.durationDays}
-                      onChange={(e) => setPlanForm({ ...planForm, durationDays: parseInt(e.target.value) || -1 })}
-                      className="w-full bg-neutral-950 border border-white/10 rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-amber-500"
-                    />
-                    <span className="text-[10px] text-neutral-500 mt-0.5 block">
-                      {planForm.durationDays === -1 || planForm.durationDays <= 0 ? '♾️ Unlimited Lifetime' : `⏳ Active for ${planForm.durationDays} days from date of subscription`}
-                    </span>
-                  </div>
-                  <div>
-                    <label className="block text-neutral-400 mb-1 font-semibold">Billing Cycle Type:</label>
-                    <select
-                      value={planForm.billingCycle}
-                      onChange={(e) => setPlanForm({ ...planForm, billingCycle: e.target.value as any })}
-                      className="w-full bg-neutral-950 border border-white/10 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
-                    >
-                      <option value="monthly">Monthly (30 Days)</option>
-                      <option value="annual">Annual (365 Days)</option>
-                      <option value="custom">Custom Duration</option>
-                      <option value="lifetime">Lifetime Access</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-neutral-400 mb-1 font-semibold">Plan Description:</label>
-                  <textarea
-                    rows={2}
-                    placeholder="Brief summary of what this tier unlocks for couples..."
-                    value={planForm.description}
-                    onChange={(e) => setPlanForm({ ...planForm, description: e.target.value })}
-                    className="w-full bg-neutral-950 border border-white/10 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-amber-500"
-                  />
-                </div>
-
-                {/* Per-Tab Item Limits & Access Configuration */}
-                <div className="pt-2 border-t border-white/10 space-y-2">
-                  <label className="block text-amber-300 font-bold text-xs uppercase font-mono tracking-wider">
-                    Tab Item Limits & Access Quotas:
-                  </label>
-                  <p className="text-[10px] text-neutral-400">
-                    Manually enter the max item limit for each tab (-1 for Unlimited):
-                  </p>
-                  <div className="grid grid-cols-2 gap-2 max-h-44 overflow-y-auto pr-1">
-                    {TABS_LIST.map((tab, idx) => {
-                      const limitObj = planForm.tabLimits?.[tab.id] || { maxLimit: -1, isLocked: false };
-                      const maxLimit = limitObj.maxLimit ?? -1;
-                      const isLocked = !!limitObj.isLocked;
-
-                      return (
-                        <div key={`tab-limit-box-${tab.id}-${idx}`} className="p-2 rounded-lg bg-neutral-950 border border-white/5 flex flex-col gap-1">
-                          <div className="flex items-center justify-between text-[11px]">
-                            <span className="font-semibold text-neutral-200 capitalize truncate">{tab.label}</span>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                const current = planForm.tabLimits?.[tab.id] || { maxLimit: -1, isLocked: false };
-                                setPlanForm({
-                                  ...planForm,
-                                  tabLimits: {
-                                    ...planForm.tabLimits,
-                                    [tab.id]: { ...current, isLocked: !current.isLocked }
-                                  }
-                                });
-                              }}
-                              className={`text-[9px] font-mono px-1.5 py-0.5 rounded border cursor-pointer ${
-                                isLocked ? 'bg-rose-500/20 text-rose-300 border-rose-500/30' : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
-                              }`}
-                            >
-                              {isLocked ? 'LOCKED' : 'ACTIVE'}
-                            </button>
-                          </div>
-                          {!isLocked && (
-                            <div className="flex items-center gap-1">
-                              <input
-                                type="number"
-                                min="-1"
-                                placeholder="-1 (Unlimited)"
-                                value={maxLimit === -1 ? '' : maxLimit}
-                                onChange={(e) => {
-                                  const rawVal = e.target.value;
-                                  const val = rawVal === '' ? -1 : parseInt(rawVal, 10);
-                                  const current = planForm.tabLimits?.[tab.id] || { maxLimit: -1, isLocked: false };
-                                  setPlanForm({
-                                    ...planForm,
-                                    tabLimits: {
-                                      ...planForm.tabLimits,
-                                      [tab.id]: { ...current, maxLimit: isNaN(val) ? -1 : val }
-                                    }
-                                  });
-                                }}
-                                className="w-full bg-neutral-900 border border-white/10 rounded px-2 py-0.5 text-xs font-mono text-amber-300 focus:outline-none focus:border-amber-500"
-                              />
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  const current = planForm.tabLimits?.[tab.id] || { maxLimit: -1, isLocked: false };
-                                  setPlanForm({
-                                    ...planForm,
-                                    tabLimits: {
-                                      ...planForm.tabLimits,
-                                      [tab.id]: { ...current, maxLimit: maxLimit === -1 ? 5 : -1 }
-                                    }
-                                  });
-                                }}
-                                className="px-1.5 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-[9px] font-mono text-neutral-300 rounded border border-white/10 shrink-0"
-                              >
-                                {maxLimit === -1 ? '∞' : 'Set ∞'}
-                              </button>
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-2 pt-1">
-                  <input
-                    type="checkbox"
-                    id="isDefaultPlan"
-                    checked={planForm.isDefault}
-                    onChange={(e) => setPlanForm({ ...planForm, isDefault: e.target.checked })}
-                    className="w-4 h-4 rounded text-amber-500 focus:ring-amber-500 bg-neutral-950 border-white/10 cursor-pointer"
-                  />
-                  <label htmlFor="isDefaultPlan" className="text-neutral-300 cursor-pointer">
-                    Set as default tier for newly registered couples
-                  </label>
-                </div>
-              </div>
-
-              <div className="flex justify-end gap-2 pt-3 border-t border-white/10">
-                <button
-                  type="button"
-                  onClick={() => setShowPlanModal(false)}
-                  className="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 text-xs font-semibold rounded-xl transition-colors cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={handleSavePlanFromModal}
-                  className="px-5 py-2 bg-gradient-to-r from-amber-500 to-rose-500 text-neutral-950 font-bold text-xs rounded-xl shadow-lg transition-all cursor-pointer"
-                >
-                  {editingPlan ? 'Save Plan Changes' : 'Create Tier'}
-                </button>
-              </div>
-            </motion.div>
-          </div>
-        )}
-
-        {/* PROMO CODE MODAL */}
-        {showPromoModal && (
-          <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95, y: 10 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95, y: 10 }}
-              className="bg-neutral-900 border border-purple-500/30 rounded-3xl p-6 sm:p-7 max-w-lg w-full text-white shadow-2xl relative space-y-5"
-            >
-              <div className="flex items-center justify-between pb-3 border-b border-white/10">
-                <div className="flex items-center gap-2.5">
-                  <div className="p-2 bg-purple-500/20 border border-purple-500/40 rounded-xl text-purple-300">
-                    <Ticket className="w-5 h-5" />
-                  </div>
-                  <h3 className="text-base font-serif font-bold text-white">
-                    {editingPromo ? 'Edit Promo Code' : 'Create New Promo Code'}
-                  </h3>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setShowPromoModal(false)}
-                  className="p-1.5 text-neutral-400 hover:text-white rounded-lg hover:bg-white/10 transition-colors cursor-pointer"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-
-              <form onSubmit={handleSavePromoForm} className="space-y-4">
-                <div>
-                  <label className="block text-xs font-mono uppercase text-purple-300 mb-1">Coupon Code Name *</label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="e.g. LOVE50, VALENTINE100, PROMO20"
-                    value={promoForm.code}
-                    onChange={(e) => setPromoForm({ ...promoForm, code: e.target.value.toUpperCase() })}
-                    className="w-full bg-neutral-950 border border-purple-500/30 rounded-xl px-3 py-2 text-xs font-mono uppercase text-white focus:outline-none focus:border-purple-500 placeholder:text-neutral-600"
-                  />
-                  <p className="text-[10px] text-neutral-500 mt-1">Codes will automatically convert to uppercase (e.g., LOVE50).</p>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs font-mono uppercase text-purple-300 mb-1">Discount Type</label>
-                    <select
-                      value={promoForm.discountType}
-                      onChange={(e) => setPromoForm({ ...promoForm, discountType: e.target.value as 'percentage' | 'fixed' })}
-                      className="w-full bg-neutral-950 border border-purple-500/30 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-purple-500"
-                    >
-                      <option value="percentage">Percentage (%) OFF</option>
-                      <option value="fixed">Fixed Amount ($) OFF</option>
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-mono uppercase text-purple-300 mb-1">
-                      Discount Value ({promoForm.discountType === 'percentage' ? '%' : '$'})
-                    </label>
-                    <input
-                      type="number"
-                      min="0"
-                      step={promoForm.discountType === 'percentage' ? '1' : '0.01'}
-                      required
-                      value={promoForm.discountValue}
-                      onChange={(e) => setPromoForm({ ...promoForm, discountValue: parseFloat(e.target.value) || 0 })}
-                      className="w-full bg-neutral-950 border border-purple-500/30 rounded-xl px-3 py-2 text-xs font-mono text-white focus:outline-none focus:border-purple-500"
-                    />
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-mono uppercase text-purple-300 mb-1">Applicable Subscription Tiers</label>
-                  <select
-                    value={promoForm.applicablePlanIds[0] || 'all'}
-                    onChange={(e) => setPromoForm({ ...promoForm, applicablePlanIds: [e.target.value] })}
-                    className="w-full bg-neutral-950 border border-purple-500/30 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-purple-500"
-                  >
-                    <option value="all">⭐ All Subscription Tiers</option>
-                    {subscriptionPlans.map((plan, idx) => (
-                      <option key={`promo-plan-opt-${plan.id}-${idx}`} value={plan.id}>
-                        {plan.name} ({plan.price})
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs font-mono uppercase text-purple-300 mb-1">Max Redemptions Limit</label>
-                    <input
-                      type="number"
-                      min="-1"
-                      placeholder="-1 for Unlimited"
-                      value={promoForm.maxUses}
-                      onChange={(e) => setPromoForm({ ...promoForm, maxUses: parseInt(e.target.value, 10) || -1 })}
-                      className="w-full bg-neutral-950 border border-purple-500/30 rounded-xl px-3 py-2 text-xs font-mono text-white focus:outline-none focus:border-purple-500"
-                    />
-                    <p className="text-[9px] text-neutral-500 mt-0.5">-1 means unlimited redemptions.</p>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-mono uppercase text-purple-300 mb-1">Expiration Date (Optional)</label>
-                    <input
-                      type="date"
-                      value={promoForm.expiresAt}
-                      onChange={(e) => setPromoForm({ ...promoForm, expiresAt: e.target.value })}
-                      className="w-full bg-neutral-950 border border-purple-500/30 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-purple-500"
-                    />
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-mono uppercase text-purple-300 mb-1">Promo Description</label>
-                  <input
-                    type="text"
-                    placeholder="e.g. 50% discount on Pro Plan for Valentine celebration"
-                    value={promoForm.description}
-                    onChange={(e) => setPromoForm({ ...promoForm, description: e.target.value })}
-                    className="w-full bg-neutral-950 border border-purple-500/30 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-purple-500 placeholder:text-neutral-600"
-                  />
-                </div>
-
-                <div className="flex items-center gap-2 pt-1">
-                  <input
-                    type="checkbox"
-                    id="promoIsActive"
-                    checked={promoForm.isActive}
-                    onChange={(e) => setPromoForm({ ...promoForm, isActive: e.target.checked })}
-                    className="rounded border-purple-500/40 text-purple-600 focus:ring-purple-500 bg-neutral-950 cursor-pointer"
-                  />
-                  <label htmlFor="promoIsActive" className="text-xs text-neutral-300 cursor-pointer">
-                    Enable & Activate this promo code immediately
-                  </label>
-                </div>
-
-                <div className="flex items-center justify-end gap-2 pt-3 border-t border-white/10">
-                  <button
-                    type="button"
-                    onClick={() => setShowPromoModal(false)}
-                    className="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-xl text-xs font-semibold cursor-pointer"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="submit"
-                    className="px-5 py-2 bg-gradient-to-r from-purple-500 to-rose-500 hover:from-purple-400 hover:to-rose-400 text-white rounded-xl text-xs font-bold shadow-lg shadow-purple-950/40 cursor-pointer"
-                  >
-                    {editingPromo ? 'Save Changes' : 'Create Promo Code'}
-                  </button>
-                </div>
-              </form>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
-
       {/* TWO-FACTOR AUTHENTICATION (TOTP) SETUP MODAL */}
       <AnimatePresence>
         {twoFactorModalAccount && (
@@ -5922,258 +5711,6 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
             onSave2FA={handleSave2FA}
             onDisable2FA={handleDisable2FA}
           />
-        )}
-
-        {/* MODAL: ADD / EDIT GLOBAL MUSIC TRACK */}
-        {isAddMusicModalOpen && (
-          <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.95 }}
-              className="w-full max-w-lg bg-neutral-900 border border-white/15 rounded-3xl p-6 sm:p-7 shadow-2xl space-y-5 max-h-[90vh] overflow-y-auto"
-            >
-              <div className="flex items-center justify-between border-b border-white/10 pb-4">
-                <div className="flex items-center gap-2.5">
-                  <div className="p-2.5 rounded-2xl bg-rose-500/10 border border-rose-500/20 text-rose-400">
-                    <Music className="w-5 h-5" />
-                  </div>
-                  <div>
-                    <h3 className="font-serif text-lg font-bold text-white">
-                      {editingMusicTrack ? 'Edit Global Music Track' : 'Add New Global Preset Track'}
-                    </h3>
-                    <p className="text-xs text-neutral-400">Broadcast romantic melodies to all couples</p>
-                  </div>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={() => setIsAddMusicModalOpen(false)}
-                  className="p-2 text-neutral-400 hover:text-white rounded-xl hover:bg-white/5 transition-colors cursor-pointer"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-
-              {musicFormError && (
-                <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-xl text-xs text-rose-300 flex items-center gap-2">
-                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
-                  <span>{musicFormError}</span>
-                </div>
-              )}
-
-              <form onSubmit={handleSaveGlobalMusicTrack} className="space-y-4 text-xs font-sans">
-                {/* Title & Artist */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-neutral-400 font-semibold mb-1">
-                      Track Title <span className="text-rose-400">*</span>
-                    </label>
-                    <input
-                      type="text"
-                      placeholder="e.g. قدام الناس (Odam El Nas)"
-                      value={musicTitle}
-                      onChange={(e) => setMusicTitle(e.target.value)}
-                      required
-                      className="w-full bg-neutral-950 border border-white/10 rounded-xl px-3 py-2.5 text-white placeholder-neutral-500 focus:outline-none focus:border-rose-500"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-neutral-400 font-semibold mb-1">
-                      Artist / Singer
-                    </label>
-                    <input
-                      type="text"
-                      placeholder="e.g. Mohamed Hamaki"
-                      value={musicArtist}
-                      onChange={(e) => setMusicArtist(e.target.value)}
-                      className="w-full bg-neutral-950 border border-white/10 rounded-xl px-3 py-2.5 text-white placeholder-neutral-500 focus:outline-none focus:border-rose-500"
-                    />
-                  </div>
-                </div>
-
-                {/* Category & Duration */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-neutral-400 font-semibold mb-1">Category</label>
-                    <div className="grid grid-cols-2 gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setMusicCategory('romantic')}
-                        className={`py-2 px-3 rounded-xl border text-xs font-semibold flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
-                          musicCategory === 'romantic'
-                            ? 'bg-rose-500/20 border-rose-500 text-rose-300 shadow-sm'
-                            : 'bg-neutral-950 border-white/10 text-neutral-400 hover:text-white'
-                        }`}
-                      >
-                        <span>💖</span>
-                        <span>Romantic</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setMusicCategory('celebration')}
-                        className={`py-2 px-3 rounded-xl border text-xs font-semibold flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
-                          musicCategory === 'celebration'
-                            ? 'bg-amber-500/20 border-amber-500 text-amber-300 shadow-sm'
-                            : 'bg-neutral-950 border-white/10 text-neutral-400 hover:text-white'
-                        }`}
-                      >
-                        <span>🎉</span>
-                        <span>Celebration</span>
-                      </button>
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="block text-neutral-400 font-semibold mb-1">
-                      Duration (MM:SS)
-                    </label>
-                    <input
-                      type="text"
-                      placeholder="3:45"
-                      value={musicDuration}
-                      onChange={(e) => setMusicDuration(e.target.value)}
-                      className="w-full bg-neutral-950 border border-white/10 rounded-xl px-3 py-2.5 text-white placeholder-neutral-500 font-mono focus:outline-none focus:border-rose-500"
-                    />
-                  </div>
-                </div>
-
-                {/* Dedication */}
-                <div>
-                  <label className="block text-neutral-400 font-semibold mb-1">
-                    Dedication / Description Note
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="e.g. Our beautiful engagement & love anthem 💍💖"
-                    value={musicDedication}
-                    onChange={(e) => setMusicDedication(e.target.value)}
-                    className="w-full bg-neutral-950 border border-white/10 rounded-xl px-3 py-2.5 text-white placeholder-neutral-500 focus:outline-none focus:border-rose-500"
-                  />
-                </div>
-
-                {/* MP3 File Upload Dropzone */}
-                <div className="space-y-1.5">
-                  <label className="block text-neutral-400 font-semibold">
-                    Audio File Upload (.mp3, .m4a, .wav)
-                  </label>
-                  
-                  <div className="relative border-2 border-dashed border-white/15 hover:border-rose-500/50 rounded-2xl p-4 text-center bg-neutral-950/60 transition-colors">
-                    <input
-                      type="file"
-                      accept="audio/*,.mp3,.m4a,.wav,.ogg"
-                      onChange={handleAudioFileUpload}
-                      disabled={isUploadingAudio}
-                      className="absolute inset-0 opacity-0 w-full h-full cursor-pointer z-10"
-                    />
-                    <div className="flex flex-col items-center gap-1.5">
-                      <div className="p-2.5 rounded-full bg-rose-500/10 text-rose-400">
-                        {isUploadingAudio ? (
-                          <div className="w-5 h-5 border-2 border-rose-500 border-t-transparent rounded-full animate-spin" />
-                        ) : (
-                          <Upload className="w-5 h-5" />
-                        )}
-                      </div>
-                      <p className="text-neutral-200 font-semibold text-xs">
-                        {isUploadingAudio ? 'Uploading audio...' : 'Click or drop MP3 audio file to upload'}
-                      </p>
-                      <p className="text-[10px] text-neutral-500 font-mono">Max size 25MB • Saved permanently to server</p>
-                    </div>
-                  </div>
-
-                  {musicUploadProgress && (
-                    <p className="text-[11px] text-sky-400 font-mono animate-pulse">{musicUploadProgress}</p>
-                  )}
-                </div>
-
-                {/* Audio URL Input (alternative or uploaded result) */}
-                <div>
-                  <label className="block text-neutral-400 font-semibold mb-1">
-                    Audio File URL / Path <span className="text-rose-400">*</span>
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="/audio/uploads/song.mp3 or https://..."
-                    value={musicUrl}
-                    onChange={(e) => setMusicUrl(e.target.value)}
-                    required
-                    className="w-full bg-neutral-950 border border-white/10 rounded-xl px-3 py-2.5 text-white placeholder-neutral-500 font-mono text-[11px] focus:outline-none focus:border-rose-500"
-                  />
-                </div>
-
-                {/* Test preview audio player */}
-                {musicUrl && (
-                  <div className="p-3 rounded-xl bg-black/40 border border-white/5 flex items-center justify-between gap-3">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <Headphones className="w-4 h-4 text-rose-400 shrink-0" />
-                      <span className="text-xs text-neutral-300 font-medium truncate">Ready to preview audio</span>
-                    </div>
-                    <audio controls src={musicUrl} className="h-8 max-w-[200px]" />
-                  </div>
-                )}
-
-                {/* Form Buttons */}
-                <div className="flex items-center justify-end gap-2.5 pt-3 border-t border-white/10">
-                  <button
-                    type="button"
-                    onClick={() => setIsAddMusicModalOpen(false)}
-                    className="px-4 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-xl font-semibold transition-colors cursor-pointer"
-                  >
-                    Cancel
-                  </button>
-
-                  <button
-                    type="submit"
-                    disabled={isUploadingAudio || !musicTitle.trim() || !musicUrl.trim()}
-                    className="px-5 py-2.5 bg-gradient-to-r from-rose-600 to-pink-600 hover:from-rose-500 hover:to-pink-500 text-white font-semibold rounded-xl shadow-md transition-all cursor-pointer disabled:opacity-50"
-                  >
-                    {editingMusicTrack ? 'Update Global Song' : 'Broadcast to All Couples 🌍'}
-                  </button>
-                </div>
-              </form>
-            </motion.div>
-          </div>
-        )}
-
-        {/* MODAL: DELETE CONFIRMATION */}
-        {musicToDelete && (
-          <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.95 }}
-              className="w-full max-w-sm bg-neutral-900 border border-white/15 rounded-3xl p-6 shadow-2xl text-center space-y-4"
-            >
-              <div className="w-12 h-12 bg-rose-500/10 rounded-2xl flex items-center justify-center mx-auto text-rose-400">
-                <Trash2 className="w-6 h-6" />
-              </div>
-
-              <div>
-                <h3 className="font-serif text-lg font-bold text-white">Delete Global Preset?</h3>
-                <p className="text-xs text-neutral-400 mt-1">
-                  Are you sure you want to remove <strong className="text-white">"{musicToDelete.title}"</strong> from the global music vault? All couples will no longer have access to this preset.
-                </p>
-              </div>
-
-              <div className="flex gap-2 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setMusicToDelete(null)}
-                  className="flex-1 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-white text-xs font-bold rounded-xl cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={handleConfirmDeleteMusicTrack}
-                  className="flex-1 py-2.5 bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold rounded-xl shadow-md cursor-pointer"
-                >
-                  Delete Global Track
-                </button>
-              </div>
-            </motion.div>
-          </div>
         )}
       </AnimatePresence>
 

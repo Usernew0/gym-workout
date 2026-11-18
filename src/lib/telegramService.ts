@@ -5,7 +5,8 @@ import {
   UserAccount, 
   TelegramAuthorizedUser,
   TelegramCapturedSender,
-  TelegramAlertOptions 
+  TelegramAlertOptions,
+  TelegramDiagnosticReport
 } from '../types';
 
 /**
@@ -1175,4 +1176,106 @@ function escapeHtml(text: string): string {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+}
+
+/**
+ * Runs an end-to-end diagnostic check against Telegram Bot API (getMe, getWebhookInfo, optional test message)
+ */
+export async function runTelegramBotDiagnostics(
+  botToken: string,
+  targetChat?: string
+): Promise<TelegramDiagnosticReport> {
+  const start = performance.now();
+  const cleanToken = (botToken || '').trim();
+  const cleanTarget = (targetChat || '').trim();
+
+  const report: TelegramDiagnosticReport = {
+    success: false,
+    latencyMs: 0,
+    checks: {
+      tokenProvided: Boolean(cleanToken),
+      apiReachable: false,
+      botAuthenticated: false,
+      webhookHealthy: false
+    },
+    testMessageSent: false,
+    testMessageDelivered: false
+  };
+
+  if (!cleanToken) {
+    report.error = 'Bot Token is missing.';
+    report.latencyMs = Math.round(performance.now() - start);
+    return report;
+  }
+
+  try {
+    // 1. Validate bot identity via getMe
+    const meRes = await fetch(`https://api.telegram.org/bot${cleanToken}/getMe`);
+    const meParsed = await safeParseResponse(meRes);
+    report.checks.apiReachable = true;
+    report.rawTelegramResponse = meParsed.data ?? meParsed.rawText;
+
+    if (!meRes.ok || !meParsed.isJson || !meParsed.data?.ok) {
+      report.error = meParsed.data?.description || `Telegram authentication failed (HTTP ${meRes.status})`;
+      report.latencyMs = Math.round(performance.now() - start);
+      return report;
+    }
+
+    report.checks.botAuthenticated = true;
+    const botResult = meParsed.data.result || {};
+    report.bot = {
+      id: botResult.id,
+      username: botResult.username || '',
+      firstName: botResult.first_name || 'Bot',
+      canJoinGroups: botResult.can_join_groups
+    };
+
+    // 2. Inspect webhook status
+    const whInfo = await getTelegramWebhookInfo(cleanToken);
+    if (whInfo.success && whInfo.info) {
+      report.webhook = {
+        url: whInfo.info.url || '',
+        pendingUpdateCount: whInfo.info.pending_update_count || 0,
+        lastErrorMessage: whInfo.info.last_error_message
+      };
+      report.checks.webhookHealthy = !whInfo.info.last_error_message;
+    } else {
+      report.checks.webhookHealthy = true;
+    }
+
+    // 3. Optional test message dispatch (supports numeric Chat ID or @username lookup)
+    if (cleanTarget) {
+      let resolvedChatId = cleanTarget;
+      if (cleanTarget.startsWith('@')) {
+        const detailed = await fetchTelegramChatIdsDetailed(cleanToken);
+        const match = detailed.mapped[cleanTarget.toLowerCase()] || detailed.mapped[cleanTarget.replace(/^@/, '').toLowerCase()];
+        if (match?.chatId) {
+          resolvedChatId = match.chatId;
+        }
+      }
+
+      report.testMessageSent = true;
+      const msgRes = await sendDirectTelegramMessage(
+        cleanToken,
+        resolvedChatId,
+        `🔍 <b>Telegram Diagnostic Ping</b>\n\nBot <b>@${escapeHtml(report.bot.username)}</b> verified.\n<i>Time: ${new Date().toLocaleString()}</i>`
+      );
+      if (msgRes.success) {
+        report.testMessageDelivered = true;
+      } else {
+        report.testMessageDelivered = false;
+        report.testMessageError = msgRes.error || 'Failed to deliver diagnostic message';
+      }
+    }
+
+    report.success = report.checks.botAuthenticated && (!report.testMessageSent || report.testMessageDelivered);
+    if (!report.success && report.testMessageError) {
+      report.error = report.testMessageError;
+    }
+  } catch (err: any) {
+    report.error = err?.message || 'Network error connecting to Telegram Bot API';
+  }
+
+  report.latencyMs = Math.round(performance.now() - start);
+  return report;
 }

@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS public.user_accounts (
   two_factor_secret TEXT,
   two_factor_backup_codes JSONB DEFAULT '[]'::jsonb,
   two_factor_created_at TIMESTAMPTZ,
+  telegram_username TEXT,
+  telegram_chat_id TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -23,6 +25,8 @@ ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS two_factor_enabled BOO
 ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS two_factor_secret TEXT;
 ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS two_factor_backup_codes JSONB DEFAULT '[]'::jsonb;
 ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS two_factor_created_at TIMESTAMPTZ;
+ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS telegram_username TEXT;
+ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT;
 ALTER TABLE public.user_accounts ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "User accounts access policy" ON public.user_accounts;
 CREATE POLICY "User accounts access policy" ON public.user_accounts FOR ALL USING (true) WITH CHECK (true);
@@ -86,9 +90,21 @@ CREATE TABLE IF NOT EXISTS public.admin_settings (
   favicon TEXT,
   auto_logout_minutes INT DEFAULT 15,
   auto_logout_enabled BOOLEAN DEFAULT FALSE,
+  login_lockout_seconds INT DEFAULT 60,
+  login_max_attempts INT DEFAULT 5,
+  telegram_config JSONB,
+  two_factor_enabled BOOLEAN DEFAULT FALSE,
+  two_factor_secret TEXT,
+  two_factor_backup_codes JSONB DEFAULT '[]'::jsonb,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS admin_accounts JSONB;
+ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS telegram_config JSONB;
+ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS login_lockout_seconds INT DEFAULT 60;
+ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS login_max_attempts INT DEFAULT 5;
+ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT FALSE;
+ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS two_factor_secret TEXT;
+ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS two_factor_backup_codes JSONB DEFAULT '[]'::jsonb;
 ALTER TABLE public.admin_settings ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Admin settings access policy" ON public.admin_settings;
 CREATE POLICY "Admin settings access policy" ON public.admin_settings FOR ALL USING (true) WITH CHECK (true);
