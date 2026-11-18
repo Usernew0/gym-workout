@@ -10,9 +10,19 @@ export default defineConfig(() => {
       alias: {
         '@': path.resolve(__dirname, '.'),
       },
-      dedupe: ['react', 'react-dom'],
+      dedupe: ['react', 'react-dom', 'react/jsx-runtime', 'react/jsx-dev-runtime'],
     },
     optimizeDeps: {
+      entries: [
+        'index.html',
+        'src/main.tsx',
+        'src/App.tsx',
+        'src/components/AdminPanel.tsx',
+        'src/components/gym/GymApp.tsx',
+        'src/lib/sheetParser.ts',
+        'src/lib/workoutPdfExport.ts',
+      ],
+      holdUntilCrawlEnd: true,
       include: [
         'react',
         'react-dom',
@@ -22,6 +32,15 @@ export default defineConfig(() => {
         'motion/react',
         'lucide-react',
         'canvas-confetti',
+        '@supabase/supabase-js',
+        'firebase/app',
+        'firebase/firestore',
+        'firebase/storage',
+        'browser-image-compression',
+        'qrcode',
+        'jspdf',
+        'xlsx',
+        'pdfjs-dist/legacy/build/pdf.mjs',
       ],
     },
     build: {

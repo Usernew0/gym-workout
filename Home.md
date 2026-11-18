@@ -837,3 +837,64 @@ Expanded and fixed the event trigger architecture to ensure 100% of security eve
 3. **Admin Panel Sync UI & Telegram Diagnostics (`src/components/AdminPanel.tsx`, `src/types.ts`, `src/lib/telegramService.ts`)**:
    - Connected `TelegramDiagnosticReport` and `runTelegramBotDiagnostics` into `AdminPanel.tsx` and synced `TelegramConfig` broadcast flags (`notifyMilestones`, `notifyDates`, `notifyLetters`, `notifyChat`, `notifyCards`).
    - Updated `Sync All Data`, `Fix DB / Auto-Repair`, `Sync User`, `Sync All Users`, and `Sync Admin` buttons and notification banners to display `Users`, `Settings`, `Workouts`, and `Logs` counts and surface exact error feedback.
+
+---
+
+## 📋 24. Multi-Sheet Workout Workbook Detection, Combined Sets × Reps, Supersets, KG/LBS & Dashboard Training View
+
+1. **Multi-Sheet Workbook Detection, Day Headers & Auto Video URL Fetching (`src/lib/sheetParser.ts`, `src/components/gym/SheetUploader.tsx`)**:
+   - Added `parseSheetFileAllSheets(file)` supporting multi-tab `.xlsx`/`.xls` workbooks (plus `.csv`, `.tsv`, `.pdf`).
+   - Added **Combined `"Sets x Reps"` Parser (`splitSetsAndReps`)**: Automatically parses combined columns like `"4 × 5–12"`, `"3 x 8-10"`, or `"4*12"` into `sets: "4"` and `reps: "5–12"` while accurately feeding `parseSetsCount` (`"4 × 5–12"` -> `4` sets).
+   - **Superset Auto-Detection**: Detects supersets from dedicated Type/Superset/Group columns (`A1`/`A2`, `SS1`, `Superset`), exercise name prefixes, or notes, and lets uploaders/members toggle `isSuperset` manually.
+   - **Pre-Filled Sheet Data Extraction (`rowsToExercisesWithMeta`, `buildWorkoutPlan`)**: Automatically detects and imports pre-filled training data when an uploaded spreadsheet already contains values — including `Weight`/`Load` (`kg`/`lbs`), `Actual Reps`, `Week 1..N` columns (`W1`, `Week 2 Weight`, `Week 2 Reps`, dual-row grouped headers like `Week 1` → `Weight | Reps`), `Set 1..N` columns, multi-set cells (`"80kg x 10, 85kg x 8"`), `Previous`/`Last Week` columns (`previousLogs`), and `Done`/`Completed` flags — auto-expanding plan weeks, auto-setting detected `kg`/`lbs` units, showing preview badges in `SheetUploader.tsx`, and safely filling missing slots during worksheet updates without overwriting saved app logs.
+   - Added `extractExcelHyperlinkGrid` + `extractUrlFromFormula` + `extractUrlFromText` so video URLs stored in Excel cell hyperlinks (`cell.l.Target`), `=HYPERLINK(...)` formulas, or mixed text cells are automatically fetched and inserted into the Video URL column on upload.
+   - Detects **Day / Section headers** inside workout sheets (`detectedDays`) and lets users select which Day header(s) to link/import or split into separate workout titles.
+
+2. **Dashboard Active Training View, Auto Sets (Weight kg/lbs × Reps), Free Modification, Supersets & Weekly History (`src/components/gym/GymApp.tsx`, `src/types.ts`, `src/lib/gymService.ts`)**:
+   - **Active Workout in Dashboard**: Renders the full interactive workout tracker (title switcher, Day filter, Week selector, KG/LBS toggle, Instructions, Sets, History, and Video Thumbnails) directly inside the **Dashboard** tab for immediate gym use.
+   - **Auto Sets with Weight Unit (`kg` / `lbs`) & Free Modification**: Automatically creates `Set 1 .. Set N` rows from the parsed set count, includes a clickable **`kg` / `lbs`** toggle inside every weight input and at the workout header, allows `+` / `-` set adjustments, and adds an inline **Edit** panel on each exercise card to modify target Sets, Reps, Name, Notes, Day, Video URL, or Superset tag anytime.
+   - **Superset Color Highlighting**: Superset exercises stand out with a vivid fuchsia/violet card highlight (`border-l-fuchsia-400`, purple gradient, `⚡ SUPERSET` badge) so paired movements are immediately recognizable while training.
+   - **In-Website YouTube WebView Player (`getVideoThumbnailInfo`, `GymApp.tsx`)**: Clicking any exercise video thumbnail opens an inline WebView `<iframe>` player directly inside the exercise card (with `referrerPolicy="strict-origin-when-cross-origin"`, timestamp `?t=`/`?start=` preservation, and `/watch`, `/shorts/`, `/live/`, `/embed/`, `youtu.be`, Vimeo, and Google Drive `/preview` support) plus an optional **Expand** modal view so users can watch demo videos inside the site while logging weights and reps.
+   - **History by Weeks**: Every exercise displays a clean **History by Weeks** breakdown showing each logged week and each set's `Weight (kg/lbs) × Reps`, alongside a read-only Previous reference strip (with the Copy to Week button removed).
+   - **Modify Worksheet Without Losing Saved Data (`mergeUpdatedWorksheetIntoPlan`)**: Added a full **Modify Worksheet** editor inside `GymApp.tsx` (plus an **Update existing plan** destination selector inside `SheetUploader.tsx`) that lets users edit plan metadata, add/remove/update exercise rows, or re-import an updated `.xlsx`/`.csv`/`.pdf` worksheet directly onto an existing plan while matching exercise IDs cleanly and preserving 100% of saved `exerciseLogs` (per-week weights & reps), `previousLogs`, and `progress` checkmarks.
+   - **PDF Summary Export (`src/lib/workoutPdfExport.ts`, `GymApp.tsx`)**: Added an **Export** / **Export PDF** button in the Training Dashboard and Active Workout header that generates and downloads a multi-page A4 PDF report via `jsPDF` containing plan metadata, overall and week-by-week progress bars, instructions, superset highlights, targets, notes, demo video URLs, and full set-by-set weekly history + previous baselines.
+
+---
+
+## 📋 25. Custom Confirmation Dialogs, Admin Per-User Sheet Updates & Member Profile Management
+
+1. **Custom In-App Confirmation Dialogs (`GymApp.tsx`, `AdminWorkoutManager.tsx`, `AdminPanel.tsx`)**:
+   - Eliminated all native `window.confirm` browser prompts across the application.
+   - Added styled dark-theme confirmation modals with loading/disabled states for workout plan deletion (`GymApp`, `AdminWorkoutManager`), clearing detected Telegram senders (`AdminPanel`), and deleting Telegram webhooks (`AdminPanel`).
+
+2. **Admin Panel Per-User Sheet Updates & Inline Worksheet Editor (`src/components/gym/AdminWorkoutManager.tsx`, `src/components/gym/SheetUploader.tsx`, `src/components/AdminPanel.tsx`)**:
+   - **Per-User Sheet Progress & Member Logged Updates**: Each workout card in `AdminWorkoutManager` displays overall completion %, per-week progress pills (`W1..WN`), `Updated` / `Created` timestamps, assigned member display name, and a live **Member Logged Updates** column in the expanded exercise table showing each user's logged set weights (`kg`/`lbs`) and reps per week.
+   - **Update Sheet & Pre-Targeted Re-Upload**: Admins can click **Update Sheet** directly on any member's plan to edit plan metadata, instructions, and exercises inline (or import an updated `.xlsx`/`.csv`/`.pdf` worksheet via `mergeUpdatedWorksheetIntoPlan` while preserving all saved member logs and progress), or click **Re-Upload** to launch `SheetUploader` pre-targeted to that user (`initialAssignTo`) and plan (`initialTargetPlanId`).
+   - **Admin User Form Fixes (`AdminPanel.tsx`)**: Added `displayName` and `@telegramUsername` inputs for Create/Edit User and fixed edit-mode password initialization so existing hashed passwords are never pre-filled or re-hashed unintentionally.
+
+3. **Member Profile, Password Change, Telegram Bot & 2FA Tab (`src/components/gym/GymApp.tsx`, `src/types.ts`, `src/lib/supabaseService.ts`, `src/App.tsx`)**:
+   - **Profile Tab & Header Chip**: Added a dedicated **Profile** tab (`GYM_TABS`) and clickable user chip in the top bar displaying `displayName` (synced cleanly to Firestore and Supabase `profiles.display_name`).
+   - **Profile Information**: Members can update their Display Name, Gender, and Default Weight Unit (`kg` / `lbs`) with instant persistence (`saveUserAccountDoc`).
+   - **Verified Password Change**: Enforces a 3-step **Old Password** (`verifyPassword`) → **New Password** (min 6 chars, must differ from old) → **Confirm New Password** (exact match) flow before hashing via `hashPassword()`, logging `password_changed`, and sending a Telegram security alert.
+   - **Telegram Bot Alerts & Auto-Detect**: Lets each member bind their `@telegramUsername` and `Chat ID` (with one-click **Auto-Detect from Bot** via `fetchTelegramChatIdsDetailed`), toggle Telegram notifications (`telegramNotificationsEnabled`), sync authorized recipients (`addAuthorizedTelegramUser`, `persistTelegramConfig`), and send a live test alert (`sendDirectTelegramMessage`).
+   - **Two-Factor Authentication (2FA)**: Embedded `<TwoFactorSetupModal />` inside the member Profile tab so members can enable or disable TOTP 2FA on their own account.
+
+---
+
+## 📋 26. Telegram Bot Commands Engine (Webhook + Direct Polling)
+
+1. **Unified Iron House Command Engine (`server/telegramBotEngine.ts`)**:
+   - **Supported Interactive Commands** (both `/command`, `/command@BotName`, and bare keyword aliases):
+     - `/start`, `/confirm`, `/verify`, `/access`: Verifies and records the sender, displays copyable `Chat ID` + `@username`, resolves any linked Iron House member profile (`userAccounts`), and lists active workout plan count.
+     - `/id`, `/chatid`: Dedicated Chat ID & account-link response (fixed earlier dead-code shadowing so `/id` and `/chatid` are never intercepted by `/confirm`).
+     - `/status`: Shows live bot link status, notification preference (`Enabled`/`Paused`), assigned plan count, and server timestamp.
+     - `/workouts` (`/plan`, `/today`): Queries Firestore `workoutPlans` for the linked member and renders each plan's weeks, exercises, day headers, and live ASCII completion bar.
+     - `/progress` (`/stats`): Aggregates overall exercise/week completion across all assigned plans plus the latest active plan's progress bar.
+     - `/help` (`/commands`): Prints the complete interactive command directory.
+   - **Persistent Token Recovery**: Resolves the active bot token from request args, persisted server state (`tmp/telegram_bot_state.json`), environment variables, and Firestore `adminSettings/telegramConfig` so webhook/command replies continue working cleanly across server restarts.
+   - **Telegram `/` Autocomplete Menu (`registerTelegramCommandsMenu`)**: Registers all 7 commands via Telegram Bot API `setMyCommands`.
+
+2. **Dual Delivery Support (`server.ts`, `api/telegram/webhook.ts`, `api/telegram/updates.ts`, `api/telegram/test.ts`)**:
+   - **Webhook Mode (`/api/telegram/webhook`)**: Handles incoming Telegram updates immediately with Iron House Gym Training replies.
+   - **Direct Polling Mode (`pollTelegramCommandsOnce`, `/api/telegram/poll`, `/api/telegram/updates`)**: Automatically polls `getUpdates` with tracked `lastProcessedUpdateId` / `processedUpdateIds` (preventing duplicate replies and backing off gracefully whenever a webhook returns 409) so bot commands work even before a public webhook is activated.
+   - **Command Sync Endpoint (`/api/telegram/commands/sync`, `syncTelegramBotCommands` in `src/lib/telegramService.ts`, `AdminPanel.tsx`)**: Registers the `/` command menu, inspects active webhook vs polling mode, answers pending messages, and exposes a **Sync Bot / Menu** button + supported commands directory in the Admin Panel.

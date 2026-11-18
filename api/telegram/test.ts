@@ -15,9 +15,9 @@ export default async function handler(req: any, res: any) {
       });
     }
 
-    const testMessage = `🎉 <b>Our Home Telegram Alert Test</b>\n\n` +
-      `Your Telegram bot is successfully connected to <b>Our Home</b>! 💕\n` +
-      `You will now receive milestone countdowns, date reminders, love letter alerts, and security notifications directly in this chat.\n\n` +
+    const testMessage = `🏋️ <b>Iron House Telegram Alert Test</b>\n\n` +
+      `Your Telegram bot is successfully connected to <b>Iron House — Gym Training</b>! 💪\n` +
+      `You can receive workout plan alerts, coach updates, security notices, and use interactive bot commands (/workouts, /progress, /status, /id, /help).\n\n` +
       `<i>Time: ${new Date().toLocaleString()}</i>`;
 
     const telegramUrl = `https://api.telegram.org/bot${token}/sendMessage`;

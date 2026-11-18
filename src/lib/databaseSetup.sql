@@ -115,15 +115,25 @@ CREATE TABLE IF NOT EXISTS public.workout_plans (
   owner_username TEXT,
   title TEXT,
   description TEXT,
+  instructions TEXT,
+  sheet_name TEXT,
+  default_weight_unit TEXT DEFAULT 'kg',
   weeks INT,
   exercises JSONB,
   source_file_name TEXT,
   created_by TEXT,
   assigned_by_admin BOOLEAN,
   progress JSONB,
+  exercise_logs JSONB DEFAULT '{}'::jsonb,
+  previous_logs JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS instructions TEXT;
+ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS sheet_name TEXT;
+ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS default_weight_unit TEXT DEFAULT 'kg';
+ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS exercise_logs JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS previous_logs JSONB DEFAULT '{}'::jsonb;
 ALTER TABLE public.workout_plans ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Workout plans access policy" ON public.workout_plans;
 CREATE POLICY "Workout plans access policy" ON public.workout_plans FOR ALL USING (true) WITH CHECK (true);

@@ -1,6 +1,7 @@
 export interface UserAccount {
   id: string;
   username: string;
+  displayName?: string;
   password?: string;
   role?: string;
   gender?: 'male' | 'female' | 'other' | string;
@@ -10,6 +11,8 @@ export interface UserAccount {
   twoFactorCreatedAt?: string;
   telegramUsername?: string;
   telegramChatId?: string;
+  telegramNotificationsEnabled?: boolean;
+  weightUnitPreference?: WeightUnit;
 }
 
 export interface AdminAccount {
@@ -149,11 +152,33 @@ export interface UserActivityLog {
 
 export interface WorkoutExercise {
   id: string;
-  name: string;      // Exercise name
-  sets?: string;     // Number of sets (e.g. "3" or "3-4")
-  reps?: string;     // Repetitions (e.g. "12" or "10-12")
-  notes?: string;    // Coach notes / form cues
-  videoUrl?: string; // Demo video link
+  name: string;           // Exercise name
+  day?: string;           // Linked day / section header (e.g. "Day 1 - Push")
+  sets?: string;          // Number of sets (e.g. "4")
+  reps?: string;          // Repetitions (e.g. "5-12")
+  notes?: string;         // Coach notes / form cues
+  videoUrl?: string;      // Demo video link
+  isSuperset?: boolean;   // Highlighted as superset exercise
+  supersetGroup?: string; // Optional superset group label (e.g. "SS1", "A1")
+}
+
+export type WeightUnit = 'kg' | 'lbs';
+
+export interface SetLogEntry {
+  setNumber: number; // 1, 2, 3...
+  weight: string;    // Weight lifted (e.g. "80")
+  unit?: WeightUnit; // Weight unit ("kg" or "lbs")
+  reps: string;      // Reps completed (e.g. "10")
+}
+
+export interface ExerciseLogEntry {
+  sets?: string;
+  reps?: string;
+  weight?: string;
+  unit?: WeightUnit;
+  setEntries?: SetLogEntry[]; // Per-set weight (with unit) & reps log
+  notes?: string;
+  updatedAt?: string;
 }
 
 export interface WorkoutPlan {
@@ -161,12 +186,17 @@ export interface WorkoutPlan {
   ownerUsername: string;         // The gym member this plan belongs to (data isolation key)
   title: string;
   description?: string;
+  instructions?: string;         // Extracted from Information / Instructions sheet tab
+  sheetName?: string;            // Original Excel sheet tab name
+  defaultWeightUnit?: WeightUnit;// Preferred default weight unit ('kg' or 'lbs')
   weeks: number;                 // Optional repeatable duration in weeks (>= 1)
   exercises: WorkoutExercise[];
   sourceFileName?: string;       // Original uploaded sheet file name
   createdBy: string;             // Username that created/uploaded the plan
   assignedByAdmin?: boolean;     // true when an admin uploaded & assigned the plan
   progress?: { [weekKey: string]: string[] }; // weekKey (e.g. "w1") -> completed exercise IDs
+  exerciseLogs?: { [weekKey: string]: { [exerciseId: string]: ExerciseLogEntry } }; // Logged sets, weights (kg/lbs) & reps per week/exercise
+  previousLogs?: { [exerciseId: string]: ExerciseLogEntry }; // Last recorded performance snapshot before current edit
   createdAt: string;
   updatedAt?: string;
 }

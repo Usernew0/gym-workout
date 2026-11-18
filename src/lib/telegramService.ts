@@ -94,6 +94,11 @@ export async function saveTelegramConfig(
       throw err;
     }
   }
+
+  // Register '/' commands on Telegram & prime server token state when botToken is present
+  if (updated.botToken) {
+    void syncTelegramBotCommands(updated.botToken).catch(() => {});
+  }
 }
 
 /**
@@ -126,9 +131,9 @@ export async function testTelegramConnection(
     return { success: false, error: 'Please enter both the Bot Token and Chat ID.' };
   }
 
-  const testMessage = `🎉 <b>Our Home Telegram Alert Test</b>\n\n` +
-    `Your Telegram bot is successfully connected to <b>Our Home</b>! 💕\n` +
-    `You will now receive milestone countdowns, date reminders, love letter alerts, and security notifications directly in this chat.\n\n` +
+  const testMessage = `🏋️ <b>Iron House Telegram Alert Test</b>\n\n` +
+    `Your Telegram bot is successfully connected to <b>Iron House — Gym Training</b>! 💪\n` +
+    `You can receive workout plan alerts, coach updates, security notices, and use interactive bot commands (/workouts, /progress, /status, /id, /help).\n\n` +
     `<i>Time: ${new Date().toLocaleString()}</i>`;
 
   // 1. Try server proxy endpoint first
@@ -583,9 +588,9 @@ export async function testTelegramMultiBroadcast(
   }
 
   const testMessage = customTestMessage || (
-    `🎉 <b>Our Home Telegram Alert Test</b>\n\n` +
-    `Your Telegram bot is successfully connected to <b>Our Home</b>! 💕\n` +
-    `You will receive milestone countdowns, date reminders, love letter alerts, and security notifications directly in this chat.\n\n` +
+    `🏋️ <b>Iron House Telegram Alert Test</b>\n\n` +
+    `Your Telegram bot is successfully connected to <b>Iron House — Gym Training</b>! 💪\n` +
+    `You can receive workout plan alerts, coach updates, security notices, and use interactive bot commands (/workouts, /progress, /status, /id, /help).\n\n` +
     `<i>Time: ${new Date().toLocaleString()}</i>`
   );
 
@@ -960,6 +965,66 @@ export async function deleteTelegramWebhook(
   }
 }
 
+export const TELEGRAM_COMMAND_DEFINITIONS = [
+  { command: 'start', description: 'Activate bot & link your Iron House account' },
+  { command: 'confirm', description: 'Confirm access & register for gym alerts' },
+  { command: 'id', description: 'Get your Telegram Chat ID & username' },
+  { command: 'status', description: 'Check bot connection & workout alerts status' },
+  { command: 'workouts', description: 'View your assigned workout plans' },
+  { command: 'progress', description: 'Check your weekly training completion' },
+  { command: 'help', description: 'Show all available bot commands' },
+];
+
+export async function syncTelegramBotCommands(
+  botToken: string
+): Promise<{ success: boolean; mode?: 'webhook' | 'polling'; repliesSent?: number; message?: string; error?: string }> {
+  const cleanToken = (botToken || '').trim();
+  if (!cleanToken) return { success: false, error: 'Bot Token is required.' };
+
+  // 1. Try server endpoint (registers menu + checks webhook/polling + processes pending commands)
+  try {
+    const res = await fetch('/api/telegram/commands/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ botToken: cleanToken })
+    });
+    const parsed = await safeParseResponse(res);
+    if (parsed.isJson && res.ok && parsed.data?.success) {
+      return {
+        success: true,
+        mode: parsed.data.mode,
+        repliesSent: parsed.data.repliesSent || 0,
+        message: parsed.data.message || 'Bot commands registered successfully!'
+      };
+    }
+  } catch (e) {
+    console.warn('Server command sync failed, using direct Telegram setMyCommands:', e);
+  }
+
+  // 2. Direct fallback to Telegram Bot API setMyCommands
+  try {
+    const directRes = await fetch(`https://api.telegram.org/bot${cleanToken}/setMyCommands`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ commands: TELEGRAM_COMMAND_DEFINITIONS })
+    });
+    const parsed = await safeParseResponse(directRes);
+    if (directRes.ok && parsed.isJson && parsed.data?.ok) {
+      return {
+        success: true,
+        mode: 'polling',
+        message: `Registered ${TELEGRAM_COMMAND_DEFINITIONS.length} bot commands via Telegram Bot API!`
+      };
+    }
+    return {
+      success: false,
+      error: (parsed.isJson && parsed.data?.description) || `HTTP ${directRes.status}`
+    };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Failed to sync bot commands' };
+  }
+}
+
 // ==========================================
 // TELEGRAM WHITELIST & PROFILE AUTO-SYNC HELPERS
 // ==========================================
@@ -1162,7 +1227,7 @@ export function formatSecurityAlertTelegramMessage(
   action: string, 
   details: string
 ): string {
-  return `🛡️ <b>Our Home — Security Alert</b> ⚠️\n\n` +
+  return `🛡️ <b>Iron House — Security Alert</b> ⚠️\n\n` +
     `User Target: <b>${escapeHtml(username)}</b>\n` +
     `Action: <code>${escapeHtml(action)}</code>\n` +
     `Details: ${escapeHtml(details)}\n` +

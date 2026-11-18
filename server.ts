@@ -4,6 +4,13 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
+import {
+  TELEGRAM_BOT_COMMANDS,
+  fetchFirestoreTelegramConfig,
+  isBotConfirmationCommand,
+  registerTelegramCommandsMenu,
+  replyToTelegramMessage,
+} from './server/telegramBotEngine';
 
 const app = express();
 const PORT = 3000;
@@ -132,7 +139,7 @@ Return a structured JSON object containing:
     }
   });
 
-  // Telegram Senders Cache & Memory Buffer
+  // Telegram Senders Cache, Bot State & Command Poller
   interface TelegramCapturedSender {
     chatId: string;
     username: string;
@@ -145,7 +152,71 @@ Return a structured JSON object containing:
   }
 
   let lastKnownBotToken = process.env.TELEGRAM_BOT_TOKEN || '';
+  let lastProcessedUpdateId = 0;
   let capturedTelegramSenders: TelegramCapturedSender[] = [];
+  const processedUpdateIds = new Set<number>();
+  let pollingPausedDueToWebhook = false;
+  let isPollingInFlight = false;
+  let commandsRegisteredForToken = '';
+
+  const botStatePath = path.join(projectRoot, 'tmp', 'telegram_bot_state.json');
+  try {
+    if (fs.existsSync(botStatePath)) {
+      const savedState = JSON.parse(fs.readFileSync(botStatePath, 'utf-8'));
+      if (!lastKnownBotToken && savedState?.botToken) {
+        lastKnownBotToken = String(savedState.botToken).trim();
+      }
+      if (typeof savedState?.lastProcessedUpdateId === 'number') {
+        lastProcessedUpdateId = savedState.lastProcessedUpdateId;
+      }
+    }
+  } catch {
+    // ignore state load failure
+  }
+
+  function saveBotState() {
+    try {
+      const tmpDir = path.join(projectRoot, 'tmp');
+      if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+      fs.writeFileSync(
+        botStatePath,
+        JSON.stringify({
+          botToken: lastKnownBotToken,
+          lastProcessedUpdateId,
+          updatedAt: new Date().toISOString(),
+        }, null, 2)
+      );
+    } catch {
+      // ignore disk write error
+    }
+  }
+
+  function rememberBotToken(token?: string) {
+    const clean = (token || '').trim();
+    if (clean && clean !== lastKnownBotToken) {
+      lastKnownBotToken = clean;
+      saveBotState();
+    }
+  }
+
+  async function resolveEffectiveBotToken(explicitToken?: string): Promise<string> {
+    const direct = (explicitToken || '').trim();
+    if (direct) {
+      rememberBotToken(direct);
+      return direct;
+    }
+    if (lastKnownBotToken.trim()) return lastKnownBotToken.trim();
+    if (process.env.TELEGRAM_BOT_TOKEN?.trim()) {
+      rememberBotToken(process.env.TELEGRAM_BOT_TOKEN);
+      return process.env.TELEGRAM_BOT_TOKEN.trim();
+    }
+    const fsConfig = await fetchFirestoreTelegramConfig().catch(() => null);
+    if (fsConfig?.botToken?.trim()) {
+      rememberBotToken(fsConfig.botToken);
+      return fsConfig.botToken.trim();
+    }
+    return '';
+  }
 
   const sendersCachePath = path.join(projectRoot, 'public', 'telegram_senders.json');
   try {
@@ -184,14 +255,125 @@ Return a structured JSON object containing:
     }
   }
 
+  function trackProcessedUpdate(updateId: number) {
+    processedUpdateIds.add(updateId);
+    if (processedUpdateIds.size > 1000) {
+      const first = processedUpdateIds.values().next().value;
+      if (first !== undefined) processedUpdateIds.delete(first);
+    }
+    if (updateId > lastProcessedUpdateId) {
+      lastProcessedUpdateId = updateId;
+      saveBotState();
+    }
+  }
+
+  async function processIncomingTelegramUpdate(u: any, token: string, shouldReply: boolean): Promise<boolean> {
+    const msg = u?.message || u?.edited_message;
+    if (!msg || !msg.from || !msg.chat) return false;
+
+    const rawUser = msg.from.username || msg.chat.username || '';
+    const chatIdStr = String(msg.chat.id);
+    const fName = msg.from.first_name || msg.chat.first_name || '';
+    const lName = msg.from.last_name || msg.chat.last_name || '';
+    const msgText = (msg.text || '').trim();
+    const isCmd = isBotConfirmationCommand(msgText);
+
+    recordCapturedSender({
+      chatId: chatIdStr,
+      username: rawUser ? `@${rawUser.toLowerCase()}` : '',
+      firstName: fName,
+      lastName: lName,
+      text: msgText,
+      date: msg.date || Math.floor(Date.now() / 1000),
+      timestamp: new Date().toISOString(),
+      isConfirmedCommand: isCmd
+    });
+
+    const updateId = typeof u.update_id === 'number' ? u.update_id : undefined;
+    const alreadyHandled = updateId !== undefined && (processedUpdateIds.has(updateId) || updateId <= lastProcessedUpdateId);
+
+    if (shouldReply && !alreadyHandled && msgText) {
+      await replyToTelegramMessage(token, msg).catch(err =>
+        console.warn('[Telegram Command] Failed to send reply:', err)
+      );
+    }
+
+    if (updateId !== undefined) {
+      trackProcessedUpdate(updateId);
+    }
+    return !alreadyHandled && Boolean(msgText);
+  }
+
+  async function pollTelegramCommandsOnce(explicitToken?: string): Promise<{
+    polled: boolean;
+    repliesSent: number;
+    webhookActive?: boolean;
+    error?: string;
+  }> {
+    if (isPollingInFlight) {
+      return { polled: false, repliesSent: 0 };
+    }
+    isPollingInFlight = true;
+    try {
+      const token = await resolveEffectiveBotToken(explicitToken);
+      if (!token) return { polled: false, repliesSent: 0 };
+
+      if (commandsRegisteredForToken !== token) {
+        const regRes = await registerTelegramCommandsMenu(token);
+        if (regRes.ok) commandsRegisteredForToken = token;
+      }
+
+      const offsetParam = lastProcessedUpdateId > 0 ? `&offset=${lastProcessedUpdateId + 1}` : '';
+      const response = await fetch(
+        `https://api.telegram.org/bot${token}/getUpdates?allowed_updates=["message"]&timeout=0${offsetParam}`
+      );
+      const result = await response.json() as any;
+
+      if (!response.ok && (response.status === 409 || result?.error_code === 409)) {
+        // Webhook is active on Telegram; never delete it from background poller
+        pollingPausedDueToWebhook = true;
+        return { polled: false, repliesSent: 0, webhookActive: true };
+      }
+
+      if (!response.ok || !result?.ok) {
+        return { polled: false, repliesSent: 0, error: result?.description || `HTTP ${response.status}` };
+      }
+
+      pollingPausedDueToWebhook = false;
+      const updates = Array.isArray(result.result) ? result.result : [];
+      let repliesSent = 0;
+
+      for (const u of updates) {
+        const replied = await processIncomingTelegramUpdate(u, token, true);
+        if (replied) repliesSent++;
+      }
+
+      return { polled: true, repliesSent };
+    } catch (err: any) {
+      return { polled: false, repliesSent: 0, error: err?.message };
+    } finally {
+      isPollingInFlight = false;
+    }
+  }
+
+  // Background Direct-Polling Command Listener (handles commands automatically when no webhook is active)
+  setInterval(() => {
+    if (!pollingPausedDueToWebhook) {
+      void pollTelegramCommandsOnce();
+    }
+  }, 4500);
+
+  // Run one initial command check shortly after startup
+  setTimeout(() => {
+    void pollTelegramCommandsOnce();
+  }, 2500);
+
   // Telegram Bot Dispatch Endpoint
   app.post('/api/telegram/send', async (req, res) => {
     try {
       const { botToken, chatId, text, parseMode = 'HTML' } = req.body;
-      const token = (botToken || process.env.TELEGRAM_BOT_TOKEN || '').trim();
+      const token = await resolveEffectiveBotToken(botToken);
       const chat = (chatId || process.env.TELEGRAM_CHAT_ID || '').trim();
-
-      if (token) lastKnownBotToken = token;
 
       if (!token || !chat) {
         return res.status(400).json({ 
@@ -237,10 +419,8 @@ Return a structured JSON object containing:
   app.post('/api/telegram/test', async (req, res) => {
     try {
       const { botToken, chatId } = req.body;
-      const token = (botToken || process.env.TELEGRAM_BOT_TOKEN || '').trim();
+      const token = await resolveEffectiveBotToken(botToken);
       const chat = (chatId || process.env.TELEGRAM_CHAT_ID || '').trim();
-
-      if (token) lastKnownBotToken = token;
 
       if (!token || !chat) {
         return res.status(400).json({ 
@@ -249,9 +429,12 @@ Return a structured JSON object containing:
         });
       }
 
-      const testMessage = `🎉 <b>Our Home Telegram Alert Test</b>\n\n` +
-        `Your Telegram bot is successfully connected to <b>Our Home</b>! 💕\n` +
-        `You will now receive milestone countdowns, date reminders, love letter alerts, and security notifications directly in this chat.\n\n` +
+      // Ensure '/' command menu is registered during connection test
+      void registerTelegramCommandsMenu(token);
+
+      const testMessage = `🏋️ <b>Iron House Telegram Alert Test</b>\n\n` +
+        `Your Telegram bot is successfully connected to <b>Iron House — Gym Training</b>! 💪\n` +
+        `You can receive workout plan alerts, coach updates, security notices, and use interactive bot commands (/workouts, /progress, /status, /id, /help).\n\n` +
         `<i>Time: ${new Date().toLocaleString()}</i>`;
 
       const telegramUrl = `https://api.telegram.org/bot${token}/sendMessage`;
@@ -282,16 +465,77 @@ Return a structured JSON object containing:
     }
   });
 
-  // Telegram Get Updates & Map Usernames Route (with auto-409 webhook unlock)
-  app.post('/api/telegram/updates', async (req, res) => {
+  // Register Telegram Bot '/' Command Menu & Check Active Mode
+  app.post('/api/telegram/commands/sync', async (req, res) => {
     try {
-      const { botToken } = req.body;
-      const token = (botToken || process.env.TELEGRAM_BOT_TOKEN || '').trim();
+      const { botToken } = req.body || {};
+      const token = await resolveEffectiveBotToken(botToken);
       if (!token) {
         return res.status(400).json({ success: false, error: 'Bot Token is required.' });
       }
 
-      if (token) lastKnownBotToken = token;
+      const reg = await registerTelegramCommandsMenu(token);
+      if (!reg.ok) {
+        return res.status(400).json({ success: false, error: reg.error || 'Failed to register Telegram bot commands.' });
+      }
+      commandsRegisteredForToken = token;
+
+      // Check whether webhook is active or polling handles commands
+      let webhookUrl = '';
+      try {
+        const infoRes = await fetch(`https://api.telegram.org/bot${token}/getWebhookInfo`);
+        const infoJson: any = await infoRes.json();
+        webhookUrl = infoJson?.result?.url || '';
+      } catch {
+        // ignore
+      }
+
+      pollingPausedDueToWebhook = Boolean(webhookUrl);
+      let repliesSent = 0;
+      if (!webhookUrl) {
+        const pollRes = await pollTelegramCommandsOnce(token);
+        repliesSent = pollRes.repliesSent;
+      }
+
+      return res.json({
+        success: true,
+        mode: webhookUrl ? 'webhook' : 'polling',
+        webhookUrl: webhookUrl || undefined,
+        commands: TELEGRAM_BOT_COMMANDS,
+        repliesSent,
+        message: webhookUrl
+          ? `Registered ${TELEGRAM_BOT_COMMANDS.length} bot commands! Webhook mode is active.`
+          : `Registered ${TELEGRAM_BOT_COMMANDS.length} bot commands! Direct Polling listener is active.`
+      });
+    } catch (err: any) {
+      console.error('Sync bot commands error:', err);
+      return res.status(500).json({ success: false, error: err.message || 'Failed to sync bot commands' });
+    }
+  });
+
+  // Trigger Immediate Command Poll Pass
+  app.post('/api/telegram/poll', async (req, res) => {
+    try {
+      const { botToken } = req.body || {};
+      const token = await resolveEffectiveBotToken(botToken);
+      if (!token) {
+        return res.status(400).json({ success: false, error: 'Bot Token is required.' });
+      }
+      const result = await pollTelegramCommandsOnce(token);
+      return res.json({ success: true, ...result });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err.message || 'Polling failed' });
+    }
+  });
+
+  // Telegram Get Updates & Map Usernames Route (with auto-409 webhook unlock & command replies)
+  app.post('/api/telegram/updates', async (req, res) => {
+    try {
+      const { botToken } = req.body;
+      const token = await resolveEffectiveBotToken(botToken);
+      if (!token) {
+        return res.status(400).json({ success: false, error: 'Bot Token is required.' });
+      }
 
       let response = await fetch(`https://api.telegram.org/bot${token}/getUpdates?allowed_updates=["message"]`);
       let result = await response.json() as any;
@@ -310,8 +554,8 @@ Return a structured JSON object containing:
           const delResult = await delRes.json() as any;
           console.log('[Telegram Updates] Released webhook:', delResult);
           webhookReleased = true;
+          pollingPausedDueToWebhook = false;
 
-          // Wait brief moment for Telegram to unlock
           await new Promise(r => setTimeout(r, 350));
           response = await fetch(`https://api.telegram.org/bot${token}/getUpdates?allowed_updates=["message"]`);
           result = await response.json() as any;
@@ -321,7 +565,7 @@ Return a structured JSON object containing:
       }
 
       if (!response.ok || !result.ok) {
-        // Even if Telegram API fails, return captured webhook senders if available
+        // Even if Telegram API fails, return captured senders if available
         if (capturedTelegramSenders.length > 0) {
           const mappedUsers: { [username: string]: { chatId: string; firstName: string; date: number; text?: string } } = {};
           for (const s of capturedTelegramSenders) {
@@ -346,69 +590,36 @@ Return a structured JSON object containing:
         });
       }
 
-      // Parse and map all users who messaged the bot
+      // Parse, record, and answer any unseen commands in Telegram updates
       const mappedUsers: { [username: string]: { chatId: string; firstName: string; date: number; text?: string } } = {};
       const updates = Array.isArray(result.result) ? result.result : [];
+      let repliesSent = 0;
 
       for (const u of updates) {
         const msg = u.message || u.edited_message;
         if (msg && msg.from && msg.chat) {
+          const replied = await processIncomingTelegramUpdate(u, token, true);
+          if (replied) repliesSent++;
+
           const rawUser = msg.from.username || msg.chat.username || '';
           const chatIdStr = String(msg.chat.id);
           const fName = msg.from.first_name || msg.chat.first_name || '';
-          const lName = msg.from.last_name || msg.chat.last_name || '';
           const msgText = (msg.text || '').trim();
-          const lower = msgText.toLowerCase();
-          const isCmd = (
-            lower === 'start' || lower === '/start' ||
-            lower === 'confirm' || lower === '/confirm' ||
-            lower === 'access' || lower === '/access' ||
-            lower === 'verify' || lower === '/verify' ||
-            lower.startsWith('/start') || lower.startsWith('start') ||
-            lower.startsWith('/confirm') || lower.startsWith('confirm') ||
-            lower === 'id' || lower === '/id' || lower === '/chatid'
-          );
-
-          recordCapturedSender({
-            chatId: chatIdStr,
-            username: rawUser ? `@${rawUser.toLowerCase()}` : '',
-            firstName: fName,
-            lastName: lName,
-            text: msgText,
-            date: msg.date || Math.floor(Date.now() / 1000),
-            timestamp: new Date().toISOString(),
-            isConfirmedCommand: isCmd
-          });
 
           if (rawUser) {
             const normalized = `@${rawUser.toLowerCase().trim()}`;
             const bare = rawUser.toLowerCase().trim();
-            mappedUsers[normalized] = {
-              chatId: chatIdStr,
-              firstName: fName,
-              date: msg.date,
-              text: msgText
-            };
-            mappedUsers[bare] = {
-              chatId: chatIdStr,
-              firstName: fName,
-              date: msg.date,
-              text: msgText
-            };
+            mappedUsers[normalized] = { chatId: chatIdStr, firstName: fName, date: msg.date, text: msgText };
+            mappedUsers[bare] = { chatId: chatIdStr, firstName: fName, date: msg.date, text: msgText };
           }
 
           if (fName) {
-            mappedUsers[fName.toLowerCase().trim()] = {
-              chatId: chatIdStr,
-              firstName: fName,
-              date: msg.date,
-              text: msgText
-            };
+            mappedUsers[fName.toLowerCase().trim()] = { chatId: chatIdStr, firstName: fName, date: msg.date, text: msgText };
           }
         }
       }
 
-      // Also merge any captured senders from webhook buffer
+      // Also merge any captured senders from webhook/poller buffer
       for (const s of capturedTelegramSenders) {
         if (s.username) {
           const withAt = s.username.toLowerCase().trim();
@@ -431,6 +642,7 @@ Return a structured JSON object containing:
         users: mappedUsers, 
         senders: capturedTelegramSenders,
         rawUpdatesCount: updates.length,
+        repliesSent,
         webhookReleased 
       });
     } catch (err: any) {
@@ -484,22 +696,10 @@ Return a structured JSON object containing:
       const fromUser = message.from || {};
       const rawUser = fromUser.username || message.chat.username || '';
       const tgUsername = rawUser ? `@${rawUser}` : '';
-      const firstName = fromUser.first_name || message.chat.first_name || 'Lover';
+      const firstName = fromUser.first_name || message.chat.first_name || 'Athlete';
       const lastName = fromUser.last_name || message.chat.last_name || '';
       const text = (message.text || '').trim();
-      const lowerText = text.toLowerCase();
-
-      // Check for confirmation command (accepts bare words and slash commands)
-      const isConfirmedCommand = (
-        lowerText === 'start' || lowerText === '/start' ||
-        lowerText === 'confirm' || lowerText === '/confirm' ||
-        lowerText === 'access' || lowerText === '/access' ||
-        lowerText === 'verify' || lowerText === '/verify' ||
-        lowerText === 'ok' || lowerText === 'yes' ||
-        lowerText.startsWith('/start') || lowerText.startsWith('start') ||
-        lowerText.startsWith('/confirm') || lowerText.startsWith('confirm') ||
-        lowerText === 'id' || lowerText === '/id' || lowerText === '/chatid'
-      );
+      const isConfirmedCommand = isBotConfirmationCommand(text);
 
       console.log(`[Telegram Webhook] Received message from ${tgUsername || firstName} (${chatId}): "${text}" (isConfirmedCommand=${isConfirmedCommand})`);
 
@@ -515,53 +715,16 @@ Return a structured JSON object containing:
         isConfirmedCommand
       });
 
-      // Respond automatically if bot token is available
-      const token = (req.query.token as string) || lastKnownBotToken || process.env.TELEGRAM_BOT_TOKEN;
+      if (typeof update?.update_id === 'number') {
+        trackProcessedUpdate(update.update_id);
+      }
+
+      // Respond automatically via unified Iron House command engine
+      const token = await resolveEffectiveBotToken(req.query.token as string);
       if (token) {
-        let replyText = '';
-
-        if (isConfirmedCommand || lowerText === 'hi' || lowerText === 'hello') {
-          replyText = `✅ <b>Access Confirmed & Verified!</b> 🎉\n\n` +
-            `Hello <b>${firstName}</b> (${tgUsername ? '<code>' + tgUsername + '</code>' : 'Your Chat'})!\n\n` +
-            `Your Telegram account is now successfully confirmed and linked with <b>Our Home</b>.\n` +
-            `• <b>Chat ID:</b> <code>${chatId}</code>\n` +
-            `• <b>Status:</b> Active Recipient 🟢\n\n` +
-            `You will now receive personalized real-time alerts for anniversaries 💍, dates 🗓️, love letters 💌, and sweet chats 💬!\n\n` +
-            `<i>Tip: Send /status anytime to inspect your active bot connection.</i> 💕`;
-        } else if (lowerText === '/id' || lowerText === '/chatid' || lowerText === 'id' || lowerText === 'chatid') {
-          replyText = `🆔 <b>Your Telegram Credentials:</b>\n\n` +
-            `• Chat ID: <code>${chatId}</code>\n` +
-            (tgUsername ? `• Username: <b>${tgUsername}</b>\n\n` : '\n') +
-            `Your Chat ID is registered! Send <b>confirm</b> or <b>/confirm</b> to complete verification.`;
-        } else if (lowerText === '/status' || lowerText === 'status') {
-          replyText = `📊 <b>Our Home Alert Connection Status:</b>\n\n` +
-            `• Name: <b>${firstName}</b>\n` +
-            (tgUsername ? `• Telegram: <code>${tgUsername}</code>\n` : '') +
-            `• Chat ID: <code>${chatId}</code>\n` +
-            `• Alerts Engine: <b>Online & Receiving Alerts 🟢</b>\n` +
-            `• System Time: <i>${new Date().toLocaleString()}</i>`;
-        } else if (lowerText === '/help' || lowerText === 'help') {
-          replyText = `🤖 <b>Our Home Telegram Bot Commands:</b>\n\n` +
-            `• <code>confirm</code> or <code>/confirm</code> - Confirm your access and register for alerts\n` +
-            `• <code>chatid</code> or <code>/id</code> - Display your destination Chat ID\n` +
-            `• <code>status</code> or <code>/status</code> - Check your alert delivery status\n` +
-            `• <code>help</code> or <code>/help</code> - Show available commands`;
-        } else {
-          replyText = `💍 <b>Our Home Bot</b> 💕\n\n` +
-            `Hello <b>${firstName}</b> (${tgUsername ? '<code>' + tgUsername + '</code>' : ''})!\n` +
-            `Your Chat ID is <code>${chatId}</code>.\n\n` +
-            `Send <b>confirm</b> or <b>/confirm</b> to activate multi-user alerts for your account! ✨`;
-        }
-
-        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: replyText,
-            parse_mode: 'HTML'
-          })
-        }).catch(err => console.warn('Failed to reply to webhook update:', err));
+        await replyToTelegramMessage(token, message).catch(err =>
+          console.warn('Failed to reply to webhook update:', err)
+        );
       }
 
       return res.json({ ok: true, received: true, chatId, username: tgUsername, text, count: capturedTelegramSenders.length });
@@ -575,10 +738,8 @@ Return a structured JSON object containing:
   app.post('/api/telegram/webhook/set', async (req, res) => {
     try {
       const { botToken, webhookUrl } = req.body;
-      const token = (botToken || process.env.TELEGRAM_BOT_TOKEN || '').trim();
+      const token = await resolveEffectiveBotToken(botToken);
       const url = (webhookUrl || '').trim();
-
-      if (token) lastKnownBotToken = token;
 
       if (!token || !url) {
         return res.status(400).json({ success: false, error: 'Bot Token and Webhook URL are required.' });
@@ -601,7 +762,12 @@ Return a structured JSON object containing:
         });
       }
 
-      return res.json({ success: true, message: result.description || 'Webhook activated successfully!' });
+      pollingPausedDueToWebhook = true;
+      void registerTelegramCommandsMenu(token).then((reg) => {
+        if (reg.ok) commandsRegisteredForToken = token;
+      });
+
+      return res.json({ success: true, message: result.description || 'Webhook activated & bot commands registered!' });
     } catch (err: any) {
       console.error('Set webhook error:', err);
       return res.status(500).json({ success: false, error: err.message || 'Server error setting webhook' });
@@ -612,9 +778,7 @@ Return a structured JSON object containing:
   app.post('/api/telegram/webhook/info', async (req, res) => {
     try {
       const { botToken } = req.body;
-      const token = (botToken || process.env.TELEGRAM_BOT_TOKEN || '').trim();
-
-      if (token) lastKnownBotToken = token;
+      const token = await resolveEffectiveBotToken(botToken);
 
       if (!token) {
         return res.status(400).json({ success: false, error: 'Bot Token is required.' });
@@ -630,6 +794,7 @@ Return a structured JSON object containing:
         });
       }
 
+      pollingPausedDueToWebhook = Boolean(result.result?.url);
       return res.json({ success: true, info: result.result });
     } catch (err: any) {
       console.error('Get webhook info error:', err);
@@ -641,9 +806,7 @@ Return a structured JSON object containing:
   app.post('/api/telegram/webhook/delete', async (req, res) => {
     try {
       const { botToken } = req.body;
-      const token = (botToken || process.env.TELEGRAM_BOT_TOKEN || '').trim();
-
-      if (token) lastKnownBotToken = token;
+      const token = await resolveEffectiveBotToken(botToken);
 
       if (!token) {
         return res.status(400).json({ success: false, error: 'Bot Token is required.' });
@@ -663,7 +826,8 @@ Return a structured JSON object containing:
         });
       }
 
-      return res.json({ success: true, message: result.description || 'Webhook deleted successfully!' });
+      pollingPausedDueToWebhook = false;
+      return res.json({ success: true, message: result.description || 'Webhook deleted! Direct polling command handler resumed.' });
     } catch (err: any) {
       console.error('Delete webhook error:', err);
       return res.status(500).json({ success: false, error: err.message || 'Server error deleting webhook' });

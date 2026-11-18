@@ -260,7 +260,12 @@ export default function App() {
   return (
     <ErrorBoundary fallbackTitle="Training App Error">
       <Suspense fallback={<ViewLoadingFallback />}>
-        <GymApp currentUser={currentUser} onLogout={handleLogout} />
+        <GymApp
+          currentUser={currentUser}
+          userAccounts={userAccounts}
+          adminSettings={adminSettings}
+          onLogout={handleLogout}
+        />
       </Suspense>
     </ErrorBoundary>
   );

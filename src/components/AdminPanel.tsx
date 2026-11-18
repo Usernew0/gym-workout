@@ -38,7 +38,9 @@ import {
   fetchCapturedTelegramSenders,
   clearCapturedTelegramSenders,
   autoResolveTelegramUsers,
-  testTelegramMultiBroadcast
+  testTelegramMultiBroadcast,
+  syncTelegramBotCommands,
+  TELEGRAM_COMMAND_DEFINITIONS
 } from '../lib/telegramService';
 
 import { HorizontalScrollWrapper } from './HorizontalScrollWrapper';
@@ -164,15 +166,25 @@ CREATE TABLE IF NOT EXISTS public.workout_plans (
   owner_username TEXT NOT NULL,
   title TEXT NOT NULL,
   description TEXT,
+  instructions TEXT,
+  sheet_name TEXT,
+  default_weight_unit TEXT DEFAULT 'kg',
   weeks INT DEFAULT 1,
   exercises JSONB DEFAULT '[]'::jsonb,
   source_file_name TEXT,
   created_by TEXT,
   assigned_by_admin BOOLEAN DEFAULT FALSE,
   progress JSONB DEFAULT '{}'::jsonb,
+  exercise_logs JSONB DEFAULT '{}'::jsonb,
+  previous_logs JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS instructions TEXT;
+ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS sheet_name TEXT;
+ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS default_weight_unit TEXT DEFAULT 'kg';
+ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS exercise_logs JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS previous_logs JSONB DEFAULT '{}'::jsonb;
 ALTER TABLE public.workout_plans ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Workout plans access policy" ON public.workout_plans;
 CREATE POLICY "Workout plans access policy" ON public.workout_plans FOR ALL USING (true) WITH CHECK (true);`;
@@ -202,12 +214,24 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   onLogout 
 }) => {
   const [newUsername, setNewUsername] = useState('');
+  const [newDisplayName, setNewDisplayName] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [newUserGender, setNewUserGender] = useState<string>('male');
+  const [newUserTelegram, setNewUserTelegram] = useState('');
   const [editingUser, setEditingUser] = useState<UserAccount | null>(null);
+  const [editingDisplayName, setEditingDisplayName] = useState('');
   const [editingPassword, setEditingPassword] = useState('');
   const [editingUserGender, setEditingUserGender] = useState<string>('male');
+  const [editingUserTelegram, setEditingUserTelegram] = useState('');
   const [userToDelete, setUserToDelete] = useState<UserAccount | null>(null);
+  const [confirmActionDialog, setConfirmActionDialog] = useState<{
+    title: string;
+    subtitle: string;
+    message: string;
+    confirmLabel: string;
+    onConfirm: () => Promise<void> | void;
+  } | null>(null);
+  const [isConfirmActionRunning, setIsConfirmActionRunning] = useState(false);
 
   // Telegram Bot & Alert Notifications State
   const [telegramConfig, setTelegramConfig] = useState<TelegramConfig>(() => {
@@ -315,13 +339,20 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     }
   };
 
-  const handleClearDetectedSenders = async () => {
-    if (!window.confirm('Clear recent Telegram messages history?')) return;
-    await clearCapturedTelegramSenders();
-    setDetectedSenders([]);
-    setTelegramConfig(prev => ({ ...prev, capturedSenders: [] }));
-    setAutoResolveStatus('Cleared recent message history.');
-    setTimeout(() => setAutoResolveStatus(null), 3000);
+  const handleClearDetectedSenders = () => {
+    setConfirmActionDialog({
+      title: 'Clear Recent Telegram History?',
+      subtitle: 'Detected Senders Cache',
+      message: 'Are you sure you want to clear the recent Telegram messages & detected senders history?',
+      confirmLabel: 'Clear History',
+      onConfirm: async () => {
+        await clearCapturedTelegramSenders();
+        setDetectedSenders([]);
+        setTelegramConfig(prev => ({ ...prev, capturedSenders: [] }));
+        setAutoResolveStatus('Cleared recent message history.');
+        setTimeout(() => setAutoResolveStatus(null), 3000);
+      }
+    });
   };
 
   const handleReleaseWebhookAndPull = async () => {
@@ -586,27 +617,66 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     }
   };
 
-  const handleDeleteWebhook = async () => {
+  const handleDeleteWebhook = () => {
     if (!telegramConfig.botToken) {
       setWebhookStatusNotice({ success: false, message: 'Bot Token is required.' });
       return;
     }
-    if (!window.confirm('Remove Telegram webhook? Bot will revert to direct push/polling mode.')) return;
-    setIsManagingWebhook(true);
+    setConfirmActionDialog({
+      title: 'Remove Telegram Webhook?',
+      subtitle: 'Bot Connection Mode',
+      message: 'Are you sure you want to remove the active Telegram webhook? The bot will revert to direct push/polling mode.',
+      confirmLabel: 'Remove Webhook',
+      onConfirm: async () => {
+        setIsManagingWebhook(true);
+        setWebhookStatusNotice(null);
+        try {
+          const res = await deleteTelegramWebhook(telegramConfig.botToken);
+          if (res.success) {
+            setTelegramConfig(prev => ({ ...prev, webhookEnabled: false }));
+            setWebhookInfoData(null);
+            setWebhookStatusNotice({ success: true, message: 'Webhook removed successfully!' });
+          } else {
+            setWebhookStatusNotice({ success: false, message: res.error || 'Failed to delete webhook.' });
+          }
+        } catch (e: any) {
+          setWebhookStatusNotice({ success: false, message: e.message || 'Error deleting webhook.' });
+        } finally {
+          setIsManagingWebhook(false);
+        }
+      }
+    });
+  };
+
+  const [isSyncingCommands, setIsSyncingCommands] = useState(false);
+
+  const handleSyncBotCommands = async () => {
+    if (!telegramConfig.botToken?.trim()) {
+      setWebhookStatusNotice({ success: false, message: 'Enter your Telegram Bot Token first to register commands.' });
+      return;
+    }
+    setIsSyncingCommands(true);
     setWebhookStatusNotice(null);
     try {
-      const res = await deleteTelegramWebhook(telegramConfig.botToken);
+      const res = await syncTelegramBotCommands(telegramConfig.botToken);
       if (res.success) {
-        setTelegramConfig(prev => ({ ...prev, webhookEnabled: false }));
-        setWebhookInfoData(null);
-        setWebhookStatusNotice({ success: true, message: 'Webhook removed successfully!' });
+        setTelegramConfig(prev => ({
+          ...prev,
+          webhookEnabled: res.mode === 'webhook',
+          webhookLastCheckedAt: new Date().toISOString()
+        }));
+        const replyInfo = res.repliesSent ? ` (${res.repliesSent} pending message${res.repliesSent === 1 ? '' : 's'} answered)` : '';
+        setWebhookStatusNotice({
+          success: true,
+          message: `${res.message || 'Bot commands registered on Telegram!'}${replyInfo}`
+        });
       } else {
-        setWebhookStatusNotice({ success: false, message: res.error || 'Failed to delete webhook.' });
+        setWebhookStatusNotice({ success: false, message: res.error || 'Failed to sync bot commands.' });
       }
-    } catch (e: any) {
-      setWebhookStatusNotice({ success: false, message: e.message || 'Error deleting webhook.' });
+    } catch (err: any) {
+      setWebhookStatusNotice({ success: false, message: err?.message || 'Error syncing bot commands.' });
     } finally {
-      setIsManagingWebhook(false);
+      setIsSyncingCommands(false);
     }
   };
 
@@ -1520,19 +1590,26 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setIsSyncing(true);
     try {
       const uPass = await hashPassword(rawPass);
+      const cleanTg = newUserTelegram.trim()
+        ? (newUserTelegram.trim().startsWith('@') ? newUserTelegram.trim().toLowerCase() : `@${newUserTelegram.trim().toLowerCase()}`)
+        : '';
 
       const newUser: UserAccount = {
         id: `user_${Date.now()}`,
         username: newUsername.trim(),
+        ...(newDisplayName.trim() ? { displayName: newDisplayName.trim() } : {}),
         password: uPass,
         gender: newUserGender,
-        role: 'user'
+        role: 'user',
+        ...(cleanTg ? { telegramUsername: cleanTg } : {}),
       };
       await saveUserAccountDoc(newUser);
 
       setNewUsername('');
+      setNewDisplayName('');
       setNewPassword('');
       setNewUserGender('male');
+      setNewUserTelegram('');
       setUserSuccessMsg(`User account "${newUser.username}" created successfully (Password Cryptographically Hashed)!`);
       
       setTimeout(() => setUserSuccessMsg(null), 4000);
@@ -1551,25 +1628,32 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     if (!editingUser) return;
     const rawPass = editingPassword.trim();
 
-    if (!rawPass) {
-      setUserErrorMsg('Password cannot be empty.');
+    if (!rawPass && !editingUser.password) {
+      setUserErrorMsg('Password cannot be empty for an account with no existing password.');
       return;
     }
 
     setIsSyncing(true);
     try {
-      const uPass = await hashPassword(rawPass);
+      const uPass = rawPass ? await hashPassword(rawPass) : editingUser.password;
+      const cleanTg = editingUserTelegram.trim()
+        ? (editingUserTelegram.trim().startsWith('@') ? editingUserTelegram.trim().toLowerCase() : `@${editingUserTelegram.trim().toLowerCase()}`)
+        : '';
       const updated: UserAccount = {
         ...editingUser,
+        displayName: editingDisplayName.trim() || editingUser.username,
         password: uPass,
-        gender: editingUserGender
+        gender: editingUserGender,
+        ...(cleanTg ? { telegramUsername: cleanTg } : { telegramUsername: '' }),
       };
       await saveUserAccountDoc(updated);
 
       setUserSuccessMsg(`User account "${editingUser.username}" updated successfully!`);
       setEditingUser(null);
+      setEditingDisplayName('');
       setEditingPassword('');
       setEditingUserGender('male');
+      setEditingUserTelegram('');
       
       setTimeout(() => setUserSuccessMsg(null), 4000);
     } catch (err: any) {
@@ -2175,7 +2259,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                       type="button"
                       onClick={() => {
                         setEditingUser(null);
+                        setEditingDisplayName('');
                         setEditingPassword('');
+                        setEditingUserTelegram('');
                         setUserErrorMsg(null);
                       }}
                       className="text-xs text-neutral-400 hover:text-white transition-all"
@@ -2183,17 +2269,26 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                       Cancel Edit
                     </button>
                   </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                     <div className="space-y-1.5">
-                      <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">New Password</label>
+                      <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">Display Name</label>
+                      <input
+                        type="text"
+                        value={editingDisplayName}
+                        onChange={(e) => setEditingDisplayName(e.target.value)}
+                        placeholder="Full name"
+                        className="w-full bg-neutral-950/80 border border-white/10 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/60"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">New Password (Optional)</label>
                       <div className="relative">
                         <input
                           type={showEditUserPassword ? "text" : "password"}
                           value={editingPassword}
                           onChange={(e) => setEditingPassword(e.target.value)}
-                          placeholder="New secret password"
+                          placeholder="Leave blank to keep current"
                           className="w-full bg-neutral-950/80 border border-white/10 rounded-xl px-3 py-2 pr-9 text-sm text-white focus:outline-none focus:border-indigo-500/60"
-                          required
                         />
                         <button
                           type="button"
@@ -2218,6 +2313,17 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         <option value="other">Other 🧑</option>
                       </select>
                     </div>
+
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">Telegram @Handle</label>
+                      <input
+                        type="text"
+                        value={editingUserTelegram}
+                        onChange={(e) => setEditingUserTelegram(e.target.value)}
+                        placeholder="@username"
+                        className="w-full bg-neutral-950/80 border border-white/10 rounded-xl px-3 py-2 text-sm text-sky-300 font-mono focus:outline-none focus:border-indigo-500/60"
+                      />
+                    </div>
                   </div>
 
                   <div className="flex justify-end pt-2">
@@ -2237,7 +2343,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     <UserPlus className="w-3.5 h-3.5" />
                     Create New Website User
                   </h3>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
                     <div className="space-y-1.5">
                       <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">Username</label>
                       <input
@@ -2247,6 +2353,16 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         placeholder="e.g. alex"
                         className="w-full bg-neutral-950/80 border border-white/10 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/60"
                         required
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">Display Name</label>
+                      <input
+                        type="text"
+                        value={newDisplayName}
+                        onChange={(e) => setNewDisplayName(e.target.value)}
+                        placeholder="e.g. Alex Carter"
+                        className="w-full bg-neutral-950/80 border border-white/10 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/60"
                       />
                     </div>
                     <div className="space-y-1.5">
@@ -2281,6 +2397,16 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         <option value="female">Female 👩</option>
                         <option value="other">Other 🧑</option>
                       </select>
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">Telegram @Handle</label>
+                      <input
+                        type="text"
+                        value={newUserTelegram}
+                        onChange={(e) => setNewUserTelegram(e.target.value)}
+                        placeholder="@username (optional)"
+                        className="w-full bg-neutral-950/80 border border-white/10 rounded-xl px-3 py-2 text-sm text-sky-300 font-mono focus:outline-none focus:border-indigo-500/60"
+                      />
                     </div>
                   </div>
 
@@ -2357,10 +2483,22 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                           </div>
                           <div>
                             <div className="flex items-center gap-2 flex-wrap">
-                              <p className="text-sm font-semibold text-white capitalize">{user.username}</p>
+                              <p className="text-sm font-semibold text-white">
+                                {user.displayName?.trim() ? user.displayName.trim() : user.username}
+                              </p>
+                              {user.displayName?.trim() && user.displayName.trim().toLowerCase() !== user.username.toLowerCase() && (
+                                <span className="text-[10px] font-mono text-neutral-400 bg-white/5 border border-white/10 px-1.5 py-0.5 rounded">
+                                  @{user.username}
+                                </span>
+                              )}
                               {user.gender && (
                                 <span className="text-[10px] font-mono text-purple-300 bg-purple-500/15 border border-purple-500/30 px-2 py-0.5 rounded-md capitalize">
                                   {user.gender === 'male' ? '👨 Male' : user.gender === 'female' ? '👩 Female' : `🧑 ${user.gender}`}
+                                </span>
+                              )}
+                              {user.telegramUsername && (
+                                <span className="text-[10px] font-mono text-sky-300 bg-sky-500/10 border border-sky-500/25 px-2 py-0.5 rounded-md">
+                                  {user.telegramUsername}{user.telegramChatId ? ' ✓' : ''}
                                 </span>
                               )}
                             </div>
@@ -2436,8 +2574,10 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                           <button
                             onClick={() => {
                               setEditingUser(user);
-                              setEditingPassword(user.password || '');
+                              setEditingDisplayName(user.displayName || user.username || '');
+                              setEditingPassword('');
                               setEditingUserGender(user.gender || 'male');
+                              setEditingUserTelegram(user.telegramUsername || '');
                             }}
                             className="p-1.5 rounded-lg border border-white/10 hover:bg-white/5 text-neutral-400 hover:text-white transition-all cursor-pointer"
                             title="Edit Account Details"
@@ -3756,21 +3896,52 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
                 {/* Telegram Webhook Engine */}
                 <div className="bg-neutral-950/70 border border-white/10 rounded-2xl p-4 space-y-3">
-                  <div className="flex items-center justify-between flex-wrap gap-2">
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <h4 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
-                          Telegram Webhook Engine (Two-Way Auto-Discovery)
-                        </h4>
-                        <span className={`text-[10px] px-2 py-0.5 rounded-full font-mono font-bold border ${telegramConfig.webhookEnabled ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' : 'bg-neutral-800 text-neutral-400 border-white/10'}`}>
-                          {telegramConfig.webhookEnabled ? 'Webhook Active 🟢' : 'Direct Polling ⚪'}
-                        </span>
+                    <div className="flex items-center justify-between flex-wrap gap-2">
+                      <div>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <h4 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
+                            Telegram Webhook &amp; Bot Commands Engine
+                          </h4>
+                          <span className={`text-[10px] px-2 py-0.5 rounded-full font-mono font-bold border ${telegramConfig.webhookEnabled ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' : 'bg-sky-500/15 text-sky-300 border-sky-500/30'}`}>
+                            {telegramConfig.webhookEnabled ? 'Webhook Active 🟢' : 'Auto-Polling Active 🟢'}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-neutral-400">
+                          Handles interactive commands in both Webhook and Direct Polling modes and auto-replies with Chat ID, account link, workouts &amp; progress.
+                        </p>
                       </div>
-                      <p className="text-[11px] text-neutral-400">
-                        Receives updates when partners send <code className="text-sky-300">/start</code> or <code className="text-sky-300">/confirm</code> to the bot and auto-replies
-                      </p>
+                      <button
+                        type="button"
+                        disabled={isSyncingCommands || !telegramConfig.botToken}
+                        onClick={handleSyncBotCommands}
+                        className="px-3 py-1.5 bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/30 text-sky-300 rounded-xl text-[11px] font-semibold flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50 shrink-0"
+                        title="Register slash commands menu (setMyCommands) and process pending messages"
+                      >
+                        {isSyncingCommands ? (
+                          <div className="w-3 h-3 border-2 border-sky-300/30 border-t-sky-300 rounded-full animate-spin" />
+                        ) : (
+                          <Sparkles className="w-3.5 h-3.5" />
+                        )}
+                        <span>Sync Bot / Menu</span>
+                      </button>
                     </div>
-                  </div>
+
+                    {/* Supported Commands Directory */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 pt-1">
+                      {TELEGRAM_COMMAND_DEFINITIONS.map((item) => (
+                        <div
+                          key={item.command}
+                          className="bg-neutral-900/70 border border-white/5 rounded-xl px-2.5 py-1.5 flex items-start gap-2"
+                        >
+                          <code className="text-[11px] font-mono font-bold text-sky-300 shrink-0">
+                            /{item.command}
+                          </code>
+                          <span className="text-[10px] text-neutral-400 leading-tight">
+                            {item.description}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
 
                   <div className="space-y-1.5">
                     <label className="text-xs font-semibold text-neutral-300 block">
@@ -5390,6 +5561,65 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 >
                   <Trash2 className="w-3.5 h-3.5" />
                   Delete Permanently
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+
+        {/* GENERIC IN-APP CONFIRMATION DIALOG MODAL */}
+        {confirmActionDialog && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              transition={{ duration: 0.2 }}
+              className="bg-neutral-900 border border-white/10 rounded-3xl p-6 max-w-md w-full shadow-2xl relative overflow-hidden"
+            >
+              <div className="absolute top-0 inset-x-0 h-1 bg-gradient-to-r from-rose-500 to-amber-500"></div>
+
+              <div className="flex items-center gap-3 mb-4">
+                <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-2xl text-rose-400">
+                  <ShieldAlert className="w-6 h-6" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-serif font-bold text-white">{confirmActionDialog.title}</h3>
+                  <p className="text-xs text-neutral-400 font-mono uppercase tracking-widest mt-0.5">
+                    {confirmActionDialog.subtitle}
+                  </p>
+                </div>
+              </div>
+
+              <p className="text-sm text-neutral-300 leading-relaxed mb-6">
+                {confirmActionDialog.message}
+              </p>
+
+              <div className="flex gap-3 justify-end">
+                <button
+                  type="button"
+                  disabled={isConfirmActionRunning}
+                  onClick={() => setConfirmActionDialog(null)}
+                  className="px-4 py-2 rounded-xl text-xs font-semibold uppercase tracking-wider text-neutral-400 hover:text-white bg-white/5 hover:bg-white/10 transition-all cursor-pointer border border-white/5 disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={isConfirmActionRunning}
+                  onClick={async () => {
+                    setIsConfirmActionRunning(true);
+                    try {
+                      await confirmActionDialog.onConfirm();
+                      setConfirmActionDialog(null);
+                    } finally {
+                      setIsConfirmActionRunning(false);
+                    }
+                  }}
+                  className="px-4 py-2 rounded-xl text-xs font-semibold uppercase tracking-wider bg-rose-600 hover:bg-rose-500 text-white shadow-md transition-all cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  {confirmActionDialog.confirmLabel}
                 </button>
               </div>
             </motion.div>

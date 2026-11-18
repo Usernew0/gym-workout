@@ -51,14 +51,14 @@ export default async function handler(req: any, res: any) {
         const lName = msg.from.last_name || msg.chat.last_name || '';
         const msgText = (msg.text || '').trim();
         const lower = msgText.toLowerCase();
+        const firstWord = lower.split(/\s+/)[0]?.replace(/^\/+/, '').split('@')[0] || '';
         const isCmd = (
-          lower === 'start' || lower === '/start' ||
-          lower === 'confirm' || lower === '/confirm' ||
-          lower === 'access' || lower === '/access' ||
-          lower === 'verify' || lower === '/verify' ||
-          lower.startsWith('/start') || lower.startsWith('start') ||
-          lower.startsWith('/confirm') || lower.startsWith('confirm') ||
-          lower === 'id' || lower === '/id' || lower === '/chatid'
+          firstWord === 'start' ||
+          firstWord === 'confirm' ||
+          firstWord === 'access' ||
+          firstWord === 'verify' ||
+          firstWord === 'id' ||
+          firstWord === 'chatid'
         );
 
         const senderObj = {

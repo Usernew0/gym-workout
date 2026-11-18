@@ -290,7 +290,7 @@ export async function saveUserAccountDoc(user: UserAccount) {
     const profilePayload = {
       id: savedUser.id,
       username: savedUser.username,
-      display_name: savedUser.username
+      display_name: savedUser.displayName?.trim() || savedUser.username
     };
     await safeUpsert('profiles', profilePayload, 'id');
   }
@@ -779,7 +779,7 @@ export async function syncAllDataToSupabase(seedData?: {
         await safeUpsert('profiles', {
           id: u.id,
           username: u.username,
-          display_name: u.username
+          display_name: u.displayName?.trim() || u.username
         }, 'id');
       } else {
         summary.errors.push(`user_accounts (${u.id}): ${res.error}`);
