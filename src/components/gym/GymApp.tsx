@@ -48,12 +48,12 @@ interface GymAppProps {
 
 type GymTab = 'dashboard' | 'workouts' | 'upload' | 'progress' | 'profile';
 
-const GYM_TABS: { id: GymTab; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
-  { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
-  { id: 'workouts', label: 'My Workouts', icon: ListChecks },
-  { id: 'upload', label: 'Upload Sheet', icon: Upload },
-  { id: 'progress', label: 'Progress', icon: TrendingUp },
-  { id: 'profile', label: 'Profile', icon: User },
+const GYM_TABS: { id: GymTab; label: string;  short: string; icon: React.ComponentType<{ className?: string }>; }[] = [
+  { id: 'dashboard', label: 'Dashboard',    short: 'Home',     icon: LayoutDashboard },
+  { id: 'workouts',  label: 'My Workouts',  short: 'Workouts', icon: ListChecks },
+  { id: 'upload',    label: 'Upload Sheet', short: 'Upload',   icon: Upload },
+  { id: 'progress',  label: 'Progress',     short: 'Progress', icon: TrendingUp },
+  { id: 'profile',   label: 'Profile',      short: 'Profile',  icon: User },
 ];
 
 const weekKey = (weekIdx: number) => `w${weekIdx + 1}`;
@@ -1211,52 +1211,43 @@ export const GymApp: React.FC<GymAppProps> = ({
     return (
       <div className="space-y-4">
         {/* CHOOSE WORKOUT TITLE PICKER */}
-        <div className="rounded-2xl border border-white/10 bg-neutral-900/70 p-4 space-y-3">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div>
-              <h2 className="text-xs font-bold text-neutral-300 uppercase tracking-wider flex items-center gap-2">
-                <Dumbbell className="w-4 h-4 text-red-500" />
-                Choose Workout Title ({myPlans.length})
-              </h2>
-            </div>
+        <div className="rounded-2xl border border-white/10 bg-neutral-900/70 p-3 sm:p-4 space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-xs font-bold text-neutral-300 uppercase tracking-wider flex items-center gap-2">
+              <Dumbbell className="w-4 h-4 text-red-500" /> Workouts ({myPlans.length})
+            </h2>
             <div className="flex items-center gap-2">
               <select
                 value={plan.id}
                 onChange={(e) => openPlan(e.target.value)}
-                className="bg-neutral-950 border border-white/15 focus:border-red-500/60 rounded-xl px-3 py-1.5 text-xs font-semibold text-white outline-none max-w-[220px]"
+                className="hidden sm:block bg-neutral-950 border border-white/15 rounded-xl px-3 py-1.5 text-xs font-semibold text-white max-w-[220px]"
               >
-                {myPlans.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.title} ({p.exercises.length} ex)
-                  </option>
-                ))}
+                {myPlans.map(p => <option key={p.id} value={p.id}>{p.title} ({p.exercises.length} ex)</option>)}
               </select>
               <button
                 onClick={() => setActiveTab('upload')}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold cursor-pointer"
+                className="h-9 px-3 inline-flex items-center gap-1.5 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold cursor-pointer"
               >
                 <Upload className="w-3.5 h-3.5" /> Upload
               </button>
             </div>
           </div>
 
-          <div className="flex flex-wrap gap-2">
-            {myPlans.map((p) => {
-              const isSelected = p.id === plan.id;
+          <div className="flex gap-2 overflow-x-auto no-scrollbar snap-x -mx-3 px-3 sm:mx-0 sm:px-0 sm:flex-wrap">
+            {myPlans.map(p => {
+              const sel = p.id === plan.id;
               return (
                 <button
-                  key={`title-pill-${p.id}`}
+                  key={p.id}
                   onClick={() => openPlan(p.id)}
-                  className={`px-3.5 py-2 rounded-xl text-xs font-bold border transition-all inline-flex items-center gap-2 cursor-pointer ${
-                    isSelected
+                  className={`snap-start shrink-0 h-10 px-3.5 rounded-xl text-xs font-bold border inline-flex items-center gap-2 cursor-pointer ${
+                    sel
                       ? 'bg-gradient-to-r from-red-600 to-red-500 text-white border-red-400 shadow-lg shadow-red-950/40'
-                      : 'bg-neutral-950/70 text-neutral-300 border-white/10 hover:border-red-500/40 hover:text-white'
+                      : 'bg-neutral-950/70 text-neutral-300 border-white/10'
                   }`}
                 >
-                  <span className="truncate max-w-[200px]">{p.title}</span>
-                  <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded-md ${
-                    isSelected ? 'bg-black/25 text-white' : 'bg-white/5 text-neutral-400'
-                  }`}>
+                  <span className="truncate max-w-[150px]">{p.title}</span>
+                  <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded-md ${sel ? 'bg-black/25' : 'bg-white/5 text-neutral-400'}`}>
                     {p.exercises.length}
                   </span>
                 </button>
@@ -1267,7 +1258,7 @@ export const GymApp: React.FC<GymAppProps> = ({
 
         {/* ACTIVE WORKOUT HEADER SUMMARY + WEIGHT UNIT SELECTOR */}
         <div className="rounded-2xl border border-white/10 bg-neutral-900/70 p-4 sm:p-5">
-          <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
             <div>
               <h2 className="text-lg font-black text-white">{plan.title}</h2>
               {plan.description && <p className="text-[13px] text-neutral-400 mt-1">{plan.description}</p>}
@@ -1290,61 +1281,62 @@ export const GymApp: React.FC<GymAppProps> = ({
               </div>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2 shrink-0">
-              <div className="inline-flex items-center rounded-xl bg-neutral-950 border border-white/15 p-0.5" title="Workout default weight unit">
-                {(['kg', 'lbs'] as WeightUnit[]).map((u) => (
-                  <button
-                    key={u}
-                    type="button"
-                    onClick={() => changePlanWeightUnit(plan, u)}
-                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold uppercase transition-all cursor-pointer ${
-                      planUnit === u
-                        ? 'bg-red-600 text-white shadow'
-                        : 'text-neutral-400 hover:text-white'
-                    }`}
-                  >
-                    {u}
-                  </button>
-                ))}
-              </div>
-              <button
-                type="button"
-                onClick={() => {
-                  if (worksheetEditPlanId === plan.id) {
-                    setWorksheetEditPlanId(null);
-                    setWorksheetDraft(null);
-                  } else {
-                    startModifyWorksheet(plan);
-                  }
-                }}
-                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
-                  worksheetEditPlanId === plan.id
-                    ? 'bg-emerald-600 text-white border-emerald-400 shadow'
-                    : 'bg-neutral-950 hover:bg-neutral-800 text-neutral-200 border-white/15 hover:border-emerald-500/50'
-                }`}
-                title="Modify worksheet exercises, sets, reps, video links or re-upload updated file without losing saved logs"
-              >
-                <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400" />
-                {worksheetEditPlanId === plan.id ? 'Close Editor' : 'Modify Worksheet'}
-              </button>
-              <button
-                type="button"
-                onClick={() => handleExportPlanPdf(plan)}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold border bg-red-600/20 hover:bg-red-600/35 text-red-200 border-red-500/35 transition-all cursor-pointer"
-                title="Download PDF summary of this workout plan, progress, and weekly history"
-              >
-                <Download className="w-3.5 h-3.5 text-red-400" />
-                Export
-              </button>
-              <button
-                type="button"
-                onClick={() => setPlanToDelete(plan)}
-                className="p-2 rounded-lg text-neutral-500 hover:text-red-400 hover:bg-red-500/10 shrink-0 cursor-pointer"
-                title="Delete plan"
-              >
-                <Trash2 className="w-4 h-4" />
-              </button>
-            </div>
+            <div className="flex items-center gap-2 w-full sm:w-auto sm:shrink-0">
+  <div className="inline-flex items-center rounded-xl bg-neutral-950 border border-white/15 p-0.5 shrink-0" title="Workout default weight unit">
+    {(['kg', 'lbs'] as WeightUnit[]).map((u) => (
+      <button
+        key={u}
+        type="button"
+        onClick={() => changePlanWeightUnit(plan, u)}
+        className={`h-8 px-2.5 rounded-lg text-[11px] font-bold uppercase transition-all cursor-pointer ${
+          planUnit === u ? 'bg-red-600 text-white shadow' : 'text-neutral-400 hover:text-white'
+        }`}
+      >
+        {u}
+      </button>
+    ))}
+  </div>
+
+  <button
+    type="button"
+    onClick={() => {
+      if (worksheetEditPlanId === plan.id) {
+        setWorksheetEditPlanId(null);
+        setWorksheetDraft(null);
+      } else {
+        startModifyWorksheet(plan);
+      }
+    }}
+    className={`flex-1 sm:flex-none min-w-0 h-9 inline-flex items-center justify-center gap-1.5 px-3 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
+      worksheetEditPlanId === plan.id
+        ? 'bg-emerald-600 text-white border-emerald-400 shadow'
+        : 'bg-neutral-950 hover:bg-neutral-800 text-neutral-200 border-white/15 hover:border-emerald-500/50'
+    }`}
+  >
+    <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+    <span className="truncate sm:hidden">{worksheetEditPlanId === plan.id ? 'Close' : 'Modify'}</span>
+    <span className="hidden sm:inline">{worksheetEditPlanId === plan.id ? 'Close Editor' : 'Modify Worksheet'}</span>
+  </button>
+
+  <button
+    type="button"
+    onClick={() => handleExportPlanPdf(plan)}
+    aria-label="Export PDF"
+    className="h-9 w-9 sm:w-auto sm:px-3 shrink-0 inline-flex items-center justify-center gap-1.5 rounded-xl text-xs font-bold border bg-red-600/20 hover:bg-red-600/35 text-red-200 border-red-500/35 cursor-pointer"
+  >
+    <Download className="w-3.5 h-3.5 text-red-400" />
+    <span className="hidden sm:inline">Export</span>
+  </button>
+
+  <button
+    type="button"
+    onClick={() => setPlanToDelete(plan)}
+    aria-label="Delete plan"
+    className="h-9 w-9 shrink-0 inline-flex items-center justify-center rounded-xl border border-white/10 text-neutral-400 hover:text-red-400 hover:bg-red-500/10 cursor-pointer"
+  >
+    <Trash2 className="w-4 h-4" />
+  </button>
+</div>
           </div>
 
           {savedNoticeId === `plan_${plan.id}` && (
@@ -1825,7 +1817,7 @@ export const GymApp: React.FC<GymAppProps> = ({
 
                       {/* FREE INLINE EXERCISE MODIFIER */}
                       {isEditingThis && editDraft && (
-                        <div className="rounded-xl border border-amber-500/30 bg-black/50 p-3 space-y-2.5 text-xs">
+                        <div className="-ml-9 sm:ml-0 rounded-xl border border-amber-500/30 bg-black/50 p-3 space-y-2.5 text-xs">
                           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                             <label className="flex flex-col gap-1">
                               <span className="text-[10px] uppercase text-neutral-400 font-semibold">Exercise Name</span>
@@ -1935,7 +1927,7 @@ export const GymApp: React.FC<GymAppProps> = ({
 
                       {/* PREVIOUS SESSION REFERENCE (READ-ONLY) */}
                       {prevWeekData && (
-                        <div className="flex flex-wrap items-center gap-2 bg-indigo-500/10 border border-indigo-500/25 rounded-xl px-3 py-1.5 text-[11px]">
+                        <div className="-ml-9 sm:ml-0 flex flex-wrap items-center gap-2 bg-indigo-500/10 border border-indigo-500/25 rounded-xl px-3 py-1.5 text-[11px]">
                           <span className="inline-flex items-center gap-1 text-indigo-300 font-semibold">
                             <History className="w-3.5 h-3.5 text-indigo-400" />
                             Previous ({prevWeekData.sourceLabel}):
@@ -1952,9 +1944,9 @@ export const GymApp: React.FC<GymAppProps> = ({
                         </div>
                       )}
 
-                      {/* AUTO-GENERATED SETS TABLE (WEIGHT + KG/LBS UNIT + REPS PER SET) */}
-                      <div className={`rounded-xl border p-3 space-y-2 ${isSuperset ? 'border-fuchsia-500/30 bg-black/45' : 'border-white/10 bg-neutral-950/60'}`}>
-                        <div className="flex items-center justify-between gap-2">
+                      {/* SETS TABLE */}
+                      <div className={`-ml-9 sm:ml-0 rounded-xl border p-3 space-y-2 ${isSuperset ? 'border-fuchsia-500/30 bg-black/45' : 'border-white/10 bg-neutral-950/60'}`}>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
                           <span className="text-[11px] font-bold uppercase tracking-wider text-neutral-400">
                             Week {selectedWeek} Sets ({setEntries.length})
                           </span>
@@ -1963,31 +1955,36 @@ export const GymApp: React.FC<GymAppProps> = ({
                               type="button"
                               onClick={() => adjustSetCount(plan, selectedWeek, ex, -1)}
                               disabled={setEntries.length <= 1}
-                              className="p-1 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-30 text-neutral-300 cursor-pointer"
-                              title="Remove last set"
+                              aria-label="Remove last set"
+                              className="h-8 w-8 inline-flex items-center justify-center rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-30 text-neutral-300 cursor-pointer"
                             >
-                              <Minus className="w-3 h-3" />
+                              <Minus className="w-3.5 h-3.5" />
                             </button>
                             <button
                               type="button"
                               onClick={() => adjustSetCount(plan, selectedWeek, ex, 1)}
-                              className="p-1 rounded-lg bg-white/5 hover:bg-white/10 text-neutral-300 cursor-pointer"
-                              title="Add extra set"
+                              aria-label="Add set"
+                              className="h-8 w-8 inline-flex items-center justify-center rounded-lg bg-white/5 hover:bg-white/10 text-neutral-300 cursor-pointer"
                             >
-                              <Plus className="w-3 h-3" />
+                              <Plus className="w-3.5 h-3.5" />
                             </button>
                             <button
                               type="button"
                               onClick={() => saveExerciseSets(plan, selectedWeek, ex)}
-                              className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold inline-flex items-center gap-1 transition-all cursor-pointer ${
+                              className={`h-8 px-2.5 rounded-lg border text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer ${
                                 isSuperset
                                   ? 'bg-fuchsia-600/25 hover:bg-fuchsia-600/40 border-fuchsia-400/40 text-fuchsia-200'
                                   : 'bg-red-600/25 hover:bg-red-600/40 border-red-500/30 text-red-200'
                               }`}
                             >
-                              <Check className="w-3 h-3" /> Save Sets
+                              <Check className="w-3 h-3" /> Save
                             </button>
                           </div>
+                        </div>
+
+                        {/* column labels, phones only */}
+                        <div className="grid grid-cols-[34px_minmax(0,1.4fr)_minmax(0,1fr)] gap-2 sm:hidden text-[9px] uppercase tracking-wider text-neutral-500 font-mono px-0.5">
+                          <span className="text-center">Set</span><span>Weight</span><span>Reps</span>
                         </div>
 
                         <div className="space-y-1.5">
@@ -1997,57 +1994,54 @@ export const GymApp: React.FC<GymAppProps> = ({
                             return (
                               <div
                                 key={sIdx}
-                                className="grid grid-cols-[58px_1fr_1fr] sm:grid-cols-[68px_170px_135px_auto] items-center gap-2"
+                                className="grid grid-cols-[34px_minmax(0,1.4fr)_minmax(0,1fr)] sm:grid-cols-[68px_170px_135px_auto] items-center gap-2"
                               >
                                 <span
-                                  className={`text-[11px] font-mono font-bold border rounded-lg py-1.5 text-center ${
+                                  className={`h-11 sm:h-auto flex items-center justify-center text-[11px] font-mono font-bold border rounded-lg sm:py-1.5 ${
                                     isSuperset
                                       ? 'text-fuchsia-200 bg-fuchsia-500/20 border-fuchsia-400/35'
                                       : 'text-red-300 bg-red-500/10 border-red-500/20'
                                   }`}
                                 >
-                                  Set {sIdx + 1}
+                                  <span className="sm:hidden">{sIdx + 1}</span>
+                                  <span className="hidden sm:inline">Set {sIdx + 1}</span>
                                 </span>
 
-                                {/* Weight input with explicit clickable kg / lbs badge */}
-                                <div className="relative flex items-center">
-                                  <span className="absolute left-2.5 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">
-                                    Wt
-                                  </span>
+                                {/* Weight */}
+                                <div className="relative flex items-center min-w-0">
+                                  <span className="hidden sm:block absolute left-2.5 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">Wt</span>
                                   <input
                                     type="text"
                                     inputMode="decimal"
                                     value={setRow.weight}
                                     onChange={(e) => updateSetField(plan, selectedWeek, ex, sIdx, 'weight', e.target.value)}
                                     onBlur={() => saveExerciseSets(plan, selectedWeek, ex)}
-                                    placeholder={prevForThisSet?.weight || `Weight (${setUnit})`}
+                                    placeholder={prevForThisSet?.weight || '0'}
                                     aria-label={`Set ${sIdx + 1} Weight (${setUnit})`}
-                                    className="w-full bg-neutral-900 border border-white/15 focus:border-red-500/70 rounded-lg pl-8 pr-11 py-1.5 text-xs text-white font-mono outline-none"
+                                    className="w-full min-w-0 h-11 sm:h-auto bg-neutral-900 border border-white/15 focus:border-red-500/70 rounded-lg pl-3 pr-12 sm:pl-8 sm:pr-11 sm:py-1.5 text-base sm:text-xs text-white font-mono outline-none"
                                   />
                                   <button
                                     type="button"
                                     onClick={() => updateSetField(plan, selectedWeek, ex, sIdx, 'unit', setUnit === 'kg' ? 'lbs' : 'kg')}
-                                    className="absolute right-1.5 px-1.5 py-0.5 rounded bg-white/10 hover:bg-white/20 text-[10px] font-bold uppercase text-neutral-200 cursor-pointer"
-                                    title="Switch between kg and lbs"
+                                    aria-label="Switch between kg and lbs"
+                                    className="absolute right-1 h-8 sm:h-auto px-1.5 sm:py-0.5 rounded-md bg-white/10 active:bg-white/25 text-[10px] font-bold uppercase text-neutral-200 cursor-pointer"
                                   >
                                     {setUnit}
                                   </button>
                                 </div>
 
-                                {/* Reps input */}
-                                <label className="relative flex items-center">
-                                  <span className="absolute left-2.5 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">
-                                    Reps
-                                  </span>
+                                {/* Reps */}
+                                <label className="relative flex items-center min-w-0">
+                                  <span className="hidden sm:block absolute left-2.5 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">Reps</span>
                                   <input
                                     type="text"
                                     inputMode="numeric"
                                     value={setRow.reps}
                                     onChange={(e) => updateSetField(plan, selectedWeek, ex, sIdx, 'reps', e.target.value)}
                                     onBlur={() => saveExerciseSets(plan, selectedWeek, ex)}
-                                    placeholder={prevForThisSet?.reps || repsDisplay || 'reps'}
+                                    placeholder={prevForThisSet?.reps || '0'}
                                     aria-label={`Set ${sIdx + 1} Reps`}
-                                    className="w-full bg-neutral-900 border border-white/15 focus:border-red-500/70 rounded-lg pl-10 pr-2.5 py-1.5 text-xs text-white font-mono outline-none"
+                                    className="w-full min-w-0 h-11 sm:h-auto bg-neutral-900 border border-white/15 focus:border-red-500/70 rounded-lg px-3 sm:pl-10 sm:pr-2.5 sm:py-1.5 text-base sm:text-xs text-white font-mono outline-none"
                                   />
                                 </label>
 
@@ -2062,12 +2056,12 @@ export const GymApp: React.FC<GymAppProps> = ({
                         </div>
                       </div>
 
-                      {/* WEEKLY HISTORY PER SET (WEIGHT WITH KG/LBS × REPS) */}
+                      {/* WEEKLY HISTORY */}
                       {weeklyHistory.length > 0 && (
-                        <div className="rounded-xl border border-indigo-500/20 bg-indigo-950/15 p-3 space-y-2">
+                        <div className="-ml-9 sm:ml-0 rounded-xl border border-indigo-500/20 bg-indigo-950/15 p-3 space-y-2">
                           <div className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-indigo-300">
                             <History className="w-3.5 h-3.5 text-indigo-400" />
-                            <span>History by Weeks (Weight × Reps per Set)</span>
+                            <span>History by Weeks</span>
                           </div>
                           <div className="space-y-1.5">
                             {weeklyHistory.map((rec, rIdx) => (
@@ -2075,9 +2069,7 @@ export const GymApp: React.FC<GymAppProps> = ({
                                 key={`${rec.weekLabel}-${rIdx}`}
                                 className="flex flex-wrap items-center gap-2 text-[11px] bg-black/30 border border-white/5 rounded-lg px-2.5 py-1.5"
                               >
-                                <span className="font-bold text-indigo-200 min-w-[68px]">
-                                  {rec.weekLabel}
-                                </span>
+                                <span className="font-bold text-indigo-200 min-w-[68px]">{rec.weekLabel}</span>
                                 <div className="flex flex-wrap gap-1.5 flex-1">
                                   {rec.setEntries.map((s) => (
                                     <span
@@ -2094,8 +2086,8 @@ export const GymApp: React.FC<GymAppProps> = ({
                           </div>
                         </div>
                       )}
-                    </div>
-                  </div>
+                      </div>  
+                   </div>
 
                   {/* Right: VIDEO THUMBNAIL CARD (Opens inline WebView player directly on page) */}
                   {videoInfo && (
@@ -2759,39 +2751,50 @@ export const GymApp: React.FC<GymAppProps> = ({
   };
 
   return (
-    <div className="h-screen flex flex-col bg-black text-white overflow-hidden selection:bg-red-900 selection:text-red-100 font-sans">
+    <div className="h-[100dvh] flex flex-col bg-black text-white overflow-hidden selection:bg-red-900 selection:text-red-100 font-sans">
       {/* Header */}
-      <header className="border-b border-red-500/20 bg-black/90 backdrop-blur-xl sticky top-0 z-40 shrink-0">
-        <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between gap-3">
-          <button onClick={() => setActiveTab('dashboard')} className="flex items-center gap-2.5 group cursor-pointer">
-            <div className="p-2 rounded-xl bg-gradient-to-tr from-red-700 to-red-500 text-white shadow-lg shadow-red-950/50 group-hover:scale-105 transition-transform">
-              <Dumbbell className="w-5 h-5" />
+        <header className="border-b border-red-500/20 bg-black/90 backdrop-blur-xl sticky top-0 z-40 shrink-0 pt-[env(safe-area-inset-top)]">
+        <div className="max-w-5xl mx-auto px-3 sm:px-4 h-14 flex items-center justify-between gap-2">
+          <button onClick={() => setActiveTab('dashboard')} className="flex items-center gap-2.5 group cursor-pointer min-w-0">
+            <div className="p-2 rounded-xl bg-gradient-to-tr from-red-700 to-red-500 text-white shadow-lg shadow-red-950/50 shrink-0">
+              <Dumbbell className="w-4 h-4 sm:w-5 sm:h-5" />
             </div>
             <div className="flex flex-col leading-tight text-left">
-              <span className="font-black text-base tracking-tight text-white">IRON HOUSE</span>
-              <span className="text-[9px] uppercase tracking-[0.25em] text-red-500 font-bold">Train Hard</span>
+              <span className="font-black text-sm sm:text-base tracking-tight text-white">IRON HOUSE</span>
+              <span className="text-[8px] sm:text-[9px] uppercase tracking-[0.25em] text-red-500 font-bold">Train Hard</span>
             </div>
           </button>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 shrink-0">
+            {/* phone: avatar */}
             <button
               type="button"
               onClick={() => setActiveTab('profile')}
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border text-xs font-semibold transition-all cursor-pointer ${
-                activeTab === 'profile'
-                  ? 'bg-red-600/25 border-red-500/50 text-red-200'
-                  : 'bg-neutral-900 border-white/10 hover:border-red-500/40 text-neutral-300'
+              aria-label="Profile"
+              className={`sm:hidden h-10 w-10 rounded-full font-black text-sm uppercase flex items-center justify-center border ${
+                activeTab === 'profile' ? 'bg-red-600 border-red-400 text-white' : 'bg-neutral-900 border-white/15 text-red-300'
               }`}
-              title="Open Profile, Password & Telegram Settings"
+            >
+              {resolvedDisplayName.charAt(0)}
+            </button>
+            {/* desktop: name chip */}
+            <button
+              type="button"
+              onClick={() => setActiveTab('profile')}
+              className={`hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border text-xs font-semibold cursor-pointer ${
+                activeTab === 'profile' ? 'bg-red-600/25 border-red-500/50 text-red-200' : 'bg-neutral-900 border-white/10 hover:border-red-500/40 text-neutral-300'
+              }`}
             >
               <User className="w-3.5 h-3.5 text-red-400" />
               <span className="max-w-[120px] truncate">{resolvedDisplayName}</span>
             </button>
             <button
               onClick={onLogout}
-              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-neutral-900 border border-white/10 hover:border-red-500/40 text-xs font-semibold text-neutral-200 cursor-pointer"
+              aria-label="Logout"
+              className="h-10 w-10 sm:w-auto sm:px-3 inline-flex items-center justify-center gap-1.5 rounded-xl bg-neutral-900 border border-white/10 hover:border-red-500/40 text-xs font-semibold text-neutral-200 cursor-pointer"
             >
-              <LogOut className="w-3.5 h-3.5" /> Logout
+              <LogOut className="w-4 h-4 sm:w-3.5 sm:h-3.5" />
+              <span className="hidden sm:inline">Logout</span>
             </button>
           </div>
         </div>
@@ -2817,8 +2820,8 @@ export const GymApp: React.FC<GymAppProps> = ({
       </header>
 
       {/* Content */}
-      <main className="flex-1 overflow-y-auto">
-        <div className="max-w-5xl mx-auto px-4 py-5 pb-24 sm:pb-8">
+        <main className="flex-1 overflow-y-auto overscroll-contain">
+          <div className="max-w-5xl mx-auto px-3 sm:px-4 py-4 sm:py-5 pb-[calc(5.5rem+env(safe-area-inset-bottom))] sm:pb-8">
           {activeTab === 'dashboard' && renderDashboard()}
           {activeTab === 'workouts' && renderWorkoutsWorkspace(true)}
           {activeTab === 'upload' && (
@@ -2848,20 +2851,22 @@ export const GymApp: React.FC<GymAppProps> = ({
       </main>
 
       {/* Mobile bottom nav */}
-      <nav className="sm:hidden fixed bottom-0 inset-x-0 z-40 bg-black/95 backdrop-blur-xl border-t border-red-500/20">
-        <div className="grid grid-cols-5">
-          {GYM_TABS.map((tab) => (
-            <button
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
-              className={`flex flex-col items-center gap-1 py-2.5 text-[10px] font-bold uppercase tracking-wide cursor-pointer ${
-                activeTab === tab.id ? 'text-red-400' : 'text-neutral-500'
-              }`}
-            >
-              <tab.icon className="w-5 h-5" />
-              {tab.label}
-            </button>
-          ))}
+      <nav className="sm:hidden fixed bottom-0 inset-x-0 z-40 bg-black/90 backdrop-blur-xl border-t border-red-500/20 pb-[env(safe-area-inset-bottom)]">
+        <div className="grid grid-cols-5 px-1">
+          {GYM_TABS.map((tab) => {
+            const active = activeTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className="relative flex flex-col items-center gap-0.5 pt-2.5 pb-1.5 text-[10px] font-bold tracking-wide active:scale-95 transition-transform cursor-pointer"
+              >
+                {active && <span className="absolute top-0 h-0.5 w-8 rounded-full bg-red-500" />}
+                <tab.icon className={`w-5 h-5 ${active ? 'text-red-400' : 'text-neutral-500'}`} />
+                <span className={active ? 'text-red-300' : 'text-neutral-500'}>{tab.short}</span>
+              </button>
+            );
+          })}
         </div>
       </nav>
 
