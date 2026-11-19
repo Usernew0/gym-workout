@@ -1,12 +1,18 @@
-import { supabase, isSupabaseConfigured } from './supabase';
-import { 
-  UserAccount, 
-  AdminSetting, 
+import {
+  supabase,
+  isSupabaseConfigured,
+  isServerSupabaseConfigured,
+  setServerSupabaseConfigured,
+  callSupabaseProxy,
+} from './supabase';
+import {
+  UserAccount,
+  AdminSetting,
   AdminAccount,
   UserActivityLog
 } from '../types';
-import { 
-  subscribeToFirestoreActivityLogs, 
+import {
+  subscribeToFirestoreActivityLogs,
   saveActivityLogDoc,
   getFirestoreActivityLogs,
   subscribeToFirestoreUserAccounts,
@@ -61,6 +67,105 @@ function handleSupabaseError(context: string, error: any) {
   }
 }
 
+let pendingServerCheck: Promise<boolean> | null = null;
+
+export async function ensureSupabaseConfigured(forceRecheck = false): Promise<boolean> {
+  if (isSupabaseConfigured && supabase) return true;
+  if (!forceRecheck && isServerSupabaseConfigured()) return true;
+  if (!forceRecheck && pendingServerCheck) return pendingServerCheck;
+
+  pendingServerCheck = (async () => {
+    try {
+      const res = await fetch('/api/supabase', { method: 'GET' });
+      if (res.ok) {
+        const json = await res.json();
+        const configured = Boolean(json?.configured);
+        setServerSupabaseConfigured(configured);
+        return configured;
+      }
+    } catch {
+      // ignore
+    } finally {
+      pendingServerCheck = null;
+    }
+    return false;
+  })();
+
+  return pendingServerCheck;
+}
+
+export async function supabaseSelect(
+  table: string,
+  options?: { select?: string; orderBy?: string; ascending?: boolean; limit?: number }
+): Promise<{ data: any[] | null; error?: string }> {
+  if (isSupabaseConfigured && supabase) {
+    let query = supabase.from(table).select(options?.select || '*');
+    if (options?.orderBy) {
+      query = query.order(options.orderBy, { ascending: Boolean(options.ascending) });
+    }
+    if (options?.limit && options.limit > 0) {
+      query = query.limit(options.limit);
+    }
+    const { data, error } = await query;
+    return { data: data || null, error: error?.message };
+  }
+
+  if (await ensureSupabaseConfigured()) {
+    try {
+      const res = await callSupabaseProxy({ action: 'select', table, ...(options || {}) });
+      if (res?.success) return { data: res.data || [] };
+      return { data: null, error: res?.error || 'Supabase proxy select failed' };
+    } catch (err: any) {
+      return { data: null, error: err?.message || String(err) };
+    }
+  }
+
+  return { data: null, error: 'Supabase not configured' };
+}
+
+export async function supabaseInsert(
+  table: string,
+  payload: Record<string, any>
+): Promise<{ success: boolean; error?: string }> {
+  if (isSupabaseConfigured && supabase) {
+    const { error } = await supabase.from(table).insert(payload);
+    return error ? { success: false, error: error.message } : { success: true };
+  }
+
+  if (await ensureSupabaseConfigured()) {
+    try {
+      const res = await callSupabaseProxy({ action: 'insert', table, payload });
+      return res?.success ? { success: true } : { success: false, error: res?.error || 'Insert failed' };
+    } catch (err: any) {
+      return { success: false, error: err?.message || String(err) };
+    }
+  }
+
+  return { success: false, error: 'Supabase not configured' };
+}
+
+export async function supabaseDelete(
+  table: string,
+  column: string,
+  value: string
+): Promise<{ success: boolean; error?: string }> {
+  if (isSupabaseConfigured && supabase) {
+    const { error } = await supabase.from(table).delete().eq(column, value);
+    return error ? { success: false, error: error.message } : { success: true };
+  }
+
+  if (await ensureSupabaseConfigured()) {
+    try {
+      const res = await callSupabaseProxy({ action: 'delete', table, column, value });
+      return res?.success ? { success: true } : { success: false, error: res?.error || 'Delete failed' };
+    } catch (err: any) {
+      return { success: false, error: err?.message || String(err) };
+    }
+  }
+
+  return { success: false, error: 'Supabase not configured' };
+}
+
 export async function verifySupabaseConnection(): Promise<{
   online: boolean;
   configured: boolean;
@@ -68,12 +173,33 @@ export async function verifySupabaseConnection(): Promise<{
   details: string;
   error?: string;
 }> {
+  // 1. Check server-side private environment variables via /api/supabase proxy first
+  try {
+    const res = await fetch('/api/supabase', { method: 'GET' });
+    if (res.ok) {
+      const json = await res.json();
+      setServerSupabaseConfigured(Boolean(json?.configured));
+      if (json?.configured) {
+        return {
+          online: Boolean(json.online),
+          configured: true,
+          latencyMs: Number(json.latencyMs) || 0,
+          details: json.details || 'Connected via Private Server Env',
+          error: json.error,
+        };
+      }
+    }
+  } catch {
+    // ignore proxy fetch error and fall through to client check if VITE_ vars exist
+  }
+
+  // 2. Fallback: direct browser Supabase client (if VITE_SUPABASE_URL & VITE_SUPABASE_ANON_KEY are set)
   if (!isSupabaseConfigured || !supabase) {
     return {
       online: false,
       configured: false,
       latencyMs: 0,
-      details: 'Not Configured (Local Fallback Mode)'
+      details: 'Not Configured (Set SUPABASE_URL & SUPABASE_ANON_KEY on server)'
     };
   }
 
@@ -131,6 +257,25 @@ export async function checkSupabaseTablesStatus(): Promise<{
     { tableName: 'workout_plans', displayName: 'Workout Plans' }
   ];
 
+  // 1. Prefer server-side proxy check (works with private SUPABASE_URL & SUPABASE_ANON_KEY without VITE_)
+  if (!isSupabaseConfigured || !supabase || isServerSupabaseConfigured()) {
+    try {
+      const proxyRes = await callSupabaseProxy({ action: 'check_tables' });
+      if (proxyRes && Array.isArray(proxyRes.tables)) {
+        if (proxyRes.configured || !isSupabaseConfigured || !supabase) {
+          return {
+            configured: Boolean(proxyRes.configured),
+            tables: proxyRes.tables,
+            allCriticalTablesExist: Boolean(proxyRes.allCriticalTablesExist),
+            checkedAt: proxyRes.checkedAt || new Date().toLocaleTimeString(),
+          };
+        }
+      }
+    } catch {
+      // fall through
+    }
+  }
+
   if (!isSupabaseConfigured || !supabase) {
     return {
       configured: false,
@@ -138,7 +283,7 @@ export async function checkSupabaseTablesStatus(): Promise<{
         tableName: t.tableName,
         displayName: t.displayName,
         status: 'unconfigured' as const,
-        message: 'Supabase URL/Key not configured (using local fallback)'
+        message: 'Supabase URL/Key not configured on server (using Firestore)'
       })),
       allCriticalTablesExist: false,
       checkedAt: new Date().toLocaleTimeString()
@@ -207,7 +352,6 @@ export async function checkSupabaseTablesStatus(): Promise<{
 
 const userAccountListeners: Array<(data: UserAccount[]) => void> = [];
 
-// In-memory cache — user accounts are sourced from Firestore + Supabase only.
 let cachedUserAccounts: UserAccount[] = [];
 
 function notifyUserAccountListeners(accounts: UserAccount[]) {
@@ -257,6 +401,15 @@ export function subscribeToUserAccounts(callback: (data: UserAccount[]) => void)
       if (unsubFirestore) unsubFirestore();
       supabase.removeChannel(channel);
     };
+  } else {
+    // Check server-side Supabase proxy on mount and hydrate if Firestore had no data
+    ensureSupabaseConfigured().then(async (ok) => {
+      if (!ok) return;
+      const { data, error } = await supabaseSelect('user_accounts');
+      if (!error && data && data.length > 0 && cachedUserAccounts.length === 0) {
+        notifyUserAccountListeners(data.map(item => mapFromDb<UserAccount>(item)));
+      }
+    }).catch(() => {});
   }
 
   return () => {
@@ -279,14 +432,13 @@ export async function saveUserAccountDoc(user: UserAccount) {
 
   notifyUserAccountListeners(updatedList);
 
-  if (isSupabaseConfigured && supabase) {
+  if (await ensureSupabaseConfigured()) {
     const dbPayload = mapToDb(savedUser);
     const res = await safeUpsert('user_accounts', dbPayload, 'id');
     if (!res.success) {
       handleSupabaseError("saveUserAccountDoc", res.error);
     }
 
-    // Automatically sync profiles table as well so foreign key references work seamlessly
     const profilePayload = {
       id: savedUser.id,
       username: savedUser.username,
@@ -302,19 +454,11 @@ export async function deleteUserAccountDoc(id: string) {
   const updatedList = cachedUserAccounts.filter(u => u.id !== id && u.username.toLowerCase() !== id.toLowerCase());
   notifyUserAccountListeners(updatedList);
 
-  if (isSupabaseConfigured && supabase) {
-    const { error } = await supabase
-      .from('user_accounts')
-      .delete()
-      .eq('id', id);
-
-    await supabase
-      .from('profiles')
-      .delete()
-      .eq('id', id);
-
-    if (error) {
-      handleSupabaseError("deleteUserAccountDoc", error);
+  if (await ensureSupabaseConfigured()) {
+    const res = await supabaseDelete('user_accounts', 'id', id);
+    await supabaseDelete('profiles', 'id', id);
+    if (!res.success && res.error) {
+      handleSupabaseError("deleteUserAccountDoc", res.error);
     }
   }
 }
@@ -331,10 +475,6 @@ function notifyAdminSettingListeners(settings: AdminSetting[]) {
   });
 }
 
-/**
-  * Intelligently merges admin settings from multiple sources (Firestore, Supabase)
-  * ensuring credentials, admin accounts, and configuration documents are never lost or overwritten by empty states.
-  */
 export function mergeAdminSettings(sources: (AdminSetting[] | null | undefined)[]): AdminSetting[] {
   const map = new Map<string, AdminSetting>();
 
@@ -397,7 +537,6 @@ let cachedFirestoreAdminSettings: AdminSetting[] = [];
 let cachedSupabaseAdminSettings: AdminSetting[] = [];
 
 export function subscribeToAdminSettings(callback: (data: AdminSetting[]) => void) {
-  // Firestore is authoritative; Supabase contributes any docs it holds.
   callback(mergeAdminSettings([cachedSupabaseAdminSettings, cachedFirestoreAdminSettings]));
   adminSettingListeners.push(callback);
 
@@ -426,7 +565,7 @@ export function subscribeToAdminSettings(callback: (data: AdminSetting[]) => voi
             if (parsed.password) {
               try {
                 parsed.adminAccounts = JSON.parse(parsed.password);
-              } catch (e) {
+              } catch {
                 // Ignore json parse error
               }
             }
@@ -454,6 +593,21 @@ export function subscribeToAdminSettings(callback: (data: AdminSetting[]) => voi
       if (unsubFirestore) unsubFirestore();
       supabase.removeChannel(channel);
     };
+  } else {
+    ensureSupabaseConfigured().then(async (ok) => {
+      if (!ok) return;
+      const { data, error } = await supabaseSelect('admin_settings');
+      if (!error && data && data.length > 0) {
+        cachedSupabaseAdminSettings = data.map(item => {
+          const parsed = mapFromDb<AdminSetting>(item);
+          if (parsed.id === 'adminAccounts' && (!parsed.adminAccounts || parsed.adminAccounts.length === 0) && parsed.password) {
+            try { parsed.adminAccounts = JSON.parse(parsed.password); } catch { /* ignore */ }
+          }
+          return parsed;
+        });
+        updateAndSync();
+      }
+    }).catch(() => {});
   }
 
   return () => {
@@ -466,10 +620,8 @@ export function subscribeToAdminSettings(callback: (data: AdminSetting[]) => voi
 export async function saveAdminSettingDoc(setting: AdminSetting) {
   const cleanSetting = sanitizeForFirestore(setting);
 
-  // ALWAYS save to Firestore first (source of truth)
   await saveFirestoreAdminSettingDoc(cleanSetting);
 
-  // Reflect the change in the in-memory Firestore cache and notify listeners
   const existingIdx = cachedFirestoreAdminSettings.findIndex(s => s.id === cleanSetting.id);
   cachedFirestoreAdminSettings = existingIdx >= 0
     ? cachedFirestoreAdminSettings.map((s, i) => (i === existingIdx ? cleanSetting : s))
@@ -477,8 +629,7 @@ export async function saveAdminSettingDoc(setting: AdminSetting) {
 
   notifyAdminSettingListeners(mergeAdminSettings([cachedSupabaseAdminSettings, cachedFirestoreAdminSettings]));
 
-  // ALSO mirror to Supabase when configured
-  if (isSupabaseConfigured && supabase) {
+  if (await ensureSupabaseConfigured()) {
     try {
       const dbPayload = mapToDb(cleanSetting);
       const res = await safeUpsert('admin_settings', dbPayload);
@@ -522,11 +673,10 @@ export function subscribeToActivityLogs(callback: (data: UserActivityLog[]) => v
 
   const emitCombinedLogs = () => {
     const map = new Map<string, UserActivityLog>();
-    // Merge firestore and supabase logs by ID
     firestoreLogs.forEach(l => { if (l && l.id) map.set(l.id, l); });
     supabaseLogs.forEach(l => { if (l && l.id) map.set(l.id, l); });
 
-    const merged = Array.from(map.values()).sort((a, b) => 
+    const merged = Array.from(map.values()).sort((a, b) =>
       new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
     );
 
@@ -536,13 +686,11 @@ export function subscribeToActivityLogs(callback: (data: UserActivityLog[]) => v
   callback([]);
   activityLogListeners.push(callback);
 
-  // Subscribe to Firestore Activity Logs (for retrieving existing/historical logs)
   const unsubscribeFirestore = subscribeToFirestoreActivityLogs((fLogs) => {
     firestoreLogs = fLogs;
     emitCombinedLogs();
   });
 
-  // Subscribe to Supabase Activity Logs if configured
   let unsubscribeSupabase = () => {};
   if (isSupabaseConfigured && supabase) {
     const fetchSupabaseLogs = async () => {
@@ -580,6 +728,15 @@ export function subscribeToActivityLogs(callback: (data: UserActivityLog[]) => v
     } catch (err) {
       handleSupabaseError("subscribeToActivityLogs channel", err);
     }
+  } else {
+    ensureSupabaseConfigured().then(async (ok) => {
+      if (!ok) return;
+      const { data, error } = await supabaseSelect('activity_logs', { orderBy: 'timestamp', ascending: false });
+      if (!error && data) {
+        supabaseLogs = data.map(item => mapFromDb<UserActivityLog>(item));
+        emitCombinedLogs();
+      }
+    }).catch(() => {});
   }
 
   return () => {
@@ -600,30 +757,24 @@ export async function logActivity(username: string, action: string, details: str
     timestamp: new Date().toISOString()
   };
 
-  // 1. Immediate in-memory listener notification
   notifyActivityLogListeners([newLog]);
 
   let savedInSupabase = false;
 
-  // 2. Save exclusively to Supabase when active
-  if (isSupabaseConfigured && supabase) {
+  if (await ensureSupabaseConfigured()) {
     try {
       const dbPayload = mapToDb(newLog);
-      const { error } = await supabase
-        .from('activity_logs')
-        .insert(dbPayload);
-
-      if (!error) {
+      const res = await supabaseInsert('activity_logs', dbPayload);
+      if (res.success) {
         savedInSupabase = true;
-      } else {
-        handleSupabaseError("logActivity Supabase insert", error);
+      } else if (res.error) {
+        handleSupabaseError("logActivity Supabase insert", res.error);
       }
     } catch (err) {
       handleSupabaseError("logActivity Supabase exception", err);
     }
   }
 
-  // 3. Fallback to Firestore ONLY if Supabase is NOT active/configured or Supabase insert failed
   if (!savedInSupabase) {
     await saveActivityLogDoc(newLog);
   }
@@ -633,7 +784,18 @@ export async function logActivity(username: string, action: string, details: str
  * Helper to upsert a record with safe foreign key fallback and schema cache handling
  */
 export async function safeUpsert(table: string, payload: any, onConflict: string = 'id'): Promise<{ success: boolean; error?: string }> {
-  if (!supabase) return { success: false, error: 'Supabase client not initialized' };
+  if (!isSupabaseConfigured || !supabase) {
+    if (await ensureSupabaseConfigured()) {
+      try {
+        const res = await callSupabaseProxy({ action: 'upsert', table, payload, onConflict });
+        return res?.success ? { success: true } : { success: false, error: res?.error || 'Supabase proxy upsert failed' };
+      } catch (err: any) {
+        return { success: false, error: err?.message || String(err) };
+      }
+    }
+    return { success: false, error: 'Supabase not configured' };
+  }
+
   try {
     const currentPayload: any = {};
     Object.keys(payload || {}).forEach(k => {
@@ -642,14 +804,12 @@ export async function safeUpsert(table: string, payload: any, onConflict: string
       }
     });
 
-    // Intelligent retry loop: strips missing schema cache columns or foreign key constraints automatically
     for (let attempt = 0; attempt < 15; attempt++) {
       const { error } = await supabase.from(table).upsert(currentPayload, { onConflict });
       if (!error) return { success: true };
 
       const msg = error.message || String(error);
 
-      // 1. Check if a specific column is missing in Supabase schema cache or Postgres
       const colMatch =
         msg.match(/Could not find the '([^']+)' column/i) ||
         msg.match(/column "([^"]+)" of relation/i);
@@ -658,33 +818,28 @@ export async function safeUpsert(table: string, payload: any, onConflict: string
         continue;
       }
 
-      // 2. Foreign key constraint fallback (e.g. created_by missing in public.profiles)
       if ((msg.includes('foreign key constraint') || msg.includes('fkey') || (error as any).code === '23503') && 'created_by' in currentPayload && currentPayload.created_by !== null) {
         currentPayload.created_by = null;
         continue;
       }
 
-      // 3. Fallback for missing couple_id column or schema cache issue
       if (msg.includes('couple_id') && 'couple_id' in currentPayload) {
         delete currentPayload.couple_id;
         continue;
       }
 
-      // 4. Fallback for unique constraint conflicts on username or profiles_username_key
       if (msg.includes('profiles_username_key') || msg.includes('username_key') || (msg.includes('duplicate key') && msg.includes('username'))) {
         const { error: retryErr } = await supabase.from(table).upsert(currentPayload, { onConflict: 'username' });
         if (!retryErr) return { success: true };
       }
 
-      // 5. Friendly, actionable message for uncreated tables in Supabase schema cache
       if (msg.includes('schema cache') && (msg.includes('Could not find the table') || msg.includes('relation') || msg.includes('PGRST301'))) {
-        return { 
-          success: false, 
-          error: `Table 'public.${table}' does not exist in Supabase yet. Please execute the SQL setup script from Admin Panel → "Fix DB / SQL Script" in your Supabase SQL Editor.` 
+        return {
+          success: false,
+          error: `Table 'public.${table}' does not exist in Supabase yet. Please execute the SQL setup script from Admin Panel → "Fix DB / SQL Script" in your Supabase SQL Editor.`
         };
       }
 
-      // If no recognizable strip rule matched, break and return the error
       return { success: false, error: msg };
     }
 
@@ -712,10 +867,12 @@ export async function syncAllDataToSupabase(seedData?: {
   userAccounts?: UserAccount[];
   adminSettings?: AdminSetting[];
 }): Promise<SupabaseSyncSummary> {
+  const hasSupabase = await ensureSupabaseConfigured(true);
+
   const summary: SupabaseSyncSummary = {
-    mode: isSupabaseConfigured && supabase ? 'firestore_and_supabase' : 'firestore_only',
+    mode: hasSupabase ? 'firestore_and_supabase' : 'firestore_only',
     firestoreOnline: false,
-    supabaseConfigured: !!(isSupabaseConfigured && supabase),
+    supabaseConfigured: hasSupabase,
     userAccountsSynced: 0,
     adminSettingsSynced: 0,
     workoutPlansSynced: 0,
@@ -724,14 +881,12 @@ export async function syncAllDataToSupabase(seedData?: {
   };
 
   try {
-    // 1. Verify Firestore connection
     const fsHealth = await verifyFirestoreConnection();
     summary.firestoreOnline = fsHealth.online;
     if (!fsHealth.online) {
       summary.errors.push(`Firestore: ${fsHealth.error || fsHealth.details}`);
     }
 
-    // 2. Push any in-memory/seeded user accounts & admin settings to Firestore so both DBs match
     if (seedData?.userAccounts && seedData.userAccounts.length > 0) {
       for (const u of seedData.userAccounts) {
         if (!u?.id || !u?.username) continue;
@@ -754,7 +909,6 @@ export async function syncAllDataToSupabase(seedData?: {
       }
     }
 
-    // 3. Pull canonical collections from Firestore
     const [fsUsers, fsSettings, fsWorkouts, fsLogs] = await Promise.all([
       getFirestoreUserAccounts(),
       getFirestoreAdminSettings(),
@@ -762,8 +916,7 @@ export async function syncAllDataToSupabase(seedData?: {
       getFirestoreActivityLogs()
     ]);
 
-    if (!isSupabaseConfigured || !supabase) {
-      // Firestore-only active cloud mode: report verified Firestore collections cleanly without false errors
+    if (!hasSupabase) {
       summary.userAccountsSynced = fsUsers.length;
       summary.adminSettingsSynced = fsSettings.length;
       summary.workoutPlansSynced = fsWorkouts.length;
@@ -771,7 +924,6 @@ export async function syncAllDataToSupabase(seedData?: {
       return summary;
     }
 
-    // 4. Dual-cloud mode: mirror all 4 collections (+ profiles) to Supabase PostgreSQL
     for (const u of fsUsers) {
       const res = await safeUpsert('user_accounts', mapToDb(u), 'id');
       if (res.success) {

@@ -12,7 +12,7 @@ function pdfSafeText(input?: string): string {
     .replace(/[–—]/g, '-')
     .replace(/[✓✔✅]/g, '[Done]')
     .replace(/[•·]/g, '-')
-    .replace(/[→➔➔]/g, '->')
+    .replace(/[→➔]/g, '->')
     .replace(/[\u2018\u2019]/g, "'")
     .replace(/[\u201C\u201D]/g, '"')
     .replace(/[^\x20-\x7E\xA0-\xFF\n]/g, '')
@@ -33,55 +33,78 @@ function getTargetText(ex: WorkoutExercise): { setsDisplay: string; repsDisplay:
   };
 }
 
-function entryHasData(entry?: ExerciseLogEntry): boolean {
-  if (!entry) return false;
-  if (entry.setEntries && entry.setEntries.some(s => (s.weight || '').trim() !== '' || (s.reps || '').trim() !== '')) {
-    return true;
+function getPopulatedSetList(
+  ex: WorkoutExercise,
+  entry: ExerciseLogEntry | undefined,
+  fallbackUnit: WeightUnit
+): SetLogEntry[] {
+  if (!entry) return [];
+  if (entry.setEntries && entry.setEntries.length > 0) {
+    return entry.setEntries
+      .filter(s => (s.weight || '').trim() !== '' || (s.reps || '').trim() !== '' || (s.rpe || '').trim() !== '')
+      .map(s => ({ ...s, unit: s.unit || entry.unit || fallbackUnit }));
   }
-  return Boolean(entry.weight?.trim() || entry.reps?.trim() || entry.sets?.trim());
+  if (entry.weight?.trim() || entry.reps?.trim()) {
+    return [
+      {
+        setNumber: 1,
+        weight: entry.weight || '',
+        unit: entry.unit || fallbackUnit,
+        reps: entry.reps || '',
+      },
+    ];
+  }
+  return [];
 }
 
-function formatSetEntries(
-  ex: WorkoutExercise,
-  entry: ExerciseLogEntry,
-  fallbackUnit: WeightUnit
-): string {
-  const list: SetLogEntry[] =
-    entry.setEntries && entry.setEntries.length > 0
-      ? entry.setEntries.filter(s => (s.weight || '').trim() !== '' || (s.reps || '').trim() !== '')
-      : [
-          {
-            setNumber: 1,
-            weight: entry.weight || '',
-            unit: entry.unit || fallbackUnit,
-            reps: entry.reps || '',
-          },
-        ];
+function formatCompactSet(s: SetLogEntry, fallbackUnit: WeightUnit): string {
+  const wt = (s.weight || '').trim();
+  const rp = (s.reps || '').trim();
+  const rpe = (s.rpe || '').trim();
+  const unit = s.unit || fallbackUnit;
+  const wtPart = wt ? (wt.toUpperCase() === 'BW' ? 'BW' : `${wt}${unit}`) : '-';
+  const rpPart = rp || '-';
+  const rpePart = rpe ? ` @${rpe}` : '';
+  return `S${s.setNumber}: ${wtPart} x ${rpPart}${rpePart}`;
+}
 
-  if (list.length === 0) {
-    const count = parseSetsCount(ex.sets);
-    return `${count} sets logged`;
+function calcEntryVolume(sets: SetLogEntry[]): number {
+  let vol = 0;
+  for (const s of sets) {
+    const w = parseFloat((s.weight || '').trim());
+    const r = parseFloat((s.reps || '').trim());
+    if (Number.isFinite(w) && Number.isFinite(r) && w > 0 && r > 0) {
+      vol += w * r;
+    }
   }
+  return vol;
+}
 
-  return list
-    .map((s) => {
-      const wt = (s.weight || '').trim();
-      const rp = (s.reps || '').trim();
-      const unit = s.unit || entry.unit || fallbackUnit;
-      const wtPart = wt ? (wt.toUpperCase() === 'BW' ? 'BW' : `${wt} ${unit}`) : '-';
-      const rpPart = rp || '-';
-      return `S${s.setNumber}: ${wtPart} x ${rpPart}`;
-    })
-    .join('  |  ');
+function calcAvgRpe(sets: SetLogEntry[]): string {
+  const vals = sets
+    .map(s => parseFloat((s.rpe || '').trim()))
+    .filter(n => Number.isFinite(n));
+  if (vals.length === 0) return '-';
+  const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+  return avg.toFixed(1).replace(/\.0$/, '');
+}
+
+function normalizeDayKey(day?: string): string {
+  const d = (day || '').trim();
+  return d ? d : 'General Workout';
 }
 
 export interface ExportWorkoutPdfOptions {
   ownerName?: string;
+  waterGlasses?: number;
 }
 
 /**
- * Generate a multi-page jsPDF summary for a WorkoutPlan, including overall & per-week progress,
- * exercise targets, instructions, notes, and full weekly set-by-set weight/reps history.
+ * Generate a clean, day-combined multi-page jsPDF report for a WorkoutPlan:
+ * - Executive Header & KPI Summary + Split Overview Table
+ * - Weekly Progress & Total Volume Breakdown
+ * - Warm-up Protocol Table
+ * - Day-Combined Training Sections (Day Header + Exercises + Aligned Weekly Set/RPE/Volume Tables + Day Session Notes)
  */
 export function buildWorkoutPlanPdfDocument(
   plan: WorkoutPlan,
@@ -90,14 +113,29 @@ export function buildWorkoutPlanPdfDocument(
   const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
   const pageWidth = doc.internal.pageSize.getWidth();
   const pageHeight = doc.internal.pageSize.getHeight();
-  const margin = 14;
+  const margin = 13;
   const contentWidth = pageWidth - margin * 2;
-  const bottomLimit = pageHeight - 16;
+  const bottomLimit = pageHeight - 15;
 
   const planUnit: WeightUnit = plan.defaultWeightUnit || 'kg';
   const weeks = Math.max(1, Number(plan.weeks) || 1);
   const exercises = plan.exercises || [];
+  const warmupExercises = plan.warmupExercises || [];
 
+  // Discover all week numbers present across plan & logs
+  const weekNumsSet = new Set<number>();
+  for (let w = 1; w <= weeks; w++) weekNumsSet.add(w);
+  Object.keys(plan.exerciseLogs || {}).forEach((k) => {
+    const m = k.match(/^w(\d+)$/i);
+    if (m) weekNumsSet.add(parseInt(m[1], 10));
+  });
+  Object.keys(plan.warmupLogs || {}).forEach((k) => {
+    const m = k.match(/^w(\d+)$/i);
+    if (m) weekNumsSet.add(parseInt(m[1], 10));
+  });
+  const sortedWeekNums = Array.from(weekNumsSet).sort((a, b) => a - b);
+
+  // Aggregate completions & total volume
   let totalDone = 0;
   const totalPossible = exercises.length * weeks;
   for (let w = 0; w < weeks; w++) {
@@ -105,94 +143,223 @@ export function buildWorkoutPlanPdfDocument(
   }
   const overallPct = totalPossible > 0 ? Math.round((totalDone / totalPossible) * 100) : 0;
 
-  let y = 14;
+  let grandTotalVolume = 0;
+  const weeklyVolumes: Record<number, number> = {};
+  sortedWeekNums.forEach((w) => {
+    const wk = weekKey(w - 1);
+    let wkVol = 0;
+    exercises.forEach((ex) => {
+      const sets = getPopulatedSetList(ex, plan.exerciseLogs?.[wk]?.[ex.id], planUnit);
+      wkVol += calcEntryVolume(sets);
+    });
+    weeklyVolumes[w] = Math.round(wkVol);
+    grandTotalVolume += wkVol;
+  });
 
+  // Group exercises into ordered Days
+  const dayOrder: string[] = [];
+  const dayExercisesMap = new Map<string, Array<{ ex: WorkoutExercise; globalIdx: number }>>();
+  exercises.forEach((ex, idx) => {
+    const dKey = normalizeDayKey(ex.day);
+    if (!dayExercisesMap.has(dKey)) {
+      dayOrder.push(dKey);
+      dayExercisesMap.set(dKey, []);
+    }
+    dayExercisesMap.get(dKey)!.push({ ex, globalIdx: idx });
+  });
+
+  // Organize session notes by scope/day + week
+  const daySessionNotes = new Map<string, Array<{ weekNum: number; scope: string; note: string }>>();
+  const globalSessionNotes: Array<{ weekNum: number; scope: string; note: string }> = [];
+
+  Object.entries(plan.exerciseLogs || {}).forEach(([wKeyStr, logsMap]) => {
+    const m = wKeyStr.match(/^w(\d+)$/i);
+    const weekNum = m ? parseInt(m[1], 10) : 1;
+    Object.entries(logsMap || {}).forEach(([entryKey, entryVal]) => {
+      if (!entryKey.startsWith('__session_note__')) return;
+      const text = pdfSafeText(entryVal?.notes);
+      if (!text) return;
+      const scope =
+        pdfSafeText(entryVal?.day) ||
+        (entryKey === '__session_note__ALL'
+          ? 'All Days'
+          : entryKey.replace(/^__session_note__/, '').replace(/_/g, ' '));
+      const matchedDay = dayOrder.find(d => pdfSafeText(d).toLowerCase() === scope.toLowerCase());
+      if (matchedDay) {
+        if (!daySessionNotes.has(matchedDay)) daySessionNotes.set(matchedDay, []);
+        daySessionNotes.get(matchedDay)!.push({ weekNum, scope, note: text });
+      } else {
+        globalSessionNotes.push({ weekNum, scope, note: text });
+      }
+    });
+  });
+
+  let y = 13;
   const ensureSpace = (neededMm: number) => {
     if (y + neededMm > bottomLimit) {
       doc.addPage();
-      y = 16;
+      y = 14;
     }
   };
 
-  // --- HEADER BANNER ---
-  doc.setFillColor(18, 18, 22);
-  doc.roundedRect(margin, y, contentWidth, 28, 3, 3, 'F');
+  // =========================================================================
+  // 1. EXECUTIVE HEADER BANNER
+  // =========================================================================
+  doc.setFillColor(17, 20, 28);
+  doc.roundedRect(margin, y, contentWidth, 29, 3, 3, 'F');
   doc.setFillColor(220, 38, 38);
-  doc.rect(margin, y, 2.5, 28, 'F');
+  doc.rect(margin, y, 2.8, 29, 'F');
 
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(9);
+  doc.setFontSize(8.5);
   doc.setTextColor(248, 113, 113);
-  doc.text('IRON HOUSE - WORKOUT PLAN & PROGRESS SUMMARY', margin + 6, y + 7);
+  doc.text('GYM WORKOUT  -  TRAINING PROGRAM & PERFORMANCE REPORT', margin + 6, y + 6.5);
 
-  doc.setFontSize(16);
+  doc.setFontSize(15.5);
   doc.setTextColor(255, 255, 255);
-  const titleLines = doc.splitTextToSize(pdfSafeText(plan.title) || 'Workout Plan', contentWidth - 12);
-  doc.text(titleLines[0], margin + 6, y + 14.5);
+  const titleLine = doc.splitTextToSize(pdfSafeText(plan.title) || 'Workout Plan', contentWidth - 12)[0];
+  doc.text(titleLine, margin + 6, y + 14);
 
   doc.setFont('helvetica', 'normal');
-  doc.setFontSize(9);
-  doc.setTextColor(200, 200, 210);
-  const memberLabel = pdfSafeText(options.ownerName || plan.ownerUsername || 'Member');
+  doc.setFontSize(8.5);
+  doc.setTextColor(203, 213, 225);
+  const memberLabel = pdfSafeText(options.ownerName || plan.ownerUsername || 'Athlete');
   const exportDate = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
-  const metaLine = `Member: ${memberLabel}   |   ${exercises.length} Exercises   |   ${weeks} Week${weeks === 1 ? '' : 's'}   |   Unit: ${planUnit.toUpperCase()}   |   Exported: ${exportDate}`;
-  doc.text(metaLine, margin + 6, y + 22);
-
-  y += 33;
+  const waterMeta = typeof options.waterGlasses === 'number' ? `  |  Water Today: ${options.waterGlasses} glasses` : '';
+  const metaLine = `Athlete: ${memberLabel}  |  ${dayOrder.length} Day${dayOrder.length === 1 ? '' : 's'}  |  ${exercises.length} Exercises  |  ${weeks} Week${weeks === 1 ? '' : 's'}  |  Unit: ${planUnit.toUpperCase()}${waterMeta}  |  ${exportDate}`;
+  doc.text(doc.splitTextToSize(metaLine, contentWidth - 12)[0] || metaLine, margin + 6, y + 21.5);
+  y += 33.5;
 
   if (plan.description && pdfSafeText(plan.description)) {
     doc.setFont('helvetica', 'italic');
-    doc.setFontSize(9.5);
-    doc.setTextColor(75, 85, 99);
+    doc.setFontSize(9);
+    doc.setTextColor(71, 85, 105);
     const descLines = doc.splitTextToSize(pdfSafeText(plan.description), contentWidth);
-    ensureSpace(descLines.length * 4.5 + 3);
+    ensureSpace(descLines.length * 4.2 + 3);
     doc.text(descLines, margin, y);
-    y += descLines.length * 4.5 + 3;
+    y += descLines.length * 4.2 + 3;
   }
 
-  // --- OVERALL & WEEKLY PROGRESS CARD ---
+  // =========================================================================
+  // 2. KPI METRICS STRIP + PROGRESS BAR
+  // =========================================================================
   ensureSpace(28);
-  doc.setFillColor(248, 250, 252);
-  doc.setDrawColor(226, 232, 240);
-  doc.roundedRect(margin, y, contentWidth, 23, 2.5, 2.5, 'FD');
+  const kpiGap = 3;
+  const kpiW = (contentWidth - kpiGap * 3) / 4;
+  const kpis = [
+    { label: 'OVERALL COMPLETION', value: `${overallPct}% (${totalDone}/${totalPossible})` },
+    { label: 'LOGGED VOLUME', value: grandTotalVolume > 0 ? `${Math.round(grandTotalVolume).toLocaleString()} ${planUnit}` : `0 ${planUnit}` },
+    { label: 'PROGRAM SPLIT', value: `${dayOrder.length} Day${dayOrder.length === 1 ? '' : 's'} / ${exercises.length} Ex` },
+    { label: 'HYDRATION TODAY', value: typeof options.waterGlasses === 'number' ? `${options.waterGlasses} / 8 Glasses` : `${weeks} Week Plan` },
+  ];
+  kpis.forEach((kpi, kIdx) => {
+    const kx = margin + kIdx * (kpiW + kpiGap);
+    doc.setFillColor(248, 250, 252);
+    doc.setDrawColor(226, 232, 240);
+    doc.roundedRect(kx, y, kpiW, 14, 2, 2, 'FD');
 
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(10);
-  doc.setTextColor(15, 23, 42);
-  doc.text(`Overall Progress: ${overallPct}% (${totalDone}/${totalPossible} exercise completions)`, margin + 4, y + 6.5);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(6.8);
+    doc.setTextColor(100, 116, 139);
+    doc.text(kpi.label, kx + 3, y + 4.8);
 
-  // Progress bar
-  const barWidth = contentWidth - 8;
+    doc.setFontSize(9.5);
+    doc.setTextColor(15, 23, 42);
+    doc.text(doc.splitTextToSize(kpi.value, kpiW - 5)[0] || kpi.value, kx + 3, y + 10.6);
+  });
+  y += 17;
+
+  // Progress bar + Weekly strip
   doc.setFillColor(226, 232, 240);
-  doc.roundedRect(margin + 4, y + 9, barWidth, 3.2, 1.5, 1.5, 'F');
+  doc.roundedRect(margin, y, contentWidth, 3, 1.5, 1.5, 'F');
   if (overallPct > 0) {
     doc.setFillColor(220, 38, 38);
-    doc.roundedRect(margin + 4, y + 9, Math.max(2, (barWidth * overallPct) / 100), 3.2, 1.5, 1.5, 'F');
+    doc.roundedRect(margin, y, Math.max(3, (contentWidth * overallPct) / 100), 3, 1.5, 1.5, 'F');
+  }
+  y += 6.5;
+
+  // =========================================================================
+  // 3. TRAINING SPLIT BY DAY (COMBINED OVERVIEW TABLE)
+  // =========================================================================
+  if (dayOrder.length > 0) {
+    const rowH = 6.2;
+    const tblH = 12 + dayOrder.length * rowH;
+    ensureSpace(Math.min(tblH + 4, 65));
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(10);
+    doc.setTextColor(15, 23, 42);
+    doc.text('Program Split Summary (By Training Day)', margin, y);
+    y += 4;
+
+    const colWidths = [contentWidth * 0.36, contentWidth * 0.14, contentWidth * 0.15, contentWidth * 0.17, contentWidth * 0.18];
+    const headers = ['Training Day', 'Exercises', 'Target Sets', 'Total Volume', 'Completion'];
+
+    // Header row
+    doc.setFillColor(30, 41, 59);
+    doc.rect(margin, y, contentWidth, 6.8, 'F');
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7.8);
+    doc.setTextColor(255, 255, 255);
+    let cx = margin;
+    headers.forEach((h, i) => {
+      doc.text(h, cx + 2.5, y + 4.6);
+      cx += colWidths[i];
+    });
+    y += 6.8;
+
+    dayOrder.forEach((dayName, dIdx) => {
+      ensureSpace(rowH + 2);
+      const list = dayExercisesMap.get(dayName) || [];
+      const dayTargetSets = list.reduce((acc, item) => acc + parseSetsCount(item.ex.sets), 0);
+      let dayVol = 0;
+      let dayDoneCount = 0;
+      const dayPossible = list.length * weeks;
+      sortedWeekNums.forEach((w) => {
+        const wk = weekKey(w - 1);
+        const doneSet = new Set(plan.progress?.[wk] || []);
+        list.forEach(({ ex }) => {
+          if (w <= weeks && doneSet.has(ex.id)) dayDoneCount++;
+          dayVol += calcEntryVolume(getPopulatedSetList(ex, plan.exerciseLogs?.[wk]?.[ex.id], planUnit));
+        });
+      });
+      const dayPct = dayPossible > 0 ? Math.round((dayDoneCount / dayPossible) * 100) : 0;
+
+      doc.setFillColor(dIdx % 2 === 0 ? 255 : 248, dIdx % 2 === 0 ? 255 : 250, dIdx % 2 === 0 ? 255 : 252);
+      doc.setDrawColor(226, 232, 240);
+      doc.rect(margin, y, contentWidth, rowH, 'FD');
+
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(8);
+      doc.setTextColor(15, 23, 42);
+      let rx = margin;
+      doc.text(doc.splitTextToSize(pdfSafeText(dayName), colWidths[0] - 4)[0] || dayName, rx + 2.5, y + 4.3);
+      rx += colWidths[0];
+
+      doc.setFont('helvetica', 'normal');
+      doc.setTextColor(51, 65, 85);
+      doc.text(String(list.length), rx + 2.5, y + 4.3);
+      rx += colWidths[1];
+      doc.text(String(dayTargetSets), rx + 2.5, y + 4.3);
+      rx += colWidths[2];
+      doc.text(dayVol > 0 ? `${Math.round(dayVol).toLocaleString()} ${planUnit}` : '-', rx + 2.5, y + 4.3);
+      rx += colWidths[3];
+      doc.setFont('helvetica', 'bold');
+      doc.setTextColor(dayPct === 100 ? 22 : 185, dayPct === 100 ? 163 : 28, dayPct === 100 ? 74 : 28);
+      doc.text(`${dayPct}% (${dayDoneCount}/${dayPossible})`, rx + 2.5, y + 4.3);
+
+      y += rowH;
+    });
+    y += 6;
   }
 
-  // Week pills summary line
-  const weekSummaryTokens: string[] = [];
-  for (let w = 1; w <= weeks; w++) {
-    const doneInW = (plan.progress?.[weekKey(w - 1)] || []).length;
-    const isDone = exercises.length > 0 && doneInW === exercises.length;
-    weekSummaryTokens.push(`W${w}: ${doneInW}/${exercises.length}${isDone ? ' [Done]' : ''}`);
-  }
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(8.5);
-  doc.setTextColor(71, 85, 105);
-  const weekLines = doc.splitTextToSize(weekSummaryTokens.join('   |   '), contentWidth - 8);
-  doc.text(weekLines[0] || '', margin + 4, y + 17.5);
-  if (weekLines.length > 1) {
-    doc.text(weekLines[1], margin + 4, y + 21);
-  }
-
-  y += 28;
-
-  // --- INFORMATION & INSTRUCTIONS ---
+  // =========================================================================
+  // 4. INFORMATION & INSTRUCTIONS
+  // =========================================================================
   if (plan.instructions && pdfSafeText(plan.instructions)) {
     const instrLines = doc.splitTextToSize(pdfSafeText(plan.instructions), contentWidth - 8);
-    const boxHeight = Math.min(80, instrLines.length * 4.2 + 10);
-    ensureSpace(boxHeight + 4);
+    const boxHeight = Math.min(72, instrLines.length * 4 + 10);
+    ensureSpace(boxHeight + 5);
 
     doc.setFillColor(240, 249, 255);
     doc.setDrawColor(186, 230, 253);
@@ -201,172 +368,412 @@ export function buildWorkoutPlanPdfDocument(
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(9.5);
     doc.setTextColor(3, 105, 161);
-    doc.text('Information & Instructions', margin + 4, y + 6);
+    doc.text('Coach Information & Program Instructions', margin + 4, y + 5.8);
 
     doc.setFont('helvetica', 'normal');
-    doc.setFontSize(8.5);
+    doc.setFontSize(8.2);
     doc.setTextColor(30, 41, 59);
-    const maxVisibleLines = Math.floor((boxHeight - 9) / 4.2);
-    doc.text(instrLines.slice(0, maxVisibleLines), margin + 4, y + 11);
-    y += boxHeight + 5;
+    const maxVisible = Math.floor((boxHeight - 9) / 4);
+    doc.text(instrLines.slice(0, maxVisible), margin + 4, y + 10.5);
+    y += boxHeight + 5.5;
   }
 
-  // --- EXERCISES & WEEKLY HISTORY ---
-  ensureSpace(12);
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(11);
-  doc.setTextColor(15, 23, 42);
-  doc.text('Exercises & Weekly History', margin, y);
-  y += 5;
+  // =========================================================================
+  // 5. WARM-UP PROTOCOL TABLE
+  // =========================================================================
+  if (warmupExercises.length > 0) {
+    ensureSpace(22);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(10.5);
+    doc.setTextColor(146, 64, 14);
+    doc.text(`Warm-up Protocol (${warmupExercises.length} Movement${warmupExercises.length === 1 ? '' : 's'})`, margin, y);
+    y += 4;
 
-  exercises.forEach((ex, idx) => {
-    const { setsDisplay, repsDisplay } = getTargetText(ex);
-    const targetStr = [
-      setsDisplay ? `${setsDisplay} sets` : '',
-      repsDisplay ? `${repsDisplay} reps` : '',
-    ]
-      .filter(Boolean)
-      .join(' x ');
+    const wuCols = [10, contentWidth * 0.34, 22, 22, contentWidth - 54 - contentWidth * 0.34];
+    doc.setFillColor(180, 83, 9);
+    doc.rect(margin, y, contentWidth, 6.5, 'F');
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7.6);
+    doc.setTextColor(255, 255, 255);
+    const wuHeaders = ['#', 'Warm-up Movement', 'Minutes', 'Sets', 'Target / Weekly Logs'];
+    let wx = margin;
+    wuHeaders.forEach((h, i) => {
+      doc.text(h, wx + 2, y + 4.4);
+      wx += wuCols[i];
+    });
+    y += 6.5;
 
-    // Gather completion weeks for this exercise
-    const completedWeeks: string[] = [];
-    for (let w = 1; w <= weeks; w++) {
-      if ((plan.progress?.[weekKey(w - 1)] || []).includes(ex.id)) {
-        completedWeeks.push(`W${w}`);
-      }
-    }
+    warmupExercises.forEach((wu, wuIdx) => {
+      const logBits: string[] = [];
+      sortedWeekNums.forEach((w) => {
+        const wEntry = plan.warmupLogs?.[weekKey(w - 1)]?.[wu.id];
+        if (!wEntry) return;
+        const popSets = (wEntry.setEntries || []).filter(
+          s => (s.weight || '').trim() !== '' || (s.reps || '').trim() !== '' || (s.rpe || '').trim() !== ''
+        );
+        const parts: string[] = [];
+        if (wEntry.completed) parts.push('[Done]');
+        if (popSets.length > 0) parts.push(popSets.map(s => formatCompactSet(s, planUnit)).join(', '));
+        if (wEntry.notes?.trim()) parts.push(pdfSafeText(wEntry.notes));
+        if (parts.length > 0) logBits.push(`W${w}: ${parts.join(' ')}`);
+      });
+      const detailStr = [pdfSafeText(wu.target), pdfSafeText(wu.notes), ...logBits].filter(Boolean).join('  |  ') || '-';
+      const detailWrapped = doc.splitTextToSize(detailStr, wuCols[4] - 4);
+      const rHeight = Math.max(6.4, detailWrapped.length * 3.8 + 2.6);
 
-    // Gather logged week history rows
-    const historyLines: string[] = [];
-    const loggedWeeks = plan.exerciseLogs || {};
-    const weekNumbers = new Set<number>();
-    for (let w = 1; w <= weeks; w++) weekNumbers.add(w);
-    Object.keys(loggedWeeks).forEach((k) => {
-      const m = k.match(/^w(\d+)$/i);
-      if (m) weekNumbers.add(parseInt(m[1], 10));
+      ensureSpace(rHeight + 2);
+      doc.setFillColor(wuIdx % 2 === 0 ? 255 : 255, wuIdx % 2 === 0 ? 251 : 247, wuIdx % 2 === 0 ? 235 : 225);
+      doc.setDrawColor(253, 230, 138);
+      doc.rect(margin, y, contentWidth, rHeight, 'FD');
+
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(8);
+      doc.setTextColor(120, 53, 15);
+      let xPos = margin;
+      doc.text(String(wuIdx + 1), xPos + 2, y + 4.3);
+      xPos += wuCols[0];
+      doc.text(doc.splitTextToSize(pdfSafeText(wu.name), wuCols[1] - 4)[0] || '', xPos + 2, y + 4.3);
+      xPos += wuCols[1];
+      doc.setFont('helvetica', 'normal');
+      doc.text(wu.minutes?.trim() ? `${wu.minutes.trim()}m` : '-', xPos + 2, y + 4.3);
+      xPos += wuCols[2];
+      doc.text(wu.targetSets?.trim() || '-', xPos + 2, y + 4.3);
+      xPos += wuCols[3];
+      doc.setFontSize(7.4);
+      doc.setTextColor(51, 65, 85);
+      doc.text(detailWrapped, xPos + 2, y + 4.1);
+
+      y += rHeight;
+    });
+    y += 6.5;
+  }
+
+  // =========================================================================
+  // 6. COMBINED DAY SECTIONS (EXERCISES + WEEKLY SET TABLES + DAY NOTES)
+  // =========================================================================
+  dayOrder.forEach((dayName, dayIdx) => {
+    const dayItems = dayExercisesMap.get(dayName) || [];
+    const dayNotes = (daySessionNotes.get(dayName) || []).sort((a, b) => a.weekNum - b.weekNum);
+    const dayTargetSets = dayItems.reduce((acc, item) => acc + parseSetsCount(item.ex.sets), 0);
+
+    let dayVolTotal = 0;
+    sortedWeekNums.forEach((w) => {
+      const wk = weekKey(w - 1);
+      dayItems.forEach(({ ex }) => {
+        dayVolTotal += calcEntryVolume(getPopulatedSetList(ex, plan.exerciseLogs?.[wk]?.[ex.id], planUnit));
+      });
     });
 
-    Array.from(weekNumbers)
-      .sort((a, b) => a - b)
-      .forEach((w) => {
-        const entry = loggedWeeks[weekKey(w - 1)]?.[ex.id];
-        if (!entryHasData(entry)) return;
-        const formatted = formatSetEntries(ex, entry!, planUnit);
-        historyLines.push(`Week ${w}: ${pdfSafeText(formatted)}`);
+    ensureSpace(26);
+    // Bold Day Group Banner
+    doc.setFillColor(24, 24, 32);
+    doc.roundedRect(margin, y, contentWidth, 9.5, 2, 2, 'F');
+    doc.setFillColor(220, 38, 38);
+    doc.rect(margin, y, 2.5, 9.5, 'F');
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(10);
+    doc.setTextColor(255, 255, 255);
+    doc.text(
+      `DAY ${dayIdx + 1}: ${doc.splitTextToSize(pdfSafeText(dayName).toUpperCase(), contentWidth * 0.56)[0]}`,
+      margin + 5,
+      y + 6.2
+    );
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8);
+    doc.setTextColor(203, 213, 225);
+    const rightMeta = `${dayItems.length} Exercises  |  ${dayTargetSets} Target Sets${dayVolTotal > 0 ? `  |  ${Math.round(dayVolTotal).toLocaleString()} ${planUnit} Volume` : ''}`;
+    doc.text(rightMeta, pageWidth - margin - 3, y + 6.2, { align: 'right' });
+    y += 12.5;
+
+    dayItems.forEach(({ ex, globalIdx }) => {
+      const { setsDisplay, repsDisplay } = getTargetText(ex);
+      const completedWeeks: string[] = [];
+      for (let w = 1; w <= weeks; w++) {
+        if ((plan.progress?.[weekKey(w - 1)] || []).includes(ex.id)) {
+          completedWeeks.push(`W${w}`);
+        }
+      }
+
+      // Build structured weekly log rows for this exercise
+      const weekTableRows: Array<{
+        wkLabel: string;
+        status: string;
+        setsText: string;
+        avgRpe: string;
+        volume: string;
+        note: string;
+      }> = [];
+
+      sortedWeekNums.forEach((w) => {
+        const wk = weekKey(w - 1);
+        const entry = plan.exerciseLogs?.[wk]?.[ex.id];
+        const isDone = (plan.progress?.[wk] || []).includes(ex.id);
+        const popSets = getPopulatedSetList(ex, entry, planUnit);
+        const wkNote = pdfSafeText(entry?.notes);
+        if (popSets.length === 0 && !wkNote && !isDone) return;
+
+        const wkVol = Math.round(calcEntryVolume(popSets));
+        weekTableRows.push({
+          wkLabel: `W${w}`,
+          status: isDone ? 'Done' : '-',
+          setsText: popSets.length > 0 ? popSets.map(s => formatCompactSet(s, planUnit)).join('  |  ') : '-',
+          avgRpe: popSets.length > 0 ? calcAvgRpe(popSets) : '-',
+          volume: wkVol > 0 ? `${wkVol} ${planUnit}` : '-',
+          note: wkNote || '',
+        });
       });
 
-    if (plan.previousLogs?.[ex.id] && entryHasData(plan.previousLogs[ex.id])) {
-      historyLines.push(`Previous Baseline: ${pdfSafeText(formatSetEntries(ex, plan.previousLogs[ex.id], planUnit))}`);
-    }
+      const metaBadges: string[] = [];
+      if (ex.isSuperset) {
+        metaBadges.push(
+          ex.supersetGroup && ex.supersetGroup.toUpperCase() !== 'SUPERSET'
+            ? `SUPERSET (${pdfSafeText(ex.supersetGroup)})`
+            : 'SUPERSET'
+        );
+      }
+      if (setsDisplay || repsDisplay) {
+        metaBadges.push(`Target: ${[setsDisplay && `${setsDisplay} sets`, repsDisplay && `${repsDisplay} reps`].filter(Boolean).join(' x ')}`);
+      }
+      if (ex.targetRpe?.trim()) {
+        metaBadges.push(`Target RPE: ${pdfSafeText(ex.targetRpe)}`);
+      }
+      if (completedWeeks.length > 0) {
+        metaBadges.push(`Done: ${completedWeeks.join(', ')}`);
+      }
 
-    const notesLines = ex.notes ? doc.splitTextToSize(`Notes: ${pdfSafeText(ex.notes)}`, contentWidth - 10) : [];
-    const wrappedHistoryLines: string[] = [];
-    if (historyLines.length > 0) {
-      historyLines.forEach((hl) => {
-        doc.splitTextToSize(hl, contentWidth - 12).forEach((part: string) => wrappedHistoryLines.push(part));
+      const coachNotesLines = ex.notes ? doc.splitTextToSize(`Coach Note: ${pdfSafeText(ex.notes)}`, contentWidth - 10) : [];
+
+      // Pre-compute table height
+      const tblCols = [13, 13, contentWidth - 62, 16, 20];
+      const wrappedRows = weekTableRows.map((r) => {
+        const combinedDetail = r.note ? `${r.setsText}\nNote: ${r.note}` : r.setsText;
+        const lines = doc.splitTextToSize(pdfSafeText(combinedDetail), tblCols[2] - 4);
+        const rh = Math.max(5.5, lines.length * 3.7 + 2);
+        return { ...r, lines, rh };
       });
-    } else {
-      wrappedHistoryLines.push('No logged weights/reps recorded yet.');
+      const tableTotalH = wrappedRows.length > 0 ? 5.8 + wrappedRows.reduce((s, r) => s + r.rh, 0) : 7.5;
+
+      const cardH =
+        11.5 +
+        (metaBadges.length > 0 ? 4.4 : 0) +
+        coachNotesLines.length * 3.8 +
+        (ex.videoUrl ? 3.8 : 0) +
+        tableTotalH +
+        3;
+
+      const fitsSingle = cardH <= pageHeight - 36;
+      ensureSpace(fitsSingle ? cardH + 2.5 : 32);
+
+      // Card chrome
+      const boxDrawH = fitsSingle ? cardH : Math.min(cardH, bottomLimit - y);
+      if (ex.isSuperset) {
+        doc.setFillColor(253, 244, 255);
+        doc.setDrawColor(217, 70, 239);
+      } else {
+        doc.setFillColor(255, 255, 255);
+        doc.setDrawColor(226, 232, 240);
+      }
+      doc.roundedRect(margin, y, contentWidth, boxDrawH, 2, 2, 'FD');
+
+      let cy = y + 5.2;
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(10);
+      doc.setTextColor(15, 23, 42);
+      doc.text(`#${globalIdx + 1}  ${pdfSafeText(ex.name)}`, margin + 3.5, cy);
+      cy += 4.3;
+
+      if (metaBadges.length > 0) {
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(7.8);
+        doc.setTextColor(ex.isSuperset ? 162 : 185, ex.isSuperset ? 28 : 28, ex.isSuperset ? 175 : 28);
+        doc.text(doc.splitTextToSize(metaBadges.join('   |   '), contentWidth - 8)[0], margin + 3.5, cy);
+        cy += 4.3;
+      }
+
+      if (coachNotesLines.length > 0) {
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(7.8);
+        doc.setTextColor(71, 85, 105);
+        doc.text(coachNotesLines, margin + 3.5, cy);
+        cy += coachNotesLines.length * 3.8;
+      }
+
+      if (ex.videoUrl) {
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(7.3);
+        doc.setTextColor(37, 99, 235);
+        doc.text(doc.splitTextToSize(`Video: ${pdfSafeText(ex.videoUrl)}`, contentWidth - 8)[0], margin + 3.5, cy);
+        cy += 3.8;
+      }
+
+      if (wrappedRows.length > 0) {
+        // Sub-table Header
+        doc.setFillColor(241, 245, 249);
+        doc.setDrawColor(203, 213, 225);
+        doc.rect(margin + 3, cy, contentWidth - 6, 5.5, 'FD');
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(7.2);
+        doc.setTextColor(51, 65, 85);
+        const innerCols = [13, 13, contentWidth - 6 - 62, 16, 20];
+        let tx = margin + 3;
+        ['Week', 'Done', 'Logged Sets (Weight x Reps @ RPE)', 'RPE Avg', 'Volume'].forEach((hdr, i) => {
+          doc.text(hdr, tx + 1.8, cy + 3.9);
+          tx += innerCols[i];
+        });
+        cy += 5.5;
+
+        wrappedRows.forEach((wr, rIdx) => {
+          if (cy + wr.rh > bottomLimit) {
+            doc.addPage();
+            cy = 16;
+          }
+          doc.setFillColor(rIdx % 2 === 0 ? 255 : 248, rIdx % 2 === 0 ? 255 : 250, rIdx % 2 === 0 ? 255 : 252);
+          doc.setDrawColor(226, 232, 240);
+          doc.rect(margin + 3, cy, contentWidth - 6, wr.rh, 'FD');
+
+          let rx = margin + 3;
+          doc.setFont('helvetica', 'bold');
+          doc.setFontSize(7.5);
+          doc.setTextColor(15, 23, 42);
+          doc.text(wr.wkLabel, rx + 1.8, cy + 3.8);
+          rx += innerCols[0];
+
+          doc.setFont('helvetica', 'bold');
+          doc.setTextColor(wr.status === 'Done' ? 22 : 148, wr.status === 'Done' ? 163 : 163, wr.status === 'Done' ? 74 : 184);
+          doc.text(wr.status, rx + 1.8, cy + 3.8);
+          rx += innerCols[1];
+
+          doc.setFont('courier', 'normal');
+          doc.setFontSize(7.2);
+          doc.setTextColor(30, 41, 59);
+          doc.text(wr.lines, rx + 1.8, cy + 3.8);
+          rx += innerCols[2];
+
+          doc.setFont('helvetica', 'bold');
+          doc.setFontSize(7.5);
+          doc.setTextColor(180, 83, 9);
+          doc.text(wr.avgRpe, rx + 1.8, cy + 3.8);
+          rx += innerCols[3];
+
+          doc.setFont('helvetica', 'normal');
+          doc.setTextColor(51, 65, 85);
+          doc.text(wr.volume, rx + 1.8, cy + 3.8);
+
+          cy += wr.rh;
+        });
+      } else {
+        doc.setFont('helvetica', 'italic');
+        doc.setFontSize(7.6);
+        doc.setTextColor(148, 163, 184);
+        doc.text('No weekly logs recorded for this exercise yet.', margin + 3.5, cy + 3.8);
+        cy += 6.5;
+      }
+
+      y = cy + 4.5;
+    });
+
+    // Render any Day-Matched Session Notes right at the close of that Day's block
+    if (dayNotes.length > 0) {
+      dayNotes.forEach((dn) => {
+        const wrapped = doc.splitTextToSize(dn.note, contentWidth - 10);
+        const nh = 9 + wrapped.length * 3.8;
+        ensureSpace(nh + 3);
+        doc.setFillColor(248, 250, 252);
+        doc.setDrawColor(203, 213, 225);
+        doc.roundedRect(margin, y, contentWidth, nh, 1.8, 1.8, 'FD');
+
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(8);
+        doc.setTextColor(185, 28, 28);
+        doc.text(`${pdfSafeText(dayName)} - Week ${dn.weekNum} Session Feedback`, margin + 3.5, y + 4.8);
+
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(8);
+        doc.setTextColor(30, 41, 59);
+        doc.text(wrapped, margin + 3.5, y + 8.8);
+        y += nh + 3;
+      });
     }
 
-    const headerSubParts: string[] = [];
-    if (ex.day) headerSubParts.push(pdfSafeText(ex.day));
-    if (ex.isSuperset) {
-      headerSubParts.push(
-        ex.supersetGroup && ex.supersetGroup.toUpperCase() !== 'SUPERSET'
-          ? `SUPERSET (${pdfSafeText(ex.supersetGroup)})`
-          : 'SUPERSET'
-      );
-    }
-    if (targetStr) headerSubParts.push(`Target: ${pdfSafeText(targetStr)}`);
-    if (completedWeeks.length > 0) headerSubParts.push(`Done: ${completedWeeks.join(', ')}`);
+    y += 3;
+  });
 
-    const cardHeight =
-      14 +
-      (headerSubParts.length > 0 ? 4.5 : 0) +
-      notesLines.length * 4 +
-      (ex.videoUrl ? 4.2 : 0) +
-      wrappedHistoryLines.length * 4.2;
-
-    const fitsSinglePage = cardHeight <= pageHeight - 36;
-    ensureSpace(fitsSinglePage ? cardHeight + 3 : 32);
-
-    // Card background & border (magenta tint if superset)
-    const drawHeight = fitsSinglePage ? cardHeight : Math.min(cardHeight, bottomLimit - y);
-    if (ex.isSuperset) {
-      doc.setFillColor(253, 244, 255);
-      doc.setDrawColor(217, 70, 239);
-    } else {
-      doc.setFillColor(255, 255, 255);
-      doc.setDrawColor(226, 232, 240);
-    }
-    doc.roundedRect(margin, y, contentWidth, drawHeight, 2, 2, 'FD');
-
-    let cy = y + 5.5;
+  // =========================================================================
+  // 7. GENERAL SESSION NOTES (ALL DAYS / UNMATCHED SCOPES)
+  // =========================================================================
+  if (globalSessionNotes.length > 0) {
+    globalSessionNotes.sort((a, b) => a.weekNum - b.weekNum || a.scope.localeCompare(b.scope));
+    ensureSpace(18);
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(10.5);
     doc.setTextColor(15, 23, 42);
-    doc.text(`#${idx + 1}  ${pdfSafeText(ex.name)}`, margin + 4, cy);
-    cy += 4.5;
+    doc.text('Overall Session Notes & Performance Feedback', margin, y);
+    y += 4.5;
 
-    if (headerSubParts.length > 0) {
+    globalSessionNotes.forEach((item) => {
+      const wrapped = doc.splitTextToSize(item.note, contentWidth - 10);
+      const boxH = 9.5 + wrapped.length * 4;
+      ensureSpace(boxH + 3);
+
+      doc.setFillColor(248, 250, 252);
+      doc.setDrawColor(226, 232, 240);
+      doc.roundedRect(margin, y, contentWidth, boxH, 2, 2, 'FD');
+
       doc.setFont('helvetica', 'bold');
-      doc.setFontSize(8);
-      doc.setTextColor(ex.isSuperset ? 162 : 185, ex.isSuperset ? 28 : 28, ex.isSuperset ? 175 : 28);
-      const subStr = doc.splitTextToSize(headerSubParts.join('   |   '), contentWidth - 8);
-      doc.text(subStr[0], margin + 4, cy);
-      cy += 4.5;
-    }
+      doc.setFontSize(8.2);
+      doc.setTextColor(185, 28, 28);
+      doc.text(`Week ${item.weekNum} - ${item.scope}`, margin + 4, y + 5.2);
 
-    if (notesLines.length > 0) {
       doc.setFont('helvetica', 'normal');
       doc.setFontSize(8.2);
-      doc.setTextColor(71, 85, 105);
-      doc.text(notesLines, margin + 4, cy);
-      cy += notesLines.length * 4;
-    }
-
-    if (ex.videoUrl) {
-      doc.setFont('helvetica', 'normal');
-      doc.setFontSize(7.8);
-      doc.setTextColor(37, 99, 235);
-      const videoStr = doc.splitTextToSize(`Video: ${pdfSafeText(ex.videoUrl)}`, contentWidth - 8);
-      doc.text(videoStr[0], margin + 4, cy);
-      cy += 4.2;
-    }
-
-    // History section divider
-    doc.setDrawColor(226, 232, 240);
-    doc.line(margin + 4, cy - 1, pageWidth - margin - 4, cy - 1);
-    cy += 3;
-
-    doc.setFont('courier', 'normal');
-    doc.setFontSize(8);
-    doc.setTextColor(30, 41, 59);
-    wrappedHistoryLines.forEach((line) => {
-      if (cy > bottomLimit) {
-        doc.addPage();
-        cy = 18;
-      }
-      doc.text(line, margin + 5, cy);
-      cy += 4.2;
+      doc.setTextColor(30, 41, 59);
+      doc.text(wrapped, margin + 4, y + 9.4);
+      y += boxH + 3;
     });
+  }
 
-    y = cy + 4;
-  });
-
-  // --- PAGE FOOTERS ---
+  // =========================================================================
+  // 8. PAGE FOOTERS
+  // =========================================================================
   const pageCount = doc.getNumberOfPages();
   for (let p = 1; p <= pageCount; p++) {
     doc.setPage(p);
+    doc.setDrawColor(226, 232, 240);
+    doc.line(margin, pageHeight - 11, pageWidth - margin, pageHeight - 11);
     doc.setFont('helvetica', 'normal');
-    doc.setFontSize(8);
-    doc.setTextColor(148, 163, 184);
-    doc.text(`Iron House Workout Archive - ${pdfSafeText(plan.title)}`, margin, pageHeight - 7);
-    doc.text(`Page ${p} of ${pageCount}`, pageWidth - margin, pageHeight - 7, { align: 'right' });
+    doc.setFontSize(7.8);
+    doc.setTextColor(100, 116, 139);
+    doc.text(`Gym Workout  -  ${pdfSafeText(plan.title)}`, margin, pageHeight - 6.5);
+    doc.text(`Page ${p} of ${pageCount}`, pageWidth - margin, pageHeight - 6.5, { align: 'right' });
   }
 
   return doc;
+}
+
+export function getWorkoutPdfFilename(plan: WorkoutPlan): string {
+  const safeSlug =
+    (plan.title || 'workout-plan')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/gi, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 48) || 'workout-plan';
+  const dateStamp = new Date().toISOString().slice(0, 10);
+  return `${safeSlug}-${dateStamp}.pdf`;
+}
+
+export function exportWorkoutPlanToPdfBuffer(
+  plan: WorkoutPlan,
+  options: ExportWorkoutPdfOptions = {}
+): { filename: string; buffer: Uint8Array } {
+  const doc = buildWorkoutPlanPdfDocument(plan, options);
+  const filename = getWorkoutPdfFilename(plan);
+  const arrayBuffer = doc.output('arraybuffer');
+  return {
+    filename,
+    buffer: new Uint8Array(arrayBuffer),
+  };
 }
 
 export function exportWorkoutPlanToPdf(
@@ -374,13 +781,7 @@ export function exportWorkoutPlanToPdf(
   options: ExportWorkoutPdfOptions = {}
 ): string {
   const doc = buildWorkoutPlanPdfDocument(plan, options);
-  const safeSlug = (plan.title || 'workout-plan')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/gi, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 48) || 'workout-plan';
-  const dateStamp = new Date().toISOString().slice(0, 10);
-  const filename = `${safeSlug}-${dateStamp}.pdf`;
+  const filename = getWorkoutPdfFilename(plan);
   doc.save(filename);
   return filename;
 }

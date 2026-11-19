@@ -13,6 +13,7 @@ export interface ParsedWeekSetEntry {
   weight: string;
   unit?: 'kg' | 'lbs';
   reps: string;
+  rpe?: string;
 }
 
 export interface ParsedWeekData {
@@ -20,6 +21,7 @@ export interface ParsedWeekData {
   unit?: 'kg' | 'lbs';
   entries: ParsedWeekSetEntry[];
   completed?: boolean;
+  weekNote?: string;
 }
 
 export interface ParsedExerciseRow {
@@ -27,6 +29,7 @@ export interface ParsedExerciseRow {
   name: string;
   sets: string;
   reps: string;
+  rpe?: string;
   notes: string;
   video: string;
   isSuperset?: boolean;
@@ -61,7 +64,7 @@ const HEADER_HINTS = {
   name: /exercise|workout|movement|name|title|تمرين|اسم/i,
   sets: /^(?:target\s*|planned\s*)?(?:sets?|rounds?|المجموعات|جولات)(?:\s*\(.*\))?$/i,
   reps: /^(?:target\s*|planned\s*|goal\s*)?(?:reps?|repetitions?|repeat|التكرار|تكرار)(?:\s*\(.*\))?$/i,
-  notes: /note|comment|cue|tempo|rest|تفاصيل|ملاحظ|تعليق/i,
+  notes: /^(?:coach\s*)?(?:note|notes|comment|cue|tempo|rest|تفاصيل|ملاحظ|تعليق)/i,
   video: /video|link|url|clip|demo|youtube|فيديو|رابط/i,
 };
 
@@ -75,20 +78,27 @@ interface ExtraDataColumn {
     | 'week_combined'
     | 'week_weight'
     | 'week_reps'
+    | 'week_rpe'
+    | 'week_notes'
     | 'week_done'
     | 'set_combined'
     | 'set_weight'
     | 'set_reps'
+    | 'set_rpe'
     | 'weight'
     | 'actual_reps'
+    | 'rpe'
     | 'done'
     | 'prev_combined'
     | 'prev_weight'
-    | 'prev_reps';
+    | 'prev_reps'
+    | 'prev_rpe';
   weekNumber?: number; // 1..52 (or 0 for prev)
   setNumber?: number;  // 1..20 for set_weight / set_reps / set_combined
   unitHint?: 'kg' | 'lbs';
 }
+
+const TARGET_RPE_HEADER_HINT = /^(?:target\s*|planned\s*|goal\s*|prescribed\s*|expected\s*|recommended\s*)?(?:rpe|rir|intensity\s*\(?rpe\)?|effort\s*\(?rpe\)?)(?:\s*target|\s*goal|\s*\([^)]*\))?$/i;
 
 interface ColumnMap {
   day: number;
@@ -97,6 +107,7 @@ interface ColumnMap {
   name: number;
   sets: number;
   reps: number;
+  targetRpe: number;
   notes: number;
   video: number;
   dataCols: ExtraDataColumn[];
@@ -209,22 +220,23 @@ function classifyExtraDataHeader(rawHeader: string, colIdx: number): ExtraDataCo
   if (!cell) return null;
   const unitHint = detectUnitFromText(cell);
 
-  // 1. Week + Set + Weight / Reps (e.g. "W1 S1 Weight", "Week 1 Set 2")
+  // 1. Week + Set + Weight / Reps / RPE (e.g. "W1 S1 Weight", "Week 1 Set 2", "W1 S1 RPE")
   const weekSetMatch = cell.match(
-    /^(?:week|wk|w)\s*#?\s*(\d+)\s*[-–_: ]*\s*(?:set|s)\s*#?\s*(\d+)(?:\s*[-–_: ]*\s*(weight|wt|load|kg|lbs?|reps?|r))?$/i
+    /^(?:week|wk|w)\s*#?\s*(\d+)\s*[-–_: ]*\s*(?:set|s)\s*#?\s*(\d+)(?:\s*[-–_: ]*\s*(weight|wt|load|kg|lbs?|reps?|r|rpe))?$/i
   );
   if (weekSetMatch) {
     const wk = parseInt(weekSetMatch[1], 10);
     const sn = parseInt(weekSetMatch[2], 10);
     const sub = (weekSetMatch[3] || '').toLowerCase();
     if (wk >= 1 && wk <= 52 && sn >= 1 && sn <= 20) {
+      if (sub === 'rpe') return { colIdx, kind: 'set_rpe', weekNumber: wk, setNumber: sn, unitHint };
       if (sub.startsWith('r')) return { colIdx, kind: 'set_reps', weekNumber: wk, setNumber: sn, unitHint };
       if (sub) return { colIdx, kind: 'set_weight', weekNumber: wk, setNumber: sn, unitHint };
       return { colIdx, kind: 'set_combined', weekNumber: wk, setNumber: sn, unitHint };
     }
   }
 
-  // 2. Week N Weight / Reps / Done / Combined (e.g. "Week 1", "W1", "Week 1 Weight (kg)", "W2 Reps", "Weight W1")
+  // 2. Week N Weight / Reps / RPE / Notes / Done / Combined (e.g. "Week 1", "Week 1 RPE", "Week 1 Set Breakdown", "Week 1 Member Notes")
   const weekPrefixMatch = cell.match(
     /^(?:week|wk|w)\s*#?\s*(\d+)\s*[-–_: ]*(.*)$/i
   );
@@ -232,8 +244,14 @@ function classifyExtraDataHeader(rawHeader: string, colIdx: number): ExtraDataCo
     const wk = parseInt(weekPrefixMatch[1], 10);
     const rest = (weekPrefixMatch[2] || '').trim().toLowerCase();
     if (wk >= 1 && wk <= 52) {
-      if (!rest || /^(?:log|data|actual|performance|result|score)?$/i.test(rest)) {
+      if (!rest || /^(?:log|data|actual|performance|result|score|set\s*breakdown|sets?\s*summary)?$/i.test(rest)) {
         return { colIdx, kind: 'week_combined', weekNumber: wk, unitHint };
+      }
+      if (/rpe/i.test(rest)) {
+        return { colIdx, kind: 'week_rpe', weekNumber: wk, unitHint };
+      }
+      if (/note|comment|feedback/i.test(rest)) {
+        return { colIdx, kind: 'week_notes', weekNumber: wk, unitHint };
       }
       if (/weight|wt|load|kg|lbs?|الوزن/i.test(rest)) {
         return { colIdx, kind: 'week_weight', weekNumber: wk, unitHint };
@@ -248,26 +266,29 @@ function classifyExtraDataHeader(rawHeader: string, colIdx: number): ExtraDataCo
   }
 
   const weekSuffixMatch = cell.match(
-    /^(weight|wt|load|kg|lbs?|reps?|done|completed|status)\s*[-–_: (]*\s*(?:week|wk|w)\s*#?\s*(\d+)\)?$/i
+    /^(weight|wt|load|kg|lbs?|reps?|rpe|notes?|done|completed|status)\s*[-–_: (]*\s*(?:week|wk|w)\s*#?\s*(\d+)\)?$/i
   );
   if (weekSuffixMatch) {
     const sub = weekSuffixMatch[1].toLowerCase();
     const wk = parseInt(weekSuffixMatch[2], 10);
     if (wk >= 1 && wk <= 52) {
+      if (/rpe/.test(sub)) return { colIdx, kind: 'week_rpe', weekNumber: wk, unitHint };
+      if (/note/.test(sub)) return { colIdx, kind: 'week_notes', weekNumber: wk, unitHint };
       if (/reps?/.test(sub)) return { colIdx, kind: 'week_reps', weekNumber: wk, unitHint };
       if (/done|complete|status/.test(sub)) return { colIdx, kind: 'week_done', weekNumber: wk, unitHint };
       return { colIdx, kind: 'week_weight', weekNumber: wk, unitHint };
     }
   }
 
-  // 3. Per-Set columns without week (defaults to Week 1): "Set 1", "S1", "Set 1 Weight", "Set 2 Reps"
+  // 3. Per-Set columns without week (defaults to Week 1): "Set 1", "S1", "Set 1 Weight", "Set 2 Reps", "Set 1 RPE"
   const setColMatch = cell.match(
-    /^(?:set|s)\s*#?\s*(\d+)(?:\s*[-–_: ]*\s*(weight|wt|load|kg|lbs?|reps?|r))?$/i
+    /^(?:set|s)\s*#?\s*(\d+)(?:\s*[-–_: ]*\s*(weight|wt|load|kg|lbs?|reps?|r|rpe))?$/i
   );
   if (setColMatch) {
     const sn = parseInt(setColMatch[1], 10);
     const sub = (setColMatch[2] || '').toLowerCase();
     if (sn >= 1 && sn <= 20) {
+      if (sub === 'rpe') return { colIdx, kind: 'set_rpe', weekNumber: 1, setNumber: sn, unitHint };
       if (sub.startsWith('r')) return { colIdx, kind: 'set_reps', weekNumber: 1, setNumber: sn, unitHint };
       if (sub) return { colIdx, kind: 'set_weight', weekNumber: 1, setNumber: sn, unitHint };
       return { colIdx, kind: 'set_combined', weekNumber: 1, setNumber: sn, unitHint };
@@ -275,6 +296,9 @@ function classifyExtraDataHeader(rawHeader: string, colIdx: number): ExtraDataCo
   }
 
   // 4. Previous / Prior / Last session columns (stored as weekNumber: 0 -> previousLogs)
+  if (/^(?:prev(?:ious)?|prior|last\s*(?:week|session)?)\s*rpe$/i.test(cell)) {
+    return { colIdx, kind: 'prev_rpe', weekNumber: 0, unitHint };
+  }
   if (/^(?:prev(?:ious)?|prior|last\s*(?:week|session|time)?|old)\s*(?:weight|wt|load|kg|lbs?)?$/i.test(cell)) {
     if (/weight|wt|load|kg|lbs?/i.test(cell)) {
       return { colIdx, kind: 'prev_weight', weekNumber: 0, unitHint };
@@ -295,7 +319,14 @@ function classifyExtraDataHeader(rawHeader: string, colIdx: number): ExtraDataCo
     return { colIdx, kind: 'actual_reps', weekNumber: 1, unitHint };
   }
 
-  // 7. Done / Completed / Checkmark status column
+  // 7. Generic / Target RPE column
+  if (
+    /^(?:actual\s*|logged\s*|avg\s*|target\s*|planned\s*|goal\s*|prescribed\s*|expected\s*|recommended\s*)?(?:rpe|rir|intensity\s*\(?rpe\)?|effort\s*\(?rpe\)?)(?:\s*target|\s*goal|\s*\([^)]*\))?$/i.test(cell)
+  ) {
+    return { colIdx, kind: 'rpe', weekNumber: 1, unitHint };
+  }
+
+  // 8. Done / Completed / Checkmark status column
   if (/^(?:done|completed?|checked|status|finished|تم)$/i.test(cell)) {
     return { colIdx, kind: 'done', weekNumber: 1, unitHint };
   }
@@ -304,8 +335,8 @@ function classifyExtraDataHeader(rawHeader: string, colIdx: number): ExtraDataCo
 }
 
 function isHeaderRowMatch(row: string[]): { map: ColumnMap; matched: boolean; matchCount: number } {
-  const fallback: ColumnMap = { day: -1, superset: -1, setsReps: -1, name: 0, sets: 1, reps: 2, notes: 3, video: 4, dataCols: [] };
-  const map: ColumnMap = { day: -1, superset: -1, setsReps: -1, name: -1, sets: -1, reps: -1, notes: -1, video: -1, dataCols: [] };
+  const fallback: ColumnMap = { day: -1, superset: -1, setsReps: -1, name: 0, sets: 1, reps: 2, targetRpe: -1, notes: 3, video: 4, dataCols: [] };
+  const map: ColumnMap = { day: -1, superset: -1, setsReps: -1, name: -1, sets: -1, reps: -1, targetRpe: -1, notes: -1, video: -1, dataCols: [] };
   let matches = 0;
 
   (row || []).forEach((rawCell, idx) => {
@@ -315,6 +346,10 @@ function isHeaderRowMatch(row: string[]): { map: ColumnMap; matched: boolean; ma
 
     const unit = detectUnitFromText(cell);
     if (unit && !map.unitHint) map.unitHint = unit;
+
+    if (map.targetRpe === -1 && TARGET_RPE_HEADER_HINT.test(cell)) {
+      map.targetRpe = idx;
+    }
 
     // Check explicit logged data columns FIRST so "Week 1 Reps" / "Set 1 Weight" / "Actual Reps" don't hijack target Sets/Reps
     const extraCol = classifyExtraDataHeader(cell, idx);
@@ -337,8 +372,8 @@ function isHeaderRowMatch(row: string[]): { map: ColumnMap; matched: boolean; ma
 
   if (matches >= 2 && map.name !== -1) {
     const positional = map.day === 0
-      ? { day: 0, superset: -1, setsReps: -1, name: 1, sets: 2, reps: 3, notes: 4, video: 5 }
-      : { day: -1, superset: -1, setsReps: -1, name: 0, sets: 1, reps: 2, notes: 3, video: 4 };
+      ? { day: 0, superset: -1, setsReps: -1, name: 1, sets: 2, reps: 3, targetRpe: -1, notes: 4, video: 5 }
+      : { day: -1, superset: -1, setsReps: -1, name: 0, sets: 1, reps: 2, targetRpe: -1, notes: 3, video: 4 };
     const scalarEntries = Object.entries(map).filter(([k, v]) => k !== 'dataCols' && k !== 'unitHint' && v !== -1);
     return {
       map: {
@@ -357,12 +392,12 @@ function isHeaderRowMatch(row: string[]): { map: ColumnMap; matched: boolean; ma
 
 /**
  * Merge dual-row headers when templates have group headers like [Week 1, '', Week 2, '']
- * directly above sub-headers like [Weight, Reps, Weight, Reps].
+ * directly above sub-headers like [Weight, Reps, RPE, Weight, Reps, RPE].
  */
 function buildMergedDualHeaderRow(primaryRow: string[], subRow?: string[]): { combined: string[]; usedSubRow: boolean } {
   if (!subRow || subRow.length === 0) return { combined: primaryRow, usedSubRow: false };
 
-  const subHeaderToken = /^(?:weight|wt|load|kg|lbs?|reps?|actual(?:\s*reps?)?|done|status|completed?|s\d+|set\s*\d+|الوزن|تكرار)(?:\s*\([^)]*\))?$/i;
+  const subHeaderToken = /^(?:weight|wt|load|kg|lbs?|reps?|rpe|rir|set\s*detail|set\s*breakdown|notes?|actual(?:\s*reps?)?|done|status|completed?|s\d+|set\s*\d+|الوزن|تكرار)(?:\s*\([^)]*\))?$/i;
   const subMatches = subRow.filter(c => subHeaderToken.test((c || '').trim())).length;
   if (subMatches < 2) return { combined: primaryRow, usedSubRow: false };
 
@@ -376,16 +411,19 @@ function buildMergedDualHeaderRow(primaryRow: string[], subRow?: string[]): { co
 
     if (p) {
       // Carry forward group headers like "Week 1", "W1", "Set 1", "Previous" across blank sub-columns
-      if (/^(?:(?:week|wk|w)\s*#?\s*\d+|(?:set|s)\s*#?\s*\d+|prev(?:ious)?|prior|last\s*week)$/i.test(p)) {
-        carriedGroup = p;
+      if (/^(?:(?:week|wk|w)\s*#?\s*\d+|(?:set|s)\s*#?\s*\d+|prev(?:ious)?|prior|last\s*week)(?:\s*[-–:|].*)?$/i.test(p)) {
+        const prefixMatch = p.match(/^((?:week|wk|w)\s*#?\s*\d+|(?:set|s)\s*#?\s*\d+|prev(?:ious)?|prior|last\s*week)/i);
+        carriedGroup = prefixMatch ? prefixMatch[1] : p;
       } else {
         carriedGroup = '';
       }
     }
 
     if (s && subHeaderToken.test(s)) {
-      const prefix = p || carriedGroup;
-      combined.push(prefix ? `${prefix} ${s}` : s);
+      const prefix = carriedGroup;
+      // Avoid double-prefixing if s already begins with Week / W1 / Set / Prev
+      const alreadyPrefixed = /^(?:week|wk|w)\s*#?\s*\d+|^(?:set|s)\s*#?\s*\d+|^prev/i.test(s);
+      combined.push(prefix && !alreadyPrefixed ? `${prefix} ${s}` : s);
     } else {
       combined.push(p || s);
     }
@@ -395,7 +433,7 @@ function buildMergedDualHeaderRow(primaryRow: string[], subRow?: string[]): { co
 }
 
 function detectColumnMap(rows: string[][]): { map: ColumnMap; headerIndex: number; headerEndIndex: number; matched: boolean } {
-  const fallback: ColumnMap = { day: -1, superset: -1, setsReps: -1, name: 0, sets: 1, reps: 2, notes: 3, video: 4, dataCols: [] };
+  const fallback: ColumnMap = { day: -1, superset: -1, setsReps: -1, name: 0, sets: 1, reps: 2, targetRpe: -1, notes: 3, video: 4, dataCols: [] };
 
   for (let i = 0; i < Math.min(rows.length, 15); i++) {
     const primary = rows[i] || [];
@@ -416,11 +454,11 @@ function detectColumnMap(rows: string[][]): { map: ColumnMap; headerIndex: numbe
   return { map: fallback, headerIndex: -1, headerEndIndex: -1, matched: false };
 }
 
-/** Parse a single cell or multi-set cell into one or more { weight, unit, reps } pieces. */
+/** Parse a single cell or multi-set cell into one or more { weight, unit, reps, rpe } pieces. */
 function parseLoggedCellEntries(
   rawCell: string,
   defaultUnit?: 'kg' | 'lbs'
-): Array<{ weight: string; unit?: 'kg' | 'lbs'; reps: string }> {
+): Array<{ weight: string; unit?: 'kg' | 'lbs'; reps: string; rpe?: string }> {
   const raw = (rawCell || '').trim();
   if (!raw || /^[-—–_=]+$|^n\/?a$/i.test(raw)) return [];
 
@@ -430,14 +468,27 @@ function parseLoggedCellEntries(
     .map(p => p.trim())
     .filter(Boolean);
 
-  const results: Array<{ weight: string; unit?: 'kg' | 'lbs'; reps: string }> = [];
+  const results: Array<{ weight: string; unit?: 'kg' | 'lbs'; reps: string; rpe?: string }> = [];
 
   for (const part of parts) {
     if (/^[-—–_=]+$|^n\/?a$/i.test(part)) continue;
     const partUnit = detectUnitFromText(part) || defaultUnit;
 
+    // Optional trailing/inline RPE tokens: "(RPE 8.5)", "[RPE 8]", "(8 RPE)", "@ RPE 8", "@8.5"
+    let rpeVal: string | undefined;
+    let body = part
+      .replace(/\s*(?:\(|\[)?\s*@?\s*(?:RPE|RIR)\s*[:=]?\s*(\d+(?:[.,]\d+)?(?:\s*[-–]\s*\d+(?:[.,]\d+)?)?)\s*(?:\)|\])?$/i, (_, val) => {
+        rpeVal = String(val).replace(',', '.').trim();
+        return '';
+      })
+      .replace(/\s*\(\s*(\d+(?:[.,]\d+)?)\s*RPE\s*\)$/i, (_, val) => {
+        rpeVal = String(val).replace(',', '.').trim();
+        return '';
+      })
+      .trim();
+
     // Optional leading "S1:" or "Set 1:" label
-    const cleaned = part.replace(/^(?:set|s)\s*#?\s*\d+\s*[:.\-–]?\s*/i, '').trim();
+    const cleaned = body.replace(/^(?:set|s)\s*#?\s*\d+\s*[:.\-–]?\s*/i, '').trim();
 
     // Format: "80kg x 10", "80 x 10", "80 * 10", "80 / 10", "80 @ 10", "80kg × 8-10"
     const wtRepsMatch = cleaned.match(
@@ -448,17 +499,19 @@ function parseLoggedCellEntries(
         weight: wtRepsMatch[1].replace(',', '.').trim(),
         ...(partUnit ? { unit: partUnit } : {}),
         reps: wtRepsMatch[2].trim(),
+        ...(rpeVal ? { rpe: rpeVal } : {}),
       });
       continue;
     }
 
-    // Format: "80kg", "80.5 lbs", "BW", "80"
+    // Format: "80kg", "80.5 lbs", "80"
     const singleWtMatch = cleaned.match(/^(\d+(?:[.,]\d+)?)\s*(?:kgs?|lbs?|pounds?)?$/i);
     if (singleWtMatch) {
       results.push({
         weight: singleWtMatch[1].replace(',', '.').trim(),
         ...(partUnit ? { unit: partUnit } : {}),
         reps: '',
+        ...(rpeVal ? { rpe: rpeVal } : {}),
       });
       continue;
     }
@@ -470,6 +523,7 @@ function parseLoggedCellEntries(
         weight: 'BW',
         ...(partUnit ? { unit: partUnit } : {}),
         reps: (bwMatch[2] || '').trim(),
+        ...(rpeVal ? { rpe: rpeVal } : {}),
       });
     }
   }
@@ -692,6 +746,7 @@ export function rowsToExercisesWithMeta(
         weight: patch.weight !== undefined && patch.weight !== '' ? patch.weight : existing.weight,
         unit: patch.unit || existing.unit || bucket.unit,
         reps: patch.reps !== undefined && patch.reps !== '' ? patch.reps : existing.reps,
+        ...(patch.rpe !== undefined && patch.rpe !== '' ? { rpe: patch.rpe } : existing.rpe ? { rpe: existing.rpe } : {}),
       };
     };
 
@@ -715,6 +770,40 @@ export function rowsToExercisesWithMeta(
         continue;
       }
 
+      if (dc.kind === 'week_notes') {
+        const b = ensureWeek(wkNum, cellUnit);
+        b.weekNote = cellVal;
+        continue;
+      }
+
+      if (dc.kind === 'set_rpe') {
+        const sIdx = Math.max(0, (dc.setNumber || 1) - 1);
+        const rMatch = cellVal.match(/(\d+(?:[.,]\d+)?)/);
+        if (rMatch) setEntrySlot(wkNum, sIdx, { rpe: rMatch[1].replace(',', '.').trim() }, cellUnit);
+        continue;
+      }
+
+      if (dc.kind === 'rpe' || dc.kind === 'week_rpe' || dc.kind === 'prev_rpe') {
+        const cleanRawRpe = cellVal
+          .replace(/^(?:target\s*|goal\s*)?(?:rpe|rir)\s*[:=]?\s*/gi, '')
+          .replace(/\s*\(avg\)\s*/gi, '')
+          .trim();
+        const rpeParts = cleanRawRpe
+          .split(/[\n,;|/]+/)
+          .map(x => x.replace(/rpe\s*[:=]?\s*/gi, '').trim())
+          .filter(x => /\d/.test(x) && !/^[-—_]+$/.test(x));
+        if (rpeParts.length === 1 && targetSetsNum > 1) {
+          for (let s = 0; s < targetSetsNum; s++) {
+            setEntrySlot(wkNum, s, { rpe: rpeParts[0] }, cellUnit);
+          }
+        } else {
+          rpeParts.forEach((rv, idx) => {
+            setEntrySlot(wkNum, idx, { rpe: rv }, cellUnit);
+          });
+        }
+        continue;
+      }
+
       if (dc.kind === 'set_combined' || dc.kind === 'set_weight' || dc.kind === 'set_reps') {
         const sIdx = Math.max(0, (dc.setNumber || 1) - 1);
         if (dc.kind === 'set_reps') {
@@ -730,6 +819,7 @@ export function rowsToExercisesWithMeta(
                 weight: parsed[0].weight,
                 unit: parsed[0].unit || cellUnit,
                 reps: dc.kind === 'set_combined' ? parsed[0].reps : '',
+                ...(parsed[0].rpe ? { rpe: parsed[0].rpe } : {}),
               },
               cellUnit
             );
@@ -786,29 +876,43 @@ export function rowsToExercisesWithMeta(
     const nonEmptyWeeks: Record<number, ParsedWeekData> = {};
     for (const [k, data] of Object.entries(weeklyLogs)) {
       const wk = Number(k);
-      const populatedEntries = data.entries.filter(s => s.weight.trim() !== '' || s.reps.trim() !== '');
-      if (populatedEntries.length > 0 || data.completed) {
+      const populatedEntries = data.entries.filter(
+        s => s.weight.trim() !== '' || s.reps.trim() !== '' || (s.rpe || '').trim() !== ''
+      );
+      if (populatedEntries.length > 0 || data.completed || data.weekNote) {
         nonEmptyWeeks[wk] = {
           weekNumber: wk,
           ...(data.unit ? { unit: data.unit } : {}),
           entries: data.entries,
           ...(data.completed ? { completed: true } : {}),
+          ...(data.weekNote ? { weekNote: data.weekNote } : {}),
         };
         if (wk > maxDataWeek) maxDataWeek = wk;
       }
     }
 
+    const rawTargetRpe = activeMap.targetRpe >= 0 ? at(cells, activeMap.targetRpe) : '';
+    const cleanedTargetRpe = rawTargetRpe
+      .replace(/^(?:target\s*)?(?:rpe|rir)\s*[:=]?\s*/gi, '')
+      .replace(/\s*\(avg\)\s*/gi, '')
+      .trim();
+    const firstWeekRpeEntry = nonEmptyWeeks[1]?.entries.find(e => (e.rpe || '').trim() !== '')?.rpe
+      || Object.values(nonEmptyWeeks)[0]?.entries.find(e => (e.rpe || '').trim() !== '')?.rpe
+      || '';
+    const resolvedRpe = cleanedTargetRpe || firstWeekRpeEntry;
+
     const hasPrefilledData = Object.keys(nonEmptyWeeks).length > 0 || rowCompleted;
     if (hasPrefilledData) prefilledRowCount++;
 
-    const w1Primary = nonEmptyWeeks[1]?.entries.find(e => e.weight || e.reps)
-      || Object.values(nonEmptyWeeks)[0]?.entries.find(e => e.weight || e.reps);
+    const w1Primary = nonEmptyWeeks[1]?.entries.find(e => e.weight || e.reps || e.rpe)
+      || Object.values(nonEmptyWeeks)[0]?.entries.find(e => e.weight || e.reps || e.rpe);
 
     const row: ParsedExerciseRow = {
       ...(currentDay ? { day: currentDay } : {}),
       name: nameVal,
       sets: setsVal,
       reps: repsVal,
+      ...(resolvedRpe ? { rpe: resolvedRpe } : {}),
       notes: notesVal,
       video: resolvedVideo,
       ...(ssInfo.isSuperset ? { isSuperset: true, supersetGroup: ssInfo.supersetGroup } : {}),
@@ -819,7 +923,7 @@ export function rowsToExercisesWithMeta(
       ...(rowCompleted ? { completed: true } : {}),
     };
 
-    if (row.name !== '' || row.sets !== '' || row.reps !== '' || row.notes !== '' || row.video !== '' || hasPrefilledData) {
+    if (row.name !== '' || row.sets !== '' || row.reps !== '' || row.rpe || row.notes !== '' || row.video !== '' || hasPrefilledData) {
       exercises.push(row);
     }
   }

@@ -67,7 +67,7 @@ export const TwoFactorSetupModal: React.FC<TwoFactorSetupModalProps> = ({
     setSecret(newSecret);
     setBackupCodes(newCodes);
 
-    const otpauthUri = generateKeyUri(username || 'User', 'Our Home', newSecret);
+    const otpauthUri = generateKeyUri(username || 'User', 'Gym Workout', newSecret);
     try {
       const qrUrl = await QRCode.toDataURL(otpauthUri, {
         width: 240,
@@ -91,7 +91,7 @@ export const TwoFactorSetupModal: React.FC<TwoFactorSetupModalProps> = ({
   };
 
   const handleCopyCodes = () => {
-    const text = `Our Home — 2FA Emergency Backup Recovery Codes for ${username}:\n\n` +
+    const text = `Gym Workout — 2FA Emergency Backup Recovery Codes for ${username}:\n\n` +
       backupCodes.map((code, idx) => `${idx + 1}. ${code}`).join('\n') +
       `\n\nGenerated on: ${new Date().toISOString()}\nNote: Each code can only be used once.`;
     navigator.clipboard.writeText(text);
@@ -100,7 +100,7 @@ export const TwoFactorSetupModal: React.FC<TwoFactorSetupModalProps> = ({
   };
 
   const handleDownloadCodes = () => {
-    const text = `Our Home — 2FA Emergency Backup Recovery Codes\n` +
+    const text = `Gym Workout — 2FA Emergency Backup Recovery Codes\n` +
       `====================================================\n` +
       `Account: ${username}\n` +
       `Generated: ${new Date().toLocaleString()}\n\n` +
@@ -115,7 +115,7 @@ export const TwoFactorSetupModal: React.FC<TwoFactorSetupModalProps> = ({
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `OurHome_2FA_Backup_Codes_${username.toLowerCase().replace(/\s+/g, '_')}.txt`;
+    a.download = `GymWorkout_2FA_Backup_Codes_${username.toLowerCase().replace(/\s+/g, '_')}.txt`;
     a.click();
     URL.revokeObjectURL(url);
   };

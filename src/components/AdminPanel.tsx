@@ -385,30 +385,72 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   };
 
   const handleQuickLinkSender = async (sender: TelegramCapturedSender) => {
-    const target = selectedLinkTargets[sender.chatId] || sender.username || sender.firstName;
-    if (!target) {
-      setAutoResolveStatus('Please select or specify a target username to link.');
+    const rawTarget = (
+      selectedLinkTargets[sender.chatId] ||
+      sender.username ||
+      activeCombinedWhitelist[0] ||
+      (userAccounts[0] ? `account:${userAccounts[0].username}` : '')
+    ).trim();
+    if (!rawTarget) {
+      setAutoResolveStatus('Please select a whitelisted handle or app user account to link.');
       setTimeout(() => setAutoResolveStatus(null), 3000);
       return;
     }
     setLinkingSenderChatId(sender.chatId);
     try {
-      const cleanUser = target.startsWith('@') ? target.toLowerCase().trim() : `@${target.toLowerCase().trim()}`;
-      
-      const updated = addAuthorizedTelegramUser(telegramConfig, {
+      let matchedAccount = undefined as typeof userAccounts[number] | undefined;
+      let cleanUser = '';
+
+      if (rawTarget.startsWith('account:')) {
+        const targetAccName = rawTarget.slice('account:'.length).trim();
+        matchedAccount = userAccounts.find(
+          acc => acc.username.toLowerCase().trim() === targetAccName.toLowerCase()
+        );
+        const preferredHandle = matchedAccount?.telegramUsername || sender.username || targetAccName;
+        cleanUser = preferredHandle.startsWith('@')
+          ? preferredHandle.toLowerCase().trim()
+          : `@${preferredHandle.toLowerCase().trim()}`;
+      } else {
+        cleanUser = rawTarget.startsWith('@')
+          ? rawTarget.toLowerCase().trim()
+          : `@${rawTarget.toLowerCase().trim()}`;
+        const bareTarget = cleanUser.replace(/^@/, '');
+        matchedAccount = userAccounts.find(
+          acc =>
+            (acc.telegramUsername && acc.telegramUsername.toLowerCase().trim().replace(/^@/, '') === bareTarget) ||
+            acc.username.toLowerCase().trim() === bareTarget
+        );
+      }
+
+      const existingAuth = (telegramConfig.authorizedUsers || []).find(
+        u => u.telegramUsername.toLowerCase().trim() === cleanUser
+      );
+      const boundAppUsername = matchedAccount?.username || existingAuth?.appUsername || cleanUser.replace(/^@/, '');
+
+      const updatedWithUser = addAuthorizedTelegramUser(telegramConfig, {
         telegramUsername: cleanUser,
         chatId: sender.chatId,
-        appUsername: sender.firstName || cleanUser.replace(/^@/, ''),
-        role: 'partner',
+        appUsername: boundAppUsername,
+        role: existingAuth?.role || 'partner',
         confirmed: true
       });
 
+      const currentWhitelist = updatedWithUser.whitelistedUsernames || [];
+      const updated = currentWhitelist.some(w => w.toLowerCase().trim() === cleanUser)
+        ? updatedWithUser
+        : { ...updatedWithUser, whitelistedUsernames: [...currentWhitelist, cleanUser] };
+
       setTelegramConfig(updated);
+      setSelectedLinkTargets(prev => {
+        const next = { ...prev };
+        delete next[sender.chatId];
+        return next;
+      });
       await persistTelegramConfig(updated, async (setting) => {
         await saveAdminSettingDoc(setting);
       });
 
-      setAutoResolveStatus(`🎉 Linked & Verified ${cleanUser} to Chat ID ${sender.chatId} successfully!`);
+      setAutoResolveStatus(`🎉 Linked & Whitelisted ${cleanUser} → "${boundAppUsername}" (Chat ID ${sender.chatId})!`);
     } catch (err: any) {
       setAutoResolveStatus(`Failed to link user: ${err.message || String(err)}`);
     } finally {
@@ -501,10 +543,10 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     return extractTelegramUsernamesFromProfiles(userAccounts);
   }, [userAccounts]);
 
-  // Combined active whitelist: manual usernames + auto-discovered from user profiles
+  // Combined active whitelist: manual whitelist entries; only merges member profile usernames when explicitly opted in
   const activeCombinedWhitelist = useMemo(() => {
     const manual = telegramConfig.whitelistedUsernames || [];
-    if (telegramConfig.autoSyncProfiles !== false) {
+    if (telegramConfig.autoSyncProfiles === true) {
       return mergeProfileUsernamesIntoWhitelist(manual, userAccounts);
     }
     return manual;
@@ -992,10 +1034,10 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
     setTestingUserId(key);
     try {
-      const pingMessage = `✨ <b>Our Home Verification Ping</b> 💕\n\n` +
+      const pingMessage = `🏋️ <b>Gym Workout Verification Ping</b> ✅\n\n` +
         `Hello <b>${user.telegramUsername}</b>!\n` +
-        `Your personal Telegram access is <b>Verified & Active</b> in Our Home.\n` +
-        `You will receive milestone countdowns, date night alerts, and love letters directly in this chat! 💌\n\n` +
+        `Your personal Telegram access is <b>Verified &amp; Active</b> in Gym Workout.\n` +
+        `Use <code>/workouts</code>, <code>/pdf</code>, <code>/excel</code>, <code>/water</code>, <code>/progress</code>, or <code>/status</code> to manage your personal training sheets, hydration reminders &amp; security alerts in this chat.\n\n` +
         `<i>Sent at ${new Date().toLocaleTimeString()}</i>`;
 
       const res = await sendDirectTelegramMessage(telegramConfig.botToken, user.chatId, pingMessage);
@@ -1140,6 +1182,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   // Database Connection Health & Table Diagnostics Hooks
   const { status: dbStatus, isChecking: isCheckingDb, refresh: refreshDbStatus } = useDatabaseStatus(30000);
   const { diagnostics: tableDiagnostics, isChecking: isCheckingTables, runDiagnostics: refreshTableDiagnostics } = useSupabaseTableDiagnostics(true);
+  const canUseSupabase = isSupabaseConfigured || dbStatus.supabase.configured || Boolean(tableDiagnostics?.configured);
   const [showSqlSetupModal, setShowSqlSetupModal] = useState(false);
   const [copiedSql, setCopiedSql] = useState(false);
   const [migrationResult, setMigrationResult] = useState<MigrationResult | null>(null);
@@ -1214,7 +1257,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     if (!testReport) return;
     const lines = [
       `====================================================`,
-      `OUR HOME WEBSITE AUTOMATED TEST REPORT`,
+      `GYM WORKOUT AUTOMATED TEST REPORT`,
       `====================================================`,
       `Generated At   : ${testReport.timestamp}`,
       `Overall Status : ${testReport.overallStatus.toUpperCase()}`,
@@ -1240,7 +1283,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `OurHome_TestReport_${new Date().toISOString().slice(0, 10)}.txt`;
+    link.download = `GymWorkout_TestReport_${new Date().toISOString().slice(0, 10)}.txt`;
     link.click();
     URL.revokeObjectURL(url);
   };
@@ -1670,7 +1713,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setUserErrorMsg(null);
     setSyncingUserId(user.id);
     setIsSyncing(true);
-    const targetDesc = isSupabaseConfigured ? 'Firestore and Supabase' : 'Firestore';
+    const targetDesc = canUseSupabase ? 'Firestore and Supabase' : 'Firestore';
     try {
       await saveUserAccountDoc(user);
       const currentAdmin = localStorage.getItem('love_app_username') || 'Admin';
@@ -1693,7 +1736,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setUserSuccessMsg(null);
     setUserErrorMsg(null);
     setIsSyncing(true);
-    const targetDesc = isSupabaseConfigured ? 'Firestore and Supabase' : 'Firestore';
+    const targetDesc = canUseSupabase ? 'Firestore and Supabase' : 'Firestore';
     try {
       for (const user of userAccounts) {
         await saveUserAccountDoc(user);
@@ -1747,7 +1790,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
       setAdminAccountsList(updatedList);
       const currentAdmin = localStorage.getItem('love_app_username') || 'Admin';
-      await logActivity(currentAdmin, 'admin_credentials_updated', logMsg || `Updated admin credentials in ${isSupabaseConfigured ? 'Firestore & Supabase' : 'Firestore'}.`);
+      await logActivity(currentAdmin, 'admin_credentials_updated', logMsg || `Updated admin credentials in ${canUseSupabase ? 'Firestore & Supabase' : 'Firestore'}.`);
       setAdminSuccessMsg('Admin portal credentials synchronized to database successfully!');
       setTimeout(() => setAdminSuccessMsg(null), 4000);
     } catch (err: any) {
@@ -2003,12 +2046,12 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       <header className="fixed top-0 left-0 right-0 z-50 border-b border-white/10 bg-neutral-950/95 backdrop-blur-2xl px-4 py-3 sm:px-6 shadow-2xl">
         <div className="max-w-[1600px] mx-auto flex flex-wrap justify-between items-center gap-3">
           <div className="flex items-center gap-3">
-            <div className="p-2.5 bg-indigo-500/10 border border-indigo-500/20 rounded-xl text-indigo-400">
-              <Home className="w-5 h-5" />
+            <div className="p-2.5 bg-red-500/10 border border-red-500/20 rounded-xl text-red-400">
+              <Dumbbell className="w-5 h-5" />
             </div>
             <div>
               <h1 className="font-serif text-xl font-bold tracking-tight text-white flex items-center gap-2">
-                Iron House
+                Gym Workout
                 <span className="px-2 py-0.5 rounded-full text-[10px] uppercase font-mono tracking-wider bg-red-500/20 text-red-300 border border-red-500/25">
                   Admin
                 </span>
@@ -2937,9 +2980,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                                 referrerPolicy="no-referrer"
                               />
                             ) : (
-                              <Heart className="w-3.5 h-3.5 text-rose-500 fill-rose-500" />
+                              <Dumbbell className="w-3.5 h-3.5 text-red-500" />
                             )}
-                            <span className="truncate font-sans font-medium">Iron House 🏋️</span>
+                            <span className="truncate font-sans font-medium">Gym Workout 🏋️</span>
                           </div>
                         </div>
                       </div>
@@ -3044,7 +3087,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     </span>
                   </div>
                   <p className="text-[11px] text-neutral-400 font-mono mt-0.5">
-                    Unified access control, whitelist directory, live sender detection & real-time couple event alerts
+                    Strict whitelist access control, 1-to-1 profile isolation, live sender detection &amp; security alerts
                   </p>
                 </div>
               </div>
@@ -3101,19 +3144,19 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 <div className="bg-black/30 p-2.5 rounded-xl border border-white/5 space-y-1">
                   <div className="font-semibold text-white flex items-center gap-1.5">
                     <span className="w-4 h-4 rounded-full bg-sky-500/20 text-sky-300 flex items-center justify-center text-[10px] font-mono font-bold">2</span>
-                    <span>Authorize Users</span>
+                    <span>Strict Whitelist Access</span>
                   </div>
                   <p className="text-neutral-400">
-                    Add Telegram usernames below. Users simply open your bot and send <code className="text-sky-300 font-mono">/start</code> or <code className="text-sky-300 font-mono">/confirm</code> to activate.
+                    Only active users added to the Admin Whitelist below can access the bot. Non-whitelisted senders are blocked on <code className="text-sky-300 font-mono">/start</code>.
                   </p>
                 </div>
                 <div className="bg-black/30 p-2.5 rounded-xl border border-white/5 space-y-1">
                   <div className="font-semibold text-white flex items-center gap-1.5">
                     <span className="w-4 h-4 rounded-full bg-sky-500/20 text-sky-300 flex items-center justify-center text-[10px] font-mono font-bold">3</span>
-                    <span>Couple & Security Alerts</span>
+                    <span>1-to-1 Isolated Data & Alerts</span>
                   </div>
                   <p className="text-neutral-400">
-                    Partners receive instant alerts for milestone countdowns, date nights, sealed love letters, chat messages, and cards!
+                    Each whitelisted Telegram user is strictly bound to their own Linked App Profile and only sees their own workout plans and alerts.
                   </p>
                 </div>
               </div>
@@ -3242,10 +3285,10 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
                     {/* Toolbar Actions */}
                     <div className="flex items-center gap-2 flex-wrap">
-                      <label className="flex items-center gap-2 bg-neutral-900 px-3 py-1.5 rounded-xl border border-white/10 cursor-pointer" title="Automatically imports and links usernames saved in user profiles">
+                      <label className="flex items-center gap-2 bg-neutral-900 px-3 py-1.5 rounded-xl border border-white/10 cursor-pointer" title="Disabled by default for strict security: when enabled, automatically grants bot access to Telegram handles entered in member profiles">
                         <input
                           type="checkbox"
-                          checked={telegramConfig.autoSyncProfiles !== false}
+                          checked={telegramConfig.autoSyncProfiles === true}
                           onChange={(e) => setTelegramConfig(prev => ({ ...prev, autoSyncProfiles: e.target.checked }))}
                           className="rounded border-white/20 text-sky-500 focus:ring-0"
                         />
@@ -3298,7 +3341,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         <span>Authorize & Whitelist New Telegram Account</span>
                       </span>
                       <span className="text-[10px] text-neutral-400 font-mono">
-                        Instant bot access & couple alerts authorization
+                        Strict whitelist: 1-to-1 profile isolation enforced
                       </span>
                     </div>
 
@@ -3366,7 +3409,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                             onChange={(e) => setNewAuthRole(e.target.value as any)}
                             className="w-full bg-neutral-950 border border-white/10 rounded-xl px-2 py-1.5 text-xs text-white focus:outline-none focus:border-sky-500/60 font-mono"
                           >
-                            <option value="partner">Partner 💖</option>
+                            <option value="partner">Member 🏋️</option>
                             <option value="admin">Admin 🛡️</option>
                             <option value="guest">Guest 👤</option>
                           </select>
@@ -3424,7 +3467,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                               </a>
 
                               <span className="text-[9px] font-mono px-2 py-0.5 rounded-md bg-purple-500/15 text-purple-300 border border-purple-500/25 uppercase font-semibold">
-                                {user.role}
+                                {user.role === 'partner' ? 'member' : user.role}
                               </span>
 
                               {user.confirmed ? (
@@ -3546,7 +3589,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         {telegramUserSearch ? 'No matching users found in directory.' : 'No users registered in Telegram & Security Hub yet.'}
                       </p>
                       <p className="text-[11px] text-neutral-400 max-w-md mx-auto">
-                        Add a partner's Telegram username above or have them save their Telegram handle in their User Profile to grant access!
+                        Add a gym member&apos;s Telegram username above (or link a detected sender) to grant them isolated bot access!
                       </p>
                     </div>
                   )}
@@ -3696,7 +3739,14 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         {!isLinked && (
                           <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap shrink-0 self-end md:self-center">
                             <select
-                              value={selectedLinkTargets[sender.chatId] || sender.username || activeCombinedWhitelist[0] || ''}
+                              value={
+                                selectedLinkTargets[sender.chatId] ||
+                                (sender.username && activeCombinedWhitelist.includes(sender.username.toLowerCase()) ? sender.username : '') ||
+                                activeCombinedWhitelist[0] ||
+                                (userAccounts[0] ? `account:${userAccounts[0].username}` : '') ||
+                                sender.username ||
+                                ''
+                              }
                               onChange={(e) => setSelectedLinkTargets(prev => ({ ...prev, [sender.chatId]: e.target.value }))}
                               className="bg-neutral-900 border border-white/10 rounded-xl px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-sky-500/60 font-mono"
                             >
@@ -3707,7 +3757,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                               </optgroup>
                               <optgroup label="App User Accounts">
                                 {userAccounts.map(acc => (
-                                  <option key={`acc-tgt-${acc.id}`} value={acc.telegramUsername ? (acc.telegramUsername.startsWith('@') ? acc.telegramUsername : `@${acc.telegramUsername}`) : `@${acc.username}`}>
+                                  <option key={`acc-tgt-${acc.id}`} value={`account:${acc.username}`}>
                                     {acc.username} {acc.telegramUsername ? `(${acc.telegramUsername})` : ''}
                                   </option>
                                 ))}
@@ -3791,81 +3841,29 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                       type="text"
                       value={telegramConfig.chatId}
                       onChange={(e) => setTelegramConfig(prev => ({ ...prev, chatId: e.target.value }))}
-                      placeholder="-100... (Optional for shared couple group chats)"
+                      placeholder="-100... (Optional — leave blank for private 1-to-1 member chats)"
                       className="w-full bg-neutral-900 border border-white/10 rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-sky-500/60 transition-all font-mono"
                     />
                     <p className="text-[10px] text-neutral-500 font-mono">
-                      Optional. Authorized users receive alerts in their personal chats automatically by their @usernames.
+                      Optional. Whitelisted members receive their own workout bot replies &amp; alerts privately by @username.
                     </p>
                   </div>
                 </div>
 
-                {/* Event Category Notification Toggles */}
+                {/* Security & Water Alert Trigger Toggles */}
                 <div className="bg-neutral-950/70 border border-white/10 rounded-2xl p-4 space-y-3">
                   <div className="flex items-center justify-between">
                     <div>
                       <h4 className="text-xs font-bold text-white uppercase tracking-wider font-mono">
-                        Broadcast Event Triggers & Reminders
+                        Alert Notification Triggers
                       </h4>
                       <p className="text-[11px] text-neutral-400">
-                        Choose which romance, couple celebration, and security events trigger automated Telegram alerts
+                        Control automated Telegram alerts for login security and member water intake reminders
                       </p>
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                    <label className="flex items-center gap-2.5 bg-neutral-900 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
-                      <input
-                        type="checkbox"
-                        checked={telegramConfig.notifyMilestones}
-                        onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifyMilestones: e.target.checked }))}
-                        className="rounded border-white/20 text-sky-500 focus:ring-0"
-                      />
-                      <div>
-                        <span className="text-xs font-semibold text-white block">💍 Milestones & Anniversaries</span>
-                        <span className="text-[10px] text-neutral-400 font-mono">Countdowns & celebration pings</span>
-                      </div>
-                    </label>
-
-                    <label className="flex items-center gap-2.5 bg-neutral-900 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
-                      <input
-                        type="checkbox"
-                        checked={telegramConfig.notifyDates}
-                        onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifyDates: e.target.checked }))}
-                        className="rounded border-white/20 text-sky-500 focus:ring-0"
-                      />
-                      <div>
-                        <span className="text-xs font-semibold text-white block">🗓️ Date Night Reminders</span>
-                        <span className="text-[10px] text-neutral-400 font-mono">Itineraries & checklist alerts</span>
-                      </div>
-                    </label>
-
-                    <label className="flex items-center gap-2.5 bg-neutral-900 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
-                      <input
-                        type="checkbox"
-                        checked={telegramConfig.notifyLetters}
-                        onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifyLetters: e.target.checked }))}
-                        className="rounded border-white/20 text-sky-500 focus:ring-0"
-                      />
-                      <div>
-                        <span className="text-xs font-semibold text-white block">💌 Sealed Love Letters</span>
-                        <span className="text-[10px] text-neutral-400 font-mono">Alert when partner seals a letter</span>
-                      </div>
-                    </label>
-
-                    <label className="flex items-center gap-2.5 bg-neutral-900 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
-                      <input
-                        type="checkbox"
-                        checked={telegramConfig.notifyChat}
-                        onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifyChat: e.target.checked }))}
-                        className="rounded border-white/20 text-sky-500 focus:ring-0"
-                      />
-                      <div>
-                        <span className="text-xs font-semibold text-white block">💬 Sweet Chat Messages</span>
-                        <span className="text-[10px] text-neutral-400 font-mono">Direct message partner notices</span>
-                      </div>
-                    </label>
-
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <label className="flex items-center gap-2.5 bg-neutral-900 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
                       <input
                         type="checkbox"
@@ -3874,21 +3872,21 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         className="rounded border-white/20 text-sky-500 focus:ring-0"
                       />
                       <div>
-                        <span className="text-xs font-semibold text-white block">🛡️ Security & Login Alerts</span>
-                        <span className="text-[10px] text-neutral-400 font-mono">Suspicious login & lockout alerts</span>
+                        <span className="text-xs font-semibold text-white block">🛡️ Security &amp; Login Alerts</span>
+                        <span className="text-[10px] text-neutral-400 font-mono">Logins, password changes, 2FA &amp; lockout alerts</span>
                       </div>
                     </label>
 
                     <label className="flex items-center gap-2.5 bg-neutral-900 border border-white/10 p-3 rounded-xl cursor-pointer hover:border-white/20 transition-all">
                       <input
                         type="checkbox"
-                        checked={telegramConfig.notifyCards !== false}
-                        onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifyCards: e.target.checked }))}
+                        checked={telegramConfig.notifyWater !== false}
+                        onChange={(e) => setTelegramConfig(prev => ({ ...prev, notifyWater: e.target.checked }))}
                         className="rounded border-white/20 text-sky-500 focus:ring-0"
                       />
                       <div>
-                        <span className="text-xs font-semibold text-white block">🎉 Choose Moment & Cards</span>
-                        <span className="text-[10px] text-neutral-400 font-mono">Interactive cards & celebrations</span>
+                        <span className="text-xs font-semibold text-white block">💧 Water Intake Alerts</span>
+                        <span className="text-[10px] text-neutral-400 font-mono">Instant &amp; scheduled hydration reminders via bot</span>
                       </div>
                     </label>
                   </div>
@@ -4561,7 +4559,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
             <div className="mt-6 pt-4 border-t border-white/5 flex items-start gap-2.5 text-[11px] text-neutral-500 leading-relaxed font-mono">
               <ShieldAlert className="w-4 h-4 text-neutral-500 flex-shrink-0 mt-0.5" />
               <span>
-                All admin accounts grant full administrative access to the Iron House gym portal and activity logs.
+                All admin accounts grant full administrative access to the Gym Workout portal and activity logs.
               </span>
             </div>
 
@@ -4796,9 +4794,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
             <div className="grid grid-cols-1 gap-2">
               <button
                 onClick={handleRunMigration}
-                disabled={isMigrating || !isSupabaseConfigured}
+                disabled={isMigrating || !canUseSupabase}
                 className="w-full bg-gradient-to-r from-indigo-600 to-rose-600 hover:from-indigo-500 hover:to-rose-500 text-white font-semibold text-xs py-2.5 px-4 rounded-2xl transition-all cursor-pointer flex items-center justify-center gap-2 shadow-lg disabled:opacity-50"
-                title={!isSupabaseConfigured ? 'Requires Supabase credentials in .env to migrate logs from Firestore' : 'Migrate & deduplicate activity logs to Supabase'}
+                title={!canUseSupabase ? 'Requires private SUPABASE_URL & SUPABASE_ANON_KEY (or SUPABASE_SERVICE_ROLE_KEY) in server environment' : 'Migrate & deduplicate activity logs to Supabase'}
               >
                 <RefreshCw className={`w-4 h-4 ${isMigrating ? 'animate-spin' : ''}`} />
                 {isMigrating ? 'Processing Deduplication & Purge...' : 'Run Migration & Purge Old Firestore Data'}
@@ -4814,9 +4812,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     Bidirectional Data Table Synchronization
                   </h3>
                   <p className="text-[11px] text-neutral-400 mt-0.5">
-                    {isSupabaseConfigured
-                      ? 'Sync specific Firestore & Supabase tables individually in either direction.'
-                      : 'Firestore cloud is active. Add VITE_SUPABASE_URL & VITE_SUPABASE_ANON_KEY to enable Supabase mirroring.'}
+                    {canUseSupabase
+                      ? 'Sync specific Firestore & Supabase tables individually in either direction (via private server proxy).'
+                      : 'Firestore cloud is active. Set SUPABASE_URL & SUPABASE_ANON_KEY (or SUPABASE_SERVICE_ROLE_KEY) in server env and restart to enable Supabase mirroring.'}
                   </p>
                 </div>
 
@@ -4824,7 +4822,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => handleBulkSyncTables('firestore_to_supabase')}
-                    disabled={isSyncingAllData || !isSupabaseConfigured}
+                    disabled={isSyncingAllData || !canUseSupabase}
                     className="px-3 py-1.5 bg-gradient-to-r from-teal-600 to-emerald-600 hover:from-teal-500 hover:to-emerald-500 text-white font-medium text-[11px] rounded-xl transition-all cursor-pointer flex items-center gap-1.5 shadow disabled:opacity-40"
                     title="Sync all Firestore collections to Supabase"
                   >
@@ -4834,7 +4832,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
                   <button
                     onClick={() => handleBulkSyncTables('supabase_to_firestore')}
-                    disabled={isSyncingAllData || !isSupabaseConfigured}
+                    disabled={isSyncingAllData || !canUseSupabase}
                     className="px-3 py-1.5 bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white font-medium text-[11px] rounded-xl transition-all cursor-pointer flex items-center gap-1.5 shadow disabled:opacity-40"
                     title="Sync all Supabase tables to Firestore"
                   >
@@ -4849,7 +4847,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 {SYNC_TABLES_LIST.map((table, idx) => {
                   const isSyncingToSupa = syncingTableState[table.key] === 'to_supabase';
                   const isSyncingToFire = syncingTableState[table.key] === 'to_firestore';
-                  const isBusy = isSyncingToSupa || isSyncingToFire || isSyncingAllData || !isSupabaseConfigured;
+                  const isBusy = isSyncingToSupa || isSyncingToFire || isSyncingAllData || !canUseSupabase;
                   const lastResult = tableSyncResults[table.key];
                   const diagStatus = tableDiagnostics?.tables?.find(t => t.tableName === table.supabaseTable);
 
@@ -5086,13 +5084,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               </div>
               <div>
                 <div className="flex items-center gap-2 flex-wrap">
-                  <h2 className="text-xl font-serif font-bold text-white tracking-wide">Automated Website Test Report</h2>
+                  <h2 className="text-xl font-serif font-bold text-white tracking-wide">Automated Gym Workout Test Report</h2>
                   <span className="px-2.5 py-0.5 rounded-full text-[10px] uppercase font-mono tracking-wider bg-purple-500/20 text-purple-300 border border-purple-500/30">
-                    Auto-Diagnostics Suite
+                    Gym Diagnostics Suite
                   </span>
                 </div>
                 <p className="text-xs text-neutral-400 mt-1 font-mono">
-                  Full-stack diagnostic runner testing storage, database connectivity, data integrity & browser APIs
+                  Diagnostic runner testing Firestore, Supabase, Workout Plans, Telegram whitelist isolation, TOTP 2FA &amp; file/PDF APIs
                 </p>
               </div>
             </div>
@@ -5262,11 +5260,12 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 <span className="text-neutral-500 font-mono uppercase text-[9px] mr-1">Category:</span>
                 {[
                   'all',
-                  'Storage & Local State',
                   'Database & Cloud Services',
                   'Data Schema & Integrity',
+                  'Workout & Telegram Engine',
                   'Browser & Runtime APIs',
-                  'Component & Navigation'
+                  'Component & Navigation',
+                  'Responsiveness & Layout'
                 ].map((cat, idx) => (
                   <button
                     key={`test-cat-${cat}-${idx}`}
@@ -5515,7 +5514,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       {/* FOOTER */}
       <footer className="relative z-10 border-t border-white/5 bg-neutral-950/40 py-4 px-4">
         <p className="text-center text-xs text-neutral-500 font-mono">
-          &copy; {new Date().getFullYear()} Iron House 🏋️. Admin Panel Console.
+          &copy; {new Date().getFullYear()} Gym Workout 🏋️. Admin Panel Console.
         </p>
       </footer>
 
@@ -5544,7 +5543,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               </div>
 
               <p className="text-sm text-neutral-300 leading-relaxed mb-6">
-                Are you absolutely sure you want to delete <span className="text-indigo-300 font-semibold capitalize">"{userToDelete.username}"</span>? This will permanently remove their login access to Iron House.
+                Are you absolutely sure you want to delete <span className="text-indigo-300 font-semibold capitalize">"{userToDelete.username}"</span>? This will permanently remove their login access to Gym Workout.
               </p>
 
               <div className="flex gap-3 justify-end">
@@ -5886,7 +5885,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               </div>
 
               <p className="text-xs text-neutral-300 leading-relaxed">
-                Copy and execute this complete script in your <strong className="text-indigo-300">Supabase Dashboard → SQL Editor</strong> to create all critical tables (including <code className="text-indigo-200 bg-white/5 px-1 py-0.5 rounded font-mono">celebration_cards</code>, <code className="text-indigo-200 bg-white/5 px-1 py-0.5 rounded font-mono">user_accounts</code>, <code className="text-indigo-200 bg-white/5 px-1 py-0.5 rounded font-mono">letters</code>, <code className="text-indigo-200 bg-white/5 px-1 py-0.5 rounded font-mono">memories</code>, <code className="text-indigo-200 bg-white/5 px-1 py-0.5 rounded font-mono">date_plans</code>, etc.) and storage buckets in one click:
+                Copy and execute this complete script in your <strong className="text-indigo-300">Supabase Dashboard → SQL Editor</strong> to create all Gym Workout tables (<code className="text-indigo-200 bg-white/5 px-1 py-0.5 rounded font-mono">user_accounts</code>, <code className="text-indigo-200 bg-white/5 px-1 py-0.5 rounded font-mono">profiles</code>, <code className="text-indigo-200 bg-white/5 px-1 py-0.5 rounded font-mono">activity_logs</code>, <code className="text-indigo-200 bg-white/5 px-1 py-0.5 rounded font-mono">admin_settings</code>, and <code className="text-indigo-200 bg-white/5 px-1 py-0.5 rounded font-mono">workout_plans</code>) in one click:
               </p>
 
               <div className="relative">

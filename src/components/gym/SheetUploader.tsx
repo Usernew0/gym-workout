@@ -21,10 +21,97 @@ interface SheetUploaderProps {
   currentUser: string;
   userAccounts?: UserAccount[];
   existingPlans?: WorkoutPlan[];
+  activePlanId?: string;
   initialAssignTo?: string;
   initialTargetPlanId?: string;
   onSaved?: (ownerUsername: string, firstSavedPlanId?: string) => void;
   onCancel?: () => void;
+}
+
+type UploadTargetMode = 'smart' | 'update_current' | 'create_new';
+
+function normMatchText(s?: string): string {
+  return (s || '')
+    .toLowerCase()
+    .replace(/\.[^.]+$/, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function findAutoMatchedPlan(
+  entries: SheetEntry[],
+  uploadedFileName: string,
+  candidates: WorkoutPlan[],
+  preferredPlanId?: string
+): { plan: WorkoutPlan; reason: string; score: number } | null {
+  if (candidates.length === 0) return null;
+  const workoutEntries = entries.filter(e => e.role === 'workout' && e.exercises.length > 0);
+  const allUploadedNames = new Set(
+    workoutEntries
+      .flatMap(e => e.exercises)
+      .map(ex => normMatchText(ex.name))
+      .filter(Boolean)
+  );
+  const uploadedFileNorm = normMatchText(uploadedFileName);
+  const sheetNamesNorm = workoutEntries.map(e => normMatchText(e.customTitle || e.name)).filter(Boolean);
+
+  let best: { plan: WorkoutPlan; reason: string; score: number } | null = null;
+
+  for (const p of candidates) {
+    let score = 0;
+    const reasons: string[] = [];
+
+    const pTitleNorm = normMatchText(p.title);
+    const pFileNorm = normMatchText(p.sourceFileName);
+    const pSheetNorm = normMatchText(p.sheetName);
+
+    if (uploadedFileNorm && pFileNorm && uploadedFileNorm === pFileNorm) {
+      score += 80;
+      reasons.push('same filename');
+    } else if (uploadedFileNorm && pTitleNorm && (uploadedFileNorm === pTitleNorm || uploadedFileNorm.includes(pTitleNorm) || pTitleNorm.includes(uploadedFileNorm))) {
+      score += 65;
+      reasons.push('matching title');
+    }
+
+    if (
+      sheetNamesNorm.some(
+        sn =>
+          sn &&
+          ((pTitleNorm && (sn === pTitleNorm || sn.includes(pTitleNorm) || pTitleNorm.includes(sn))) ||
+            (pSheetNorm && (sn === pSheetNorm || pSheetNorm.includes(sn))))
+      )
+    ) {
+      score += 55;
+      if (!reasons.includes('matching title')) reasons.push('matching sheet tab');
+    }
+
+    const planExNames = (p.exercises || []).map(ex => normMatchText(ex.name)).filter(Boolean);
+    if (planExNames.length > 0 && allUploadedNames.size > 0) {
+      let overlap = 0;
+      for (const name of planExNames) {
+        if (allUploadedNames.has(name)) overlap++;
+      }
+      const ratio = overlap / Math.max(planExNames.length, allUploadedNames.size);
+      if (overlap > 0) {
+        score += Math.round(ratio * 100);
+        reasons.push(`${overlap}/${planExNames.length} matching exercises`);
+      }
+    }
+
+    if (preferredPlanId && p.id === preferredPlanId && score > 0) {
+      score += 20;
+    }
+
+    if (score >= 30 && (!best || score > best.score)) {
+      best = {
+        plan: p,
+        reason: reasons.join(' · ') || 'active workout match',
+        score,
+      };
+    }
+  }
+
+  return best;
 }
 
 interface SheetEntry {
@@ -50,6 +137,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
   currentUser,
   userAccounts = [],
   existingPlans = [],
+  activePlanId = '',
   initialAssignTo = '',
   initialTargetPlanId = '',
   onSaved,
@@ -76,6 +164,10 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
   const [weightUnit, setWeightUnit] = useState<WeightUnit>('kg');
   const [assignTo, setAssignTo] = useState(initialAssignTo);
   const [targetPlanIdToUpdate, setTargetPlanIdToUpdate] = useState(initialTargetPlanId);
+  const [uploadTargetMode, setUploadTargetMode] = useState<UploadTargetMode>(
+    initialTargetPlanId ? 'update_current' : 'smart'
+  );
+  const [autoMatchReason, setAutoMatchReason] = useState<string | null>(null);
   const [importSheetData, setImportSheetData] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [savedMsg, setSavedMsg] = useState<string | null>(null);
@@ -84,6 +176,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
     if (initialAssignTo) setAssignTo(initialAssignTo);
     if (initialTargetPlanId) {
       setTargetPlanIdToUpdate(initialTargetPlanId);
+      setUploadTargetMode('update_current');
       const found = existingPlans.find(p => p.id === initialTargetPlanId);
       if (found) {
         setWeeks(Math.max(1, found.weeks || 1));
@@ -100,19 +193,60 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
     return existingPlans.filter(p => (p.ownerUsername || '').toLowerCase().trim() === ownerForMatch);
   }, [existingPlans, ownerForMatch]);
 
+  const currentWorkoutPlan = useMemo(
+    () =>
+      (activePlanId ? candidateExistingPlans.find(p => p.id === activePlanId) : null) ||
+      candidateExistingPlans[0] ||
+      null,
+    [candidateExistingPlans, activePlanId]
+  );
+
   const selectedExistingPlan = useMemo(
     () => candidateExistingPlans.find(p => p.id === targetPlanIdToUpdate) || null,
     [candidateExistingPlans, targetPlanIdToUpdate]
   );
 
-  const selectTargetPlanToUpdate = (planId: string) => {
+  const selectTargetPlanToUpdate = (planId: string, manualReason: string | null = null) => {
     setTargetPlanIdToUpdate(planId);
+    setAutoMatchReason(manualReason);
+    if (!planId) {
+      setUploadTargetMode('create_new');
+      return;
+    }
     const found = candidateExistingPlans.find(p => p.id === planId);
     if (found) {
-      setWeeks(Math.max(1, found.weeks || 1));
+      setWeeks(prev => Math.max(prev, found.weeks || 1));
       setWeightUnit(found.defaultWeightUnit || 'kg');
       if (!description.trim() && found.description) setDescription(found.description);
       if (!instructions.trim() && found.instructions) setInstructions(found.instructions);
+    }
+  };
+
+  const applyUploadTargetMode = (nextMode: UploadTargetMode) => {
+    setUploadTargetMode(nextMode);
+    if (nextMode === 'create_new') {
+      selectTargetPlanToUpdate('', null);
+      return;
+    }
+    if (nextMode === 'update_current') {
+      const target = currentWorkoutPlan;
+      if (target) {
+        selectTargetPlanToUpdate(target.id, 'Targeted current active workout');
+      }
+      return;
+    }
+    // 'smart': re-evaluate auto-match if sheets are already loaded, or default to currentWorkoutPlan
+    if (sheets.length > 0) {
+      const matched = findAutoMatchedPlan(sheets, fileName, candidateExistingPlans, currentWorkoutPlan?.id);
+      if (matched) {
+        selectTargetPlanToUpdate(matched.plan.id, `Auto-matched (${matched.reason})`);
+      } else if (currentWorkoutPlan) {
+        selectTargetPlanToUpdate(currentWorkoutPlan.id, 'Defaulted to current active workout');
+      } else {
+        selectTargetPlanToUpdate('', null);
+      }
+    } else if (currentWorkoutPlan) {
+      selectTargetPlanToUpdate(currentWorkoutPlan.id, 'Ready to update current workout');
     }
   };
 
@@ -169,6 +303,41 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
 
       const firstWorkoutIdx = entries.findIndex(s => s.role === 'workout');
       setActiveWorkoutIdx(firstWorkoutIdx >= 0 ? firstWorkoutIdx : 0);
+
+      // Auto-match against user's current workout or closest existing plan
+      if (uploadTargetMode === 'update_current') {
+        const preferred =
+          (targetPlanIdToUpdate ? candidateExistingPlans.find(p => p.id === targetPlanIdToUpdate) : null) ||
+          currentWorkoutPlan;
+        if (preferred) {
+          setTargetPlanIdToUpdate(preferred.id);
+          setAutoMatchReason('Auto-updating current workout plan');
+          setWeeks(prev => Math.max(prev, preferred.weeks || 1));
+        }
+      } else if (uploadTargetMode === 'smart' && candidateExistingPlans.length > 0) {
+        const matched = findAutoMatchedPlan(entries, file.name, candidateExistingPlans, currentWorkoutPlan?.id);
+        if (matched) {
+          setTargetPlanIdToUpdate(matched.plan.id);
+          setAutoMatchReason(`Auto-matched (${matched.reason})`);
+          setWeeks(prev => Math.max(prev, matched.plan.weeks || 1));
+          if (!detectedUnit && matched.plan.defaultWeightUnit) {
+            setWeightUnit(matched.plan.defaultWeightUnit);
+          }
+          if (!description.trim() && matched.plan.description) {
+            setDescription(matched.plan.description);
+          }
+        } else if (currentWorkoutPlan && entries.filter(s => s.role === 'workout' && s.exercises.length > 0).length === 1) {
+          // If the user has an active workout and uploaded a single-plan update sheet, pre-select Create New unless they choose Update Current,
+          // UNLESS initialTargetPlanId was passed
+          if (initialTargetPlanId) {
+            setTargetPlanIdToUpdate(currentWorkoutPlan.id);
+            setAutoMatchReason('Targeted workout plan');
+          } else {
+            setTargetPlanIdToUpdate('');
+            setAutoMatchReason(null);
+          }
+        }
+      }
 
       if (entries.every(s => s.exercises.length === 0)) {
         setError('Sheets were detected, but no structured exercise rows were recognized automatically. Select the Workout sheet tab below or add exercises manually.');
@@ -620,6 +789,49 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
     return count;
   }, [isMultiSheetMode, sheets, manualRows.length]);
 
+  const mergePreviewSummary = useMemo(() => {
+    if (!selectedExistingPlan) return null;
+    const incoming = isMultiSheetMode
+      ? sheets
+          .filter(s => s.role === 'workout' && s.exercises.length > 0)
+          .flatMap(s => getFilteredExercisesForSheet(s))
+      : manualRows;
+    if (incoming.length === 0) return null;
+
+    const existing = selectedExistingPlan.exercises || [];
+    const matchedIds = new Set<string>();
+    let updatedCount = 0;
+    let addedCount = 0;
+
+    for (const row of incoming) {
+      const rName = (row.name || '').trim().toLowerCase();
+      const rDay = (row.day || '').trim().toLowerCase();
+      const match =
+        existing.find(e => !matchedIds.has(e.id) && (e.name || '').trim().toLowerCase() === rName && (e.day || '').trim().toLowerCase() === rDay) ||
+        existing.find(e => !matchedIds.has(e.id) && (e.name || '').trim().toLowerCase() === rName);
+      if (match) {
+        matchedIds.add(match.id);
+        updatedCount++;
+      } else {
+        addedCount++;
+      }
+    }
+
+    const removedCount = existing.filter(e => !matchedIds.has(e.id)).length;
+    const preservedLoggedCount = existing.filter(e => {
+      if (!matchedIds.has(e.id)) return false;
+      return Object.values(selectedExistingPlan.exerciseLogs || {}).some(wkMap => Boolean(wkMap?.[e.id]));
+    }).length;
+
+    return {
+      updatedCount,
+      addedCount,
+      removedCount,
+      preservedLoggedCount,
+      warmupCount: (selectedExistingPlan.warmupExercises || []).length,
+    };
+  }, [selectedExistingPlan, isMultiSheetMode, sheets, manualRows]);
+
   const activeDaySet = new Set(activeSheet?.selectedDays || []);
 
   return (
@@ -1020,31 +1232,97 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
         </label>
       )}
 
-      {/* Save Destination: Create New vs Update Existing Plan (preserving saved logs & history) */}
-      {candidateExistingPlans.length > 0 && (displayedRows.length > 0 || isMultiSheetMode) && (
-        <div className="rounded-2xl border border-emerald-500/25 bg-emerald-950/15 p-3.5 space-y-2">
+      {/* Save Destination: Auto-Match / Update Current Workout / Create New (preserving saved logs & history) */}
+      {candidateExistingPlans.length > 0 && (
+        <div className="rounded-2xl border border-emerald-500/30 bg-emerald-950/15 p-3.5 space-y-2.5">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <span className="text-[11px] uppercase tracking-wider text-emerald-300 font-bold">
-              Save Mode — New Plan or Update Existing (Preserve Saved Logs)
+              Upload Mode — Auto-Update Current Workout or Create New
             </span>
-            {selectedExistingPlan && (
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-200 border border-emerald-400/30">
-                Preserving saved weights, reps &amp; history
+            {autoMatchReason && selectedExistingPlan && (
+              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-200 border border-emerald-400/30">
+                {autoMatchReason}
               </span>
             )}
           </div>
+
+          <div className="flex flex-wrap gap-1.5">
+            <button
+              type="button"
+              onClick={() => applyUploadTargetMode('smart')}
+              className={`px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border cursor-pointer transition-colors ${
+                uploadTargetMode === 'smart'
+                  ? 'bg-emerald-600/85 text-white border-emerald-400'
+                  : 'bg-neutral-950 text-neutral-300 border-white/10 hover:border-emerald-500/40'
+              }`}
+            >
+              Auto-Match Uploaded Sheet
+            </button>
+            {currentWorkoutPlan && (
+              <button
+                type="button"
+                onClick={() => applyUploadTargetMode('update_current')}
+                className={`px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border cursor-pointer transition-colors truncate max-w-full ${
+                  uploadTargetMode === 'update_current' || (selectedExistingPlan?.id === currentWorkoutPlan.id && uploadTargetMode !== 'create_new')
+                    ? 'bg-emerald-600/85 text-white border-emerald-400'
+                    : 'bg-neutral-950 text-neutral-300 border-white/10 hover:border-emerald-500/40'
+                }`}
+              >
+                Update Current: {currentWorkoutPlan.title}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => applyUploadTargetMode('create_new')}
+              className={`px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border cursor-pointer transition-colors ${
+                uploadTargetMode === 'create_new'
+                  ? 'bg-red-600/85 text-white border-red-400'
+                  : 'bg-neutral-950 text-neutral-300 border-white/10 hover:border-red-500/40'
+              }`}
+            >
+              Create as New Plan
+            </button>
+          </div>
+
           <select
             value={targetPlanIdToUpdate}
-            onChange={(e) => selectTargetPlanToUpdate(e.target.value)}
+            onChange={(e) => {
+              const val = e.target.value;
+              if (!val) {
+                applyUploadTargetMode('create_new');
+              } else {
+                setUploadTargetMode('update_current');
+                selectTargetPlanToUpdate(val, 'Selected existing workout plan');
+              }
+            }}
             className="w-full bg-neutral-950 border border-emerald-500/30 focus:border-emerald-400 rounded-xl px-3 py-2 text-xs font-semibold text-white outline-none"
           >
-            <option value="">➕ Create as a New Workout Plan</option>
+            <option value="">Create as a New Workout Plan</option>
             {candidateExistingPlans.map((p) => (
               <option key={p.id} value={p.id}>
-                🔄 Update existing: {p.title} ({p.exercises.length} exercises, {p.weeks}w — keeps saved data)
+                {currentWorkoutPlan?.id === p.id ? '[Current] ' : ''}Update existing: {p.title} ({p.exercises.length} exercises, {p.weeks}w — keeps saved data)
               </option>
             ))}
           </select>
+
+          {selectedExistingPlan && mergePreviewSummary && (
+            <div className="rounded-xl bg-black/40 border border-emerald-500/20 px-3 py-2 text-[11px] text-emerald-100 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono tabular-nums">
+              <span className="font-sans font-semibold text-emerald-300">Merge preview:</span>
+              <span>{mergePreviewSummary.updatedCount} matched</span>
+              {mergePreviewSummary.preservedLoggedCount > 0 && (
+                <span className="text-sky-300">{mergePreviewSummary.preservedLoggedCount} with saved logs preserved</span>
+              )}
+              {mergePreviewSummary.addedCount > 0 && (
+                <span className="text-emerald-300">+{mergePreviewSummary.addedCount} new</span>
+              )}
+              {mergePreviewSummary.removedCount > 0 && (
+                <span className="text-amber-300">-{mergePreviewSummary.removedCount} removed</span>
+              )}
+              {mergePreviewSummary.warmupCount > 0 && (
+                <span className="text-amber-200">{mergePreviewSummary.warmupCount} warm-ups kept</span>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -1125,8 +1403,9 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
                   <th className="px-2 py-2 font-semibold">Exercise</th>
                   <th className="px-2 py-2 font-semibold w-24">Sets (Auto)</th>
                   <th className="px-2 py-2 font-semibold w-24">Reps Range</th>
+                  <th className="px-2 py-2 font-semibold w-20 text-amber-300">RPE</th>
                   {displayedRows.some(r => r.weeklyLogs || r.loggedWeight || r.loggedReps || r.completed) && (
-                    <th className="px-2 py-2 font-semibold w-48 text-indigo-300">Prefilled Sheet Data</th>
+                    <th className="px-2 py-2 font-semibold w-52 text-indigo-300">Prefilled Sheet Data</th>
                   )}
                   <th className="px-2 py-2 font-semibold">Notes</th>
                   <th className="px-2 py-2 font-semibold w-64">Video URL (Auto)</th>
@@ -1229,6 +1508,17 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
                         />
                       </td>
 
+                      {/* Sheet RPE */}
+                      <td className="px-1 py-1">
+                        <input
+                          value={row.rpe || ''}
+                          onChange={(e) => updateRow(idx, 'rpe', e.target.value)}
+                          placeholder="—"
+                          aria-label={`Target RPE for ${row.name || `row ${idx + 1}`}`}
+                          className="w-full bg-transparent focus:bg-neutral-900 border border-transparent focus:border-amber-500/50 rounded-lg px-2 py-1.5 text-[12px] text-amber-200 font-mono outline-none"
+                        />
+                      </td>
+
                       {/* Prefilled Sheet Data Chips */}
                       {displayedRows.some(r => r.weeklyLogs || r.loggedWeight || r.loggedReps || r.completed) && (
                         <td className="px-1.5 py-1">
@@ -1237,21 +1527,30 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
                               Object.entries(row.weeklyLogs)
                                 .sort(([a], [b]) => Number(a) - Number(b))
                                 .map(([wkKey, wData]) => {
-                                  const first = wData.entries.find(e => e.weight || e.reps);
+                                  const first = wData.entries.find(e => e.weight || e.reps || e.rpe);
                                   const wkLabel = Number(wkKey) === 0 ? 'Prev' : `W${wkKey}`;
                                   const unitLbl = first?.unit || wData.unit || weightUnit;
+                                  const rpes = Array.from(
+                                    new Set(wData.entries.map(e => (e.rpe || '').trim()).filter(Boolean))
+                                  );
+                                  const rpePart = rpes.length > 0 ? ` RPE ${rpes.join('/')}` : '';
                                   return (
                                     <span
                                       key={wkKey}
                                       className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-indigo-500/15 border border-indigo-400/30 text-indigo-200 whitespace-nowrap"
                                     >
-                                      {wkLabel}: {first ? `${first.weight || '—'}${first.weight && first.weight !== 'BW' ? unitLbl : ''}×${first.reps || '—'}` : (wData.completed ? 'Done ✓' : 'Logged')}
+                                      {wkLabel}:{' '}
+                                      {first
+                                        ? `${first.weight || '—'}${first.weight && first.weight !== 'BW' ? unitLbl : ''}×${first.reps || '—'}${rpePart}`
+                                        : wData.completed
+                                        ? 'Done ✓'
+                                        : 'Logged'}
                                     </span>
                                   );
                                 })
-                            ) : row.loggedWeight || row.loggedReps ? (
+                            ) : row.loggedWeight || row.loggedReps || row.rpe ? (
                               <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-indigo-500/15 border border-indigo-400/30 text-indigo-200">
-                                {row.loggedWeight || '—'}{row.loggedUnit || weightUnit}×{row.loggedReps || '—'}
+                                {row.loggedWeight || '—'}{row.loggedWeight ? (row.loggedUnit || weightUnit) : ''}×{row.loggedReps || '—'}{row.rpe ? ` RPE ${row.rpe}` : ''}
                               </span>
                             ) : row.completed ? (
                               <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-400/30 text-emerald-200">

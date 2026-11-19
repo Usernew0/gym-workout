@@ -131,8 +131,8 @@ export async function testTelegramConnection(
     return { success: false, error: 'Please enter both the Bot Token and Chat ID.' };
   }
 
-  const testMessage = `🏋️ <b>Iron House Telegram Alert Test</b>\n\n` +
-    `Your Telegram bot is successfully connected to <b>Iron House — Gym Training</b>! 💪\n` +
+  const testMessage = `🏋️ <b>Gym Workout Telegram Alert Test</b>\n\n` +
+    `Your Telegram bot is successfully connected to <b>Gym Workout</b>! 💪\n` +
     `You can receive workout plan alerts, coach updates, security notices, and use interactive bot commands (/workouts, /progress, /status, /id, /help).\n\n` +
     `<i>Time: ${new Date().toLocaleString()}</i>`;
 
@@ -401,34 +401,30 @@ export async function autoResolveTelegramUsers(
   const resolvedUsers: { username: string; chatId: string; displayName?: string }[] = [];
   let newlyResolvedCount = 0;
 
-  // Build combined list of target usernames to resolve
+  // Build combined list of ONLY whitelisted / authorized target usernames
   const targetUsernames = new Set<string>();
   (config.whitelistedUsernames || []).forEach(u => targetUsernames.add(u.toLowerCase().trim()));
   (config.authorizedUsers || []).forEach(u => targetUsernames.add(u.telegramUsername.toLowerCase().trim()));
-  extractTelegramUsernamesFromProfiles(userAccounts).forEach(u => targetUsernames.add(u.username.toLowerCase().trim()));
+  if (config.autoSyncProfiles === true) {
+    extractTelegramUsernamesFromProfiles(userAccounts).forEach(u => targetUsernames.add(u.username.toLowerCase().trim()));
+  }
 
   const currentAuthorizedList = Array.isArray(config.authorizedUsers) ? [...config.authorizedUsers] : [];
 
   for (const rawTg of targetUsernames) {
+    if (!rawTg || rawTg === '@') continue;
     const cleanWithAt = rawTg.startsWith('@') ? rawTg : `@${rawTg}`;
     const cleanBare = rawTg.replace(/^@/, '');
 
-    // 1. Try exact matches from updatesMap
+    // 1. Exact username match from updatesMap (strict — no firstName or substring guessing)
     let detected = updatesMap[cleanWithAt] || updatesMap[cleanBare];
 
-    // 2. If not found in updatesMap, scan allSenders
+    // 2. If not found in updatesMap, scan allSenders for exact @username match only
     if (!detected && allSenders.length > 0) {
       const matchedSender = allSenders.find(s => {
         const sWithAt = (s.username || '').toLowerCase().trim();
         const sBare = sWithAt.replace(/^@/, '');
-        const sFirst = (s.firstName || '').toLowerCase().trim();
-        return (
-          sWithAt === cleanWithAt ||
-          sBare === cleanBare ||
-          (sBare && cleanBare && (sBare.includes(cleanBare) || cleanBare.includes(sBare))) ||
-          (sFirst && (sFirst === cleanBare || sFirst === cleanWithAt)) ||
-          (s.text && (s.text.toLowerCase().includes(cleanBare) || s.text.toLowerCase().includes(cleanWithAt)))
-        );
+        return Boolean(sBare) && (sWithAt === cleanWithAt || sBare === cleanBare);
       });
 
       if (matchedSender) {
@@ -437,19 +433,6 @@ export async function autoResolveTelegramUsers(
           firstName: matchedSender.firstName,
           text: matchedSender.text,
           date: matchedSender.date
-        };
-      }
-    }
-
-    // 3. Fallback heuristic: If user has a single unverified authorized user or whitelist, and only 1 sender sent start/confirm
-    if (!detected && targetUsernames.size <= 2 && allSenders.length >= 1) {
-      const confirmedSender = allSenders.find(s => s.isConfirmedCommand) || allSenders[0];
-      if (confirmedSender) {
-        detected = {
-          chatId: confirmedSender.chatId,
-          firstName: confirmedSender.firstName,
-          text: confirmedSender.text,
-          date: confirmedSender.date
         };
       }
     }
@@ -467,7 +450,8 @@ export async function autoResolveTelegramUsers(
             chatId: detected.chatId,
             confirmed: true,
             confirmedAt: currentAuthorizedList[existingIdx].confirmedAt || new Date().toISOString(),
-            isActive: true
+            // Preserve admin's paused state if explicitly set to false
+            isActive: currentAuthorizedList[existingIdx].isActive !== false
           };
           newlyResolvedCount++;
           resolvedUsers.push({ 
@@ -477,17 +461,18 @@ export async function autoResolveTelegramUsers(
           });
         }
       } else {
-        // Find profile account if any
-        const matchedProfile = userAccounts.find(
+        // Bind ONLY to a uniquely matching member profile if present
+        const matchedProfiles = userAccounts.filter(
           a => (a.telegramUsername || '').toLowerCase().trim() === cleanWithAt.toLowerCase() ||
-               (a.telegramUsername || '').toLowerCase().trim() === cleanBare.toLowerCase()
+               (a.telegramUsername || '').toLowerCase().trim().replace(/^@/, '') === cleanBare
         );
+        const uniqueProfile = matchedProfiles.length === 1 ? matchedProfiles[0] : undefined;
 
         currentAuthorizedList.push({
           id: `tg_usr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
           telegramUsername: cleanWithAt,
           chatId: detected.chatId,
-          appUsername: matchedProfile?.username || detected.firstName || '',
+          appUsername: uniqueProfile?.username || '',
           confirmed: true,
           confirmedAt: new Date().toISOString(),
           isActive: true,
@@ -497,33 +482,7 @@ export async function autoResolveTelegramUsers(
         resolvedUsers.push({ 
           username: cleanWithAt, 
           chatId: detected.chatId, 
-          displayName: detected.firstName || matchedProfile?.username 
-        });
-      }
-    }
-  }
-
-  // Also ensure every confirmed sender with an @username is at least added if they executed confirm/start
-  for (const sender of allSenders) {
-    if (sender.isConfirmedCommand && sender.username && sender.chatId) {
-      const cleanUser = sender.username.startsWith('@') ? sender.username : `@${sender.username}`;
-      const existing = currentAuthorizedList.find(u => u.telegramUsername.toLowerCase() === cleanUser.toLowerCase());
-      if (!existing) {
-        currentAuthorizedList.push({
-          id: `tg_usr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-          telegramUsername: cleanUser,
-          chatId: sender.chatId,
-          appUsername: sender.firstName || '',
-          confirmed: true,
-          confirmedAt: new Date().toISOString(),
-          isActive: true,
-          role: 'partner'
-        });
-        newlyResolvedCount++;
-        resolvedUsers.push({
-          username: cleanUser,
-          chatId: sender.chatId,
-          displayName: sender.firstName
+          displayName: uniqueProfile?.username || detected.firstName 
         });
       }
     }
@@ -588,8 +547,8 @@ export async function testTelegramMultiBroadcast(
   }
 
   const testMessage = customTestMessage || (
-    `🏋️ <b>Iron House Telegram Alert Test</b>\n\n` +
-    `Your Telegram bot is successfully connected to <b>Iron House — Gym Training</b>! 💪\n` +
+    `🏋️ <b>Gym Workout Telegram Alert Test</b>\n\n` +
+    `Your Telegram bot is successfully connected to <b>Gym Workout</b>! 💪\n` +
     `You can receive workout plan alerts, coach updates, security notices, and use interactive bot commands (/workouts, /progress, /status, /id, /help).\n\n` +
     `<i>Time: ${new Date().toLocaleString()}</i>`
   );
@@ -630,7 +589,7 @@ export async function testTelegramMultiBroadcast(
  */
 export async function sendTelegramAlert(
   message: string,
-  type: 'security',
+  type: 'security' | 'water' | 'workout',
   adminSettingsOrOptions?: AdminSetting[] | TelegramAlertOptions,
   customConfig?: TelegramConfig
 ): Promise<{ success: boolean; error?: string; recipientsCount?: number }> {
@@ -652,8 +611,9 @@ export async function sendTelegramAlert(
     return { success: false, error: 'Telegram alerts are disabled or not configured.' };
   }
 
-  // Check security event filter
+  // Check category event filter
   if (type === 'security' && !config.notifySecurity) return { success: false, error: 'Security notifications disabled' };
+  if (type === 'water' && config.notifyWater === false) return { success: false, error: 'Water intake alerts disabled in Admin Panel' };
 
   const cleanToken = config.botToken.trim();
 
@@ -841,6 +801,87 @@ export async function sendDirectTelegramMessage(
   }
 }
 
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+/**
+ * Dispatches a binary file (.pdf or .xlsx) directly to a Telegram chat ID via /api/telegram/send-document
+ * with direct multipart/form-data fallback to the Telegram Bot API.
+ */
+export async function sendTelegramDocumentFile(params: {
+  botToken: string;
+  chatId: string;
+  bytes: Uint8Array;
+  filename: string;
+  mimeType: string;
+  caption?: string;
+}): Promise<{ success: boolean; message?: string; error?: string }> {
+  const cleanToken = (params.botToken || '').trim();
+  const cleanChat = (params.chatId || '').trim();
+
+  if (!cleanToken || !cleanChat) {
+    return { success: false, error: 'Both Bot Token and your personal Telegram Chat ID are required.' };
+  }
+
+  try {
+    const fileBase64 = uint8ArrayToBase64(params.bytes);
+    const res = await fetch('/api/telegram/send-document', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        botToken: cleanToken,
+        chatId: cleanChat,
+        fileBase64,
+        filename: params.filename,
+        mimeType: params.mimeType,
+        caption: params.caption || '',
+      }),
+    });
+    const parsed = await safeParseResponse(res);
+    if (parsed.isJson && res.ok && parsed.data?.success) {
+      return { success: true, message: `Sent ${params.filename} to Telegram!` };
+    }
+  } catch (proxyErr) {
+    console.warn('Proxy send-document failed, trying direct Telegram upload:', proxyErr);
+  }
+
+  try {
+    const form = new FormData();
+    form.append('chat_id', cleanChat);
+    const blob = new Blob([new Uint8Array(params.bytes)], { type: params.mimeType });
+    form.append('document', blob, params.filename);
+    if (params.caption?.trim()) {
+      form.append('caption', params.caption.trim());
+      form.append('parse_mode', 'HTML');
+    }
+
+    const directRes = await fetch(`https://api.telegram.org/bot${cleanToken}/sendDocument`, {
+      method: 'POST',
+      body: form,
+    });
+    const directParsed = await safeParseResponse(directRes);
+    if (directRes.ok && directParsed.isJson && directParsed.data?.ok) {
+      return { success: true, message: `Delivered ${params.filename} to Telegram!` };
+    }
+    return {
+      success: false,
+      error:
+        directParsed.isJson && directParsed.data?.description
+          ? directParsed.data.description
+          : `HTTP ${directRes.status}`,
+    };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Network error uploading document to Telegram' };
+  }
+}
+
 // ==========================================
 // TELEGRAM WEBHOOK MANAGEMENT (SERVER & DIRECT)
 // ==========================================
@@ -966,12 +1007,15 @@ export async function deleteTelegramWebhook(
 }
 
 export const TELEGRAM_COMMAND_DEFINITIONS = [
-  { command: 'start', description: 'Activate bot & link your Iron House account' },
+  { command: 'start', description: 'Activate bot & link your Gym Workout account' },
   { command: 'confirm', description: 'Confirm access & register for gym alerts' },
   { command: 'id', description: 'Get your Telegram Chat ID & username' },
   { command: 'status', description: 'Check bot connection & workout alerts status' },
   { command: 'workouts', description: 'View your assigned workout plans' },
   { command: 'progress', description: 'Check your weekly training completion' },
+  { command: 'pdf', description: 'Send your workout plan as a PDF document' },
+  { command: 'excel', description: 'Send your workout sheet as an Excel (.xlsx) file' },
+  { command: 'water', description: 'Check water intake goal & hydration reminder' },
   { command: 'help', description: 'Show all available bot commands' },
 ];
 
@@ -1227,12 +1271,36 @@ export function formatSecurityAlertTelegramMessage(
   action: string, 
   details: string
 ): string {
-  return `🛡️ <b>Iron House — Security Alert</b> ⚠️\n\n` +
+  return `🛡️ <b>Gym Workout — Security Alert</b> ⚠️\n\n` +
     `User Target: <b>${escapeHtml(username)}</b>\n` +
     `Action: <code>${escapeHtml(action)}</code>\n` +
     `Details: ${escapeHtml(details)}\n` +
     `Time: <i>${new Date().toLocaleString()}</i>\n\n` +
     `If this was not authorized by you, please check Admin Panel security controls immediately.`;
+}
+
+export function formatWaterIntakeTelegramMessage(
+  memberName: string,
+  glassesToday: number,
+  goalGlasses = 8,
+  note?: string
+): string {
+  const remaining = Math.max(0, goalGlasses - glassesToday);
+  const pct = Math.min(100, Math.round((glassesToday / Math.max(1, goalGlasses)) * 100));
+  const filled = Math.round(pct / 10);
+  const bar = `${'█'.repeat(filled)}${'░'.repeat(10 - filled)} ${pct}%`;
+
+  return (
+    `💧 <b>Gym Workout — Water Intake Reminder</b>\n\n` +
+    `Athlete: <b>${escapeHtml(memberName)}</b>\n` +
+    `Today's Intake: <b>${glassesToday} / ${goalGlasses}</b> glasses\n` +
+    `Progress: <code>${bar}</code>\n` +
+    (remaining > 0
+      ? `Remaining: <b>${remaining} glass${remaining === 1 ? '' : 'es'}</b> left for today's hydration target.\n`
+      : `Daily hydration target reached! 🎉\n`) +
+    (note ? `\n<i>${escapeHtml(note)}</i>\n` : '') +
+    `\nTime: <i>${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</i>`
+  );
 }
 
 function escapeHtml(text: string): string {

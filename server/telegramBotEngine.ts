@@ -1,5 +1,8 @@
 import fs from 'fs';
 import path from 'path';
+import type { WorkoutPlan } from '../src/types';
+import { exportWorkoutPlanToPdfBuffer } from '../src/lib/workoutPdfExport';
+import { exportWorkoutPlanToExcelBuffer } from '../src/lib/workoutExcelExport';
 
 export interface BotCommandSpec {
   command: string;
@@ -7,12 +10,15 @@ export interface BotCommandSpec {
 }
 
 export const TELEGRAM_BOT_COMMANDS: BotCommandSpec[] = [
-  { command: 'start', description: 'Activate bot & link your Iron House account' },
+  { command: 'start', description: 'Activate bot & link your Gym Workout account' },
   { command: 'confirm', description: 'Confirm access & register for gym alerts' },
   { command: 'id', description: 'Get your Telegram Chat ID & username' },
   { command: 'status', description: 'Check bot connection & workout alerts status' },
   { command: 'workouts', description: 'View your assigned workout plans' },
   { command: 'progress', description: 'Check your weekly training completion' },
+  { command: 'pdf', description: 'Send your workout plan as a PDF document' },
+  { command: 'excel', description: 'Send your workout sheet as an Excel (.xlsx) file' },
+  { command: 'water', description: 'Check water intake goal & hydration reminder' },
   { command: 'help', description: 'Show all available bot commands' },
 ];
 
@@ -24,20 +30,43 @@ export interface FirestoreUserRecord {
   telegramUsername?: string;
   telegramChatId?: string;
   telegramNotificationsEnabled?: boolean;
+  waterIntake?: {
+    date?: string;
+    glasses?: number;
+    updatedAt?: string;
+    reminderEnabled?: boolean;
+    reminderIntervalMinutes?: number;
+  };
 }
 
 export interface FirestoreWorkoutPlanRecord {
   id: string;
   ownerUsername: string;
   title: string;
+  description?: string;
+  instructions?: string;
+  sheetName?: string;
+  defaultWeightUnit?: 'kg' | 'lbs';
   weeks: number;
+  warmupExercises?: any[];
+  warmupLogs?: Record<string, Record<string, any>>;
   exercises: Array<{
     id?: string;
     day?: string;
     name?: string;
+    sets?: string;
+    reps?: string;
+    notes?: string;
+    videoUrl?: string;
+    isSuperset?: boolean;
+    supersetGroup?: string;
   }>;
+  sourceFileName?: string;
+  createdBy?: string;
+  assignedByAdmin?: boolean;
   progress?: Record<string, string[]>;
   exerciseLogs?: Record<string, Record<string, any>>;
+  previousLogs?: Record<string, any>;
   updatedAt?: string;
   createdAt?: string;
 }
@@ -46,6 +75,7 @@ export interface FirestoreTelegramConfigRecord {
   botToken?: string;
   chatId?: string;
   enabled?: boolean;
+  autoSyncProfiles?: boolean;
   webhookEnabled?: boolean;
   webhookUrl?: string;
   whitelistedUsernames?: string[];
@@ -168,7 +198,7 @@ export function normalizeCommandText(rawText: string): {
   const rawLower = trimmed.toLowerCase();
   const [firstToken, ...restTokens] = trimmed.split(/\s+/);
   const args = restTokens.join(' ').trim();
-  // Strip leading "/" and optional "@BotUsername" suffix (e.g. "/start@IronHouseBot")
+  // Strip leading "/" and optional "@BotUsername" suffix (e.g. "/start@GymWorkoutBot")
   const cleanedCmd = firstToken.replace(/^\/+/, '').split('@')[0].toLowerCase().trim();
   return { command: cleanedCmd, args, rawLower };
 }
@@ -242,6 +272,108 @@ function computePlanStats(plan: FirestoreWorkoutPlanRecord): {
   };
 }
 
+function getTodayDateKey(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function getUserTodayWaterGlasses(user: FirestoreUserRecord | null): number | undefined {
+  if (!user?.waterIntake) return undefined;
+  const dateStr = (user.waterIntake.date || '').trim();
+  if (dateStr && dateStr !== getTodayDateKey()) return 0;
+  const n = Number(user.waterIntake.glasses);
+  return Number.isFinite(n) && n >= 0 ? Math.min(40, Math.floor(n)) : undefined;
+}
+
+function toFullWorkoutPlan(rec: FirestoreWorkoutPlanRecord): WorkoutPlan {
+  return {
+    id: rec.id,
+    ownerUsername: rec.ownerUsername || '',
+    title: rec.title || 'Workout Plan',
+    description: rec.description,
+    instructions: rec.instructions,
+    sheetName: rec.sheetName,
+    defaultWeightUnit: rec.defaultWeightUnit === 'lbs' ? 'lbs' : 'kg',
+    weeks: Math.max(1, Number(rec.weeks) || 1),
+    warmupExercises: Array.isArray(rec.warmupExercises) ? rec.warmupExercises : [],
+    warmupLogs: rec.warmupLogs || {},
+    exercises: (Array.isArray(rec.exercises) ? rec.exercises : []).map((ex, idx) => ({
+      id: ex?.id || `ex_${idx + 1}`,
+      name: ex?.name || `Exercise ${idx + 1}`,
+      ...(ex?.day ? { day: ex.day } : {}),
+      ...(ex?.sets ? { sets: ex.sets } : {}),
+      ...(ex?.reps ? { reps: ex.reps } : {}),
+      ...(ex?.notes ? { notes: ex.notes } : {}),
+      ...(ex?.videoUrl ? { videoUrl: ex.videoUrl } : {}),
+      ...(ex?.isSuperset ? { isSuperset: true } : {}),
+      ...(ex?.supersetGroup ? { supersetGroup: ex.supersetGroup } : {}),
+    })),
+    sourceFileName: rec.sourceFileName,
+    createdBy: rec.createdBy || rec.ownerUsername || 'coach',
+    assignedByAdmin: rec.assignedByAdmin,
+    progress: rec.progress || {},
+    exerciseLogs: rec.exerciseLogs || {},
+    previousLogs: rec.previousLogs || {},
+    createdAt: rec.createdAt || new Date().toISOString(),
+    updatedAt: rec.updatedAt,
+  };
+}
+
+function pickMemberPlan(plans: FirestoreWorkoutPlanRecord[], args: string): FirestoreWorkoutPlanRecord | null {
+  if (plans.length === 0) return null;
+  const sorted = [...plans].sort(
+    (a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+  );
+  const cleanArgs = (args || '').trim();
+  if (!cleanArgs) return sorted[0];
+
+  if (/^\d+$/.test(cleanArgs)) {
+    const idx = parseInt(cleanArgs, 10) - 1;
+    if (idx >= 0 && idx < sorted.length) return sorted[idx];
+  }
+
+  const lower = cleanArgs.toLowerCase();
+  const byTitle = sorted.find(p => (p.title || '').toLowerCase().includes(lower));
+  return byTitle || sorted[0];
+}
+
+export async function sendTelegramDocument(
+  botToken: string,
+  chatId: string,
+  bytes: Uint8Array | Buffer,
+  filename: string,
+  mimeType: string,
+  caption?: string
+): Promise<{ ok: boolean; messageId?: number; error?: string }> {
+  const token = (botToken || '').trim();
+  const cleanChat = (chatId || '').trim();
+  if (!token || !cleanChat) {
+    return { ok: false, error: 'Missing bot token or chat ID' };
+  }
+  try {
+    const form = new FormData();
+    form.append('chat_id', cleanChat);
+    const blob = new Blob([new Uint8Array(bytes)], { type: mimeType });
+    form.append('document', blob, filename);
+    if (caption?.trim()) {
+      form.append('caption', caption.trim());
+      form.append('parse_mode', 'HTML');
+    }
+
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
+      method: 'POST',
+      body: form,
+    });
+    const data: any = await res.json();
+    if (!res.ok || !data?.ok) {
+      return { ok: false, error: data?.description || `HTTP ${res.status}` };
+    }
+    return { ok: true, messageId: data.result?.message_id };
+  } catch (err: any) {
+    return { ok: false, error: err?.message || 'Failed to upload Telegram document' };
+  }
+}
+
 export async function registerTelegramCommandsMenu(botToken: string): Promise<{ ok: boolean; error?: string }> {
   const token = (botToken || '').trim();
   if (!token) return { ok: false, error: 'Missing bot token' };
@@ -263,51 +395,101 @@ export async function registerTelegramCommandsMenu(botToken: string): Promise<{ 
   }
 }
 
-export function findLinkedAccount(
+export interface TelegramAccessResolution {
+  authorized: boolean;
+  denyReason?: 'not_whitelisted' | 'paused' | 'ambiguous_account';
+  linkedAccount: FirestoreUserRecord | null;
+}
+
+/**
+ * Strictly verifies whether the incoming Telegram sender is authorized by the Admin Panel whitelist
+ * and resolves ONLY that single sender's own UserAccount (1-to-1 isolation).
+ * Never accepts unverified `/start <username>` arguments and never exposes other users' data.
+ */
+export function resolveTelegramAccess(
   accounts: FirestoreUserRecord[],
   tgConfig: FirestoreTelegramConfigRecord | null,
   chatId: string,
-  tgUsername: string,
-  startArg?: string
-): FirestoreUserRecord | null {
-  const cleanChat = chatId.trim();
-  const cleanAt = tgUsername ? (tgUsername.startsWith('@') ? tgUsername.toLowerCase() : `@${tgUsername.toLowerCase()}`) : '';
-  const cleanBare = cleanAt.replace(/^@/, '');
+  tgUsername: string
+): TelegramAccessResolution {
+  const cleanChat = (chatId || '').trim();
+  const cleanBare = (tgUsername || '').trim().replace(/^@/, '').toLowerCase();
 
-  // 1. Match directly by telegramChatId on userAccounts
-  const byChat = accounts.find((u) => (u.telegramChatId || '').trim() === cleanChat);
-  if (byChat) return byChat;
-
-  // 2. Match by telegramUsername on userAccounts
-  if (cleanBare) {
-    const byHandle = accounts.find((u) => {
-      const uh = (u.telegramUsername || '').trim().toLowerCase().replace(/^@/, '');
-      return uh && uh === cleanBare;
-    });
-    if (byHandle) return byHandle;
-  }
-
-  // 3. Match via tgConfig.authorizedUsers appUsername mapping
-  const authMatch = (tgConfig?.authorizedUsers || []).find((a) => {
+  // 1. Check Admin's authorizedUsers registry (exact chatId or exact @username)
+  const matchingAuthEntries = (tgConfig?.authorizedUsers || []).filter((a) => {
     const aChat = (a.chatId || '').trim();
-    const aUser = (a.telegramUsername || '').trim().toLowerCase().replace(/^@/, '');
-    return (aChat && aChat === cleanChat) || (cleanBare && aUser === cleanBare);
+    const aBare = (a.telegramUsername || '').trim().replace(/^@/, '').toLowerCase();
+    const chatMatched = Boolean(aChat && cleanChat && aChat === cleanChat);
+    const userMatched = Boolean(aBare && cleanBare && aBare === cleanBare);
+    return chatMatched || userMatched;
   });
-  if (authMatch?.appUsername) {
-    const byAppUser = accounts.find(
-      (u) => u.username.toLowerCase() === authMatch.appUsername!.toLowerCase().trim()
+
+  // If ANY matching entry was explicitly paused/disabled by Admin, deny immediately
+  if (matchingAuthEntries.some((a) => a.isActive === false)) {
+    return { authorized: false, denyReason: 'paused', linkedAccount: null };
+  }
+
+  const activeAuthEntry = matchingAuthEntries.find((a) => a.isActive !== false);
+
+  // 2. Check explicit Admin Whitelist handles
+  const isInExplicitWhitelist =
+    Boolean(cleanBare) &&
+    (tgConfig?.whitelistedUsernames || []).some(
+      (w) => (w || '').trim().replace(/^@/, '').toLowerCase() === cleanBare
     );
-    if (byAppUser) return byAppUser;
+
+  // 3. Check primary Admin Chat ID fallback
+  const isPrimaryAdminChat =
+    Boolean(tgConfig?.chatId?.trim()) && tgConfig!.chatId!.trim() === cleanChat;
+
+  // 4. Optional Auto-Sync Profiles (ONLY when Admin explicitly enabled autoSyncProfiles === true)
+  const matchingProfileByHandle = cleanBare
+    ? accounts.filter(
+        (u) => (u.telegramUsername || '').trim().replace(/^@/, '').toLowerCase() === cleanBare
+      )
+    : [];
+  const isProfileAutoAllowed =
+    tgConfig?.autoSyncProfiles === true && matchingProfileByHandle.length > 0;
+
+  if (!activeAuthEntry && !isInExplicitWhitelist && !isPrimaryAdminChat && !isProfileAutoAllowed) {
+    return { authorized: false, denyReason: 'not_whitelisted', linkedAccount: null };
   }
 
-  // 4. Match optional `/start <username>` deep link arg
-  if (startArg) {
-    const argLower = startArg.toLowerCase().trim();
-    const byArg = accounts.find((u) => u.username.toLowerCase() === argLower);
-    if (byArg) return byArg;
+  // Gate 2: Resolve strictly 1-to-1 to ONLY this sender's own UserAccount
+  // Priority A: Admin explicitly mapped `appUsername` on their authorizedUsers entry
+  if (activeAuthEntry?.appUsername?.trim()) {
+    const boundUsername = activeAuthEntry.appUsername.trim().toLowerCase();
+    const boundAccount =
+      accounts.find((u) => u.username.trim().toLowerCase() === boundUsername) || null;
+    if (boundAccount) {
+      return { authorized: true, linkedAccount: boundAccount };
+    }
   }
 
-  return null;
+  // Priority B: Exact Chat ID match on UserAccount (must be unique to prevent cross-user sharing)
+  const byChatMatches = cleanChat
+    ? accounts.filter((u) => (u.telegramChatId || '').trim() === cleanChat)
+    : [];
+  if (byChatMatches.length > 1) {
+    return { authorized: true, denyReason: 'ambiguous_account', linkedAccount: null };
+  }
+  if (byChatMatches.length === 1) {
+    return { authorized: true, linkedAccount: byChatMatches[0] };
+  }
+
+  // Priority C: Exact @telegramUsername match on UserAccount (provided it isn't bound to a different Chat ID)
+  const byHandleMatches = matchingProfileByHandle.filter((u) => {
+    const boundChat = (u.telegramChatId || '').trim();
+    return !boundChat || boundChat === cleanChat;
+  });
+  if (byHandleMatches.length > 1) {
+    return { authorized: true, denyReason: 'ambiguous_account', linkedAccount: null };
+  }
+  if (byHandleMatches.length === 1) {
+    return { authorized: true, linkedAccount: byHandleMatches[0] };
+  }
+
+  return { authorized: true, linkedAccount: null };
 }
 
 export async function buildTelegramCommandReply(params: {
@@ -317,25 +499,49 @@ export async function buildTelegramCommandReply(params: {
   text: string;
 }): Promise<string> {
   const { chatId, tgUsername, firstName, text } = params;
-  const { command, args, rawLower } = normalizeCommandText(text);
+  const { command, rawLower } = normalizeCommandText(text);
   const safeName = escapeHtml(firstName || 'Athlete');
   const safeHandle = tgUsername ? `<code>${escapeHtml(tgUsername)}</code>` : 'No @username';
 
-  // Fetch member & workout context from Firestore safely (never fails the reply)
+  // Fetch whitelist config, member accounts, and workout plans from Firestore
   const [tgConfig, accounts, allPlans] = await Promise.all([
     fetchFirestoreTelegramConfig().catch(() => null),
     fetchFirestoreUserAccounts().catch(() => []),
     fetchFirestoreWorkoutPlans().catch(() => []),
   ]);
 
-  const linkedAccount = findLinkedAccount(
-    accounts,
-    tgConfig,
-    chatId,
-    tgUsername,
-    command === 'start' ? args : undefined
-  );
+  const access = resolveTelegramAccess(accounts, tgConfig, chatId, tgUsername);
 
+  // STRICT WHITELIST GATE: Unauthorized or paused senders get ZERO user/workout data
+  if (!access.authorized) {
+    if (command === 'id' || command === 'chatid') {
+      return (
+        `🆔 <b>Your Telegram Credentials</b>\n\n` +
+        `• <b>Chat ID:</b> <code>${escapeHtml(chatId)}</code>\n` +
+        `• <b>Username:</b> ${safeHandle}\n` +
+        `• <b>Access Status:</b> ${
+          access.denyReason === 'paused'
+            ? 'Paused by Admin ⏸️'
+            : 'Not on Admin Whitelist 🔒'
+        }\n\n` +
+        `Share your @username or Chat ID above with the Admin to request whitelist access in <b>Admin Panel → Telegram Bot</b>.`
+      );
+    }
+
+    return (
+      `🔒 <b>Access Restricted — Not Whitelisted</b>\n\n` +
+      `Hello <b>${safeName}</b> (${safeHandle}),\n` +
+      `• <b>Chat ID:</b> <code>${escapeHtml(chatId)}</code>\n\n` +
+      (access.denyReason === 'paused'
+        ? `Your Telegram bot access is currently <b>paused by the Admin</b>.\n\n`
+        : `Your Telegram account is <b>not on the Gym Workout Telegram Whitelist</b>.\n\n`) +
+      `For privacy, workout plans and member profiles are only accessible to whitelisted users. ` +
+      `Ask your Coach/Admin to add your @username in <b>Admin Panel → Telegram Bot → Authorized Users &amp; Whitelist</b>.`
+    );
+  }
+
+  // Strictly isolate workout plans to ONLY the verified sender's own UserAccount
+  const linkedAccount = access.linkedAccount;
   const memberPlans = linkedAccount
     ? allPlans.filter(
         (p) => (p.ownerUsername || '').trim().toLowerCase() === linkedAccount.username.trim().toLowerCase()
@@ -346,6 +552,20 @@ export async function buildTelegramCommandReply(params: {
     ? escapeHtml(linkedAccount.displayName?.trim() || linkedAccount.username)
     : '';
 
+  if (
+    access.denyReason === 'ambiguous_account' &&
+    command !== 'id' &&
+    command !== 'chatid' &&
+    command !== 'help' &&
+    command !== 'commands'
+  ) {
+    return (
+      `⚠️ <b>Account Link Ambiguous</b>\n\n` +
+      `Multiple Gym Workout profiles reference the same Telegram @username or Chat ID.\n` +
+      `To protect user privacy, please ask your Admin to explicitly select your <b>Linked App Profile</b> in <b>Admin Panel → Telegram Bot</b>.`
+    );
+  }
+
   // 1. /id or /chatid — ALWAYS checked BEFORE /start & /confirm so it is never shadowed
   if (command === 'id' || command === 'chatid') {
     return (
@@ -353,9 +573,9 @@ export async function buildTelegramCommandReply(params: {
       `• <b>Chat ID:</b> <code>${escapeHtml(chatId)}</code>\n` +
       `• <b>Username:</b> ${safeHandle}\n` +
       (linkedAccount
-        ? `• <b>Linked Iron House Profile:</b> <b>${memberLabel}</b> (<code>${escapeHtml(linkedAccount.username)}</code>) 🟢\n\n`
-        : `• <b>Profile Link:</b> Not linked yet 🟡\n\n` +
-          `Paste this Chat ID into <b>Iron House → Profile → Telegram Bot</b> (or send <code>/confirm</code> after saving your @username).\n\n`) +
+        ? `• <b>Linked Gym Workout Profile:</b> <b>${memberLabel}</b> (<code>${escapeHtml(linkedAccount.username)}</code>) 🟢\n\n`
+        : `• <b>Whitelist Status:</b> Whitelisted 🟢 (Profile not linked yet)\n\n` +
+          `Paste this Chat ID into <b>Gym Workout → Profile → Telegram Bot</b> (or ask your Admin to bind your App Profile).\n\n`) +
       `<i>Tip: Tap the Chat ID above to copy it instantly.</i>`
     );
   }
@@ -363,14 +583,17 @@ export async function buildTelegramCommandReply(params: {
   // 2. /help or /commands
   if (command === 'help' || command === 'commands') {
     return (
-      `🏋️ <b>Iron House Bot — Available Commands</b>\n\n` +
+      `🏋️ <b>Gym Workout Bot — Available Commands</b>\n\n` +
       `• <code>/start</code> or <code>/confirm</code> — Confirm access &amp; link alerts\n` +
       `• <code>/id</code> or <code>/chatid</code> — Show your Telegram Chat ID\n` +
       `• <code>/status</code> — Check bot connection &amp; alert settings\n` +
       `• <code>/workouts</code> — View your assigned workout plans\n` +
       `• <code>/progress</code> — View your weekly training progress\n` +
+      `• <code>/pdf</code> — Download your workout sheet as a PDF file 📄\n` +
+      `• <code>/excel</code> — Download your workout sheet as an Excel (.xlsx) file 📊\n` +
+      `• <code>/water</code> — Check water intake goal &amp; hydration reminder 💧\n` +
       `• <code>/help</code> — Show this command reference\n\n` +
-      `<i>You can type commands with or without the leading slash (e.g. <code>id</code>, <code>workouts</code>).</i>`
+      `<i>Tip: If you have multiple plans, send <code>/pdf 2</code> or <code>/excel 2</code> to pick a plan by number!</i>`
     );
   }
 
@@ -380,29 +603,56 @@ export async function buildTelegramCommandReply(params: {
       ? linkedAccount.telegramNotificationsEnabled !== false
       : true;
     return (
-      `📊 <b>Iron House Bot Status</b>\n\n` +
+      `📊 <b>Gym Workout Bot Status</b>\n\n` +
       `• <b>Telegram User:</b> ${safeName} (${safeHandle})\n` +
       `• <b>Chat ID:</b> <code>${escapeHtml(chatId)}</code>\n` +
+      `• <b>Whitelist Access:</b> Authorized 🟢\n` +
       `• <b>Account Link:</b> ${
         linkedAccount
           ? `Linked to <b>${memberLabel}</b> (<code>${escapeHtml(linkedAccount.username)}</code>) 🟢`
-          : `Not linked yet 🟡`
+          : `Not linked to a member profile yet 🟡`
       }\n` +
       `• <b>Notifications:</b> ${notificationsOn ? 'Enabled 🔔' : 'Paused 🔕'}\n` +
-      `• <b>Assigned Workout Plans:</b> <b>${memberPlans.length}</b>\n` +
+      `• <b>Your Assigned Plans:</b> <b>${memberPlans.length}</b>\n` +
       `• <b>Server Time:</b> <i>${escapeHtml(new Date().toLocaleString())}</i>`
     );
   }
 
-  // 4. /workouts, /plan, /today
+  // 4. /water, /hydration, /drink
+  if (command === 'water' || command === 'hydration' || command === 'drink') {
+    if (!linkedAccount) {
+      return (
+        `💧 <b>Hydration Reminder — Gym Workout</b>\n\n` +
+        `Link your Chat ID (<code>${escapeHtml(chatId)}</code>) in <b>Gym Workout → Profile → Telegram Bot</b> to track your daily glasses right here!\n\n` +
+        `<i>Goal: Drink 8 glasses (~2–2.5L) daily and sip water between sets.</i>`
+      );
+    }
+
+    const todayGlasses = getUserTodayWaterGlasses(linkedAccount) ?? 0;
+    const goal = 8;
+    const pct = Math.min(100, Math.round((todayGlasses / goal) * 100));
+    const remaining = Math.max(0, goal - todayGlasses);
+
+    return (
+      `💧 <b>Water Intake Reminder — ${memberLabel}</b>\n\n` +
+      `• <b>Today's Intake:</b> <b>${todayGlasses} / ${goal}</b> glasses\n` +
+      `• <b>Daily Goal:</b> <code>${buildProgressBar(pct)}</code>\n` +
+      (remaining > 0
+        ? `• <b>Remaining:</b> ${remaining} more glass${remaining === 1 ? '' : 'es'} to hit today's goal! 🥤\n\n` +
+          `<i>Time for a water break — grab a glass now and tap <b>+</b> on your Dashboard!</i>`
+        : `• <b>Status:</b> Daily hydration target reached! 🎉 Great discipline!`)
+    );
+  }
+
+  // 5. /workouts, /plan, /today
   if (command === 'workouts' || command === 'plan' || command === 'today') {
     if (!linkedAccount) {
       return (
         `🏋️ <b>My Workout Plans</b>\n\n` +
-        `Your Telegram chat (<code>${escapeHtml(chatId)}</code>) is not linked to an Iron House account yet.\n\n` +
-        `To link it:\n` +
-        `1. Open <b>Iron House → Profile → Telegram Bot</b>\n` +
-        `2. Enter your Chat ID (<code>${escapeHtml(chatId)}</code>) or @username and save.\n` +
+        `Your Telegram chat (<code>${escapeHtml(chatId)}</code>) is whitelisted 🟢, but not bound to your Gym Workout account yet.\n\n` +
+        `To link your own profile:\n` +
+        `1. Open <b>Gym Workout → Profile → Telegram Bot</b>\n` +
+        `2. Save your Chat ID (<code>${escapeHtml(chatId)}</code>) or ask Admin to map your App Profile.\n` +
         `Then send <code>/workouts</code> again! 💪`
       );
     }
@@ -415,7 +665,11 @@ export async function buildTelegramCommandReply(params: {
       );
     }
 
-    const lines = memberPlans.slice(0, 6).map((plan, idx) => {
+    const sortedPlans = [...memberPlans].sort(
+      (a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+    );
+
+    const lines = sortedPlans.slice(0, 6).map((plan, idx) => {
       const stats = computePlanStats(plan);
       const dayText =
         stats.days.length > 0
@@ -429,19 +683,19 @@ export async function buildTelegramCommandReply(params: {
     });
 
     return (
-      `🏋️ <b>Assigned Workouts — ${memberLabel}</b>\n\n` +
+      `🏋️ <b>Your Workouts — ${memberLabel}</b>\n\n` +
       lines.join('\n\n') +
-      (memberPlans.length > 6 ? `\n\n<i>…and ${memberPlans.length - 6} more plans in the app.</i>` : '') +
-      `\n\n<i>Send /progress for full completion stats.</i>`
+      (sortedPlans.length > 6 ? `\n\n<i>…and ${sortedPlans.length - 6} more plans in the app.</i>` : '') +
+      `\n\n<i>Send /pdf or /excel to download your workout sheet directly here, or /progress for stats.</i>`
     );
   }
 
-  // 5. /progress or /stats
+  // 6. /progress or /stats
   if (command === 'progress' || command === 'stats') {
     if (!linkedAccount) {
       return (
         `📈 <b>Training Progress</b>\n\n` +
-        `Link your Chat ID (<code>${escapeHtml(chatId)}</code>) in <b>Iron House → Profile → Telegram Bot</b> to view your live workout stats!`
+        `Link your Chat ID (<code>${escapeHtml(chatId)}</code>) in <b>Gym Workout → Profile → Telegram Bot</b> to view your personal workout stats!`
       );
     }
 
@@ -463,7 +717,10 @@ export async function buildTelegramCommandReply(params: {
     });
     const overallPct = totalChecks > 0 ? Math.round((totalDone / totalChecks) * 100) : 0;
 
-    const latest = memberPlans[0];
+    const sortedPlans = [...memberPlans].sort(
+      (a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+    );
+    const latest = sortedPlans[0];
     const latestStats = computePlanStats(latest);
 
     return (
@@ -474,11 +731,11 @@ export async function buildTelegramCommandReply(params: {
       `  <code>${buildProgressBar(overallPct)}</code> (${totalDone}/${totalChecks} checks)\n\n` +
       `🔥 <b>Latest Plan: ${escapeHtml(latest.title)}</b>\n` +
       `  <code>${buildProgressBar(latestStats.pct)}</code> (${latestStats.weeks} weeks)\n\n` +
-      `<i>Keep pushing! Open Iron House to log today's weights &amp; reps.</i> 💪`
+      `<i>Send /pdf or /excel to get your latest sheet right here!</i> 💪`
     );
   }
 
-  // 6. /start, /confirm, /verify, /access, ok, yes, hi, hello
+  // 7. /start, /confirm, /verify, /access, ok, yes, hi, hello (ONLY for whitelisted users)
   if (
     command === 'start' ||
     command === 'confirm' ||
@@ -491,17 +748,20 @@ export async function buildTelegramCommandReply(params: {
     rawLower === 'hey'
   ) {
     return (
-      `✅ <b>Iron House Bot Connected!</b> 🏋️\n\n` +
+      `✅ <b>Gym Workout Bot Connected!</b> 🏋️\n\n` +
       `Hello <b>${safeName}</b> (${safeHandle})!\n` +
       `• <b>Chat ID:</b> <code>${escapeHtml(chatId)}</code>\n` +
+      `• <b>Whitelist Status:</b> Authorized 🟢\n` +
       (linkedAccount
         ? `• <b>Member Account:</b> <b>${memberLabel}</b> (<code>${escapeHtml(linkedAccount.username)}</code>) 🟢\n` +
-          `• <b>Workout Plans:</b> ${memberPlans.length} active\n\n` +
-          `You will receive workout reminders, coach updates, and security alerts right here.\n\n`
-        : `• <b>Status:</b> Verified &amp; Captured 🟢\n\n` +
-          `Copy your Chat ID above into <b>Profile → Telegram Bot</b> (or ask your Admin to click <b>Auto-Detect Chat IDs</b>) to finish linking.\n\n`) +
+          `• <b>Your Workout Plans:</b> ${memberPlans.length} active\n\n` +
+          `You will receive your workout reminders, water intake alerts, and security alerts right here.\n\n`
+        : `\nYour Telegram handle is whitelisted! Save your Chat ID above in <b>Profile → Telegram Bot</b> (or ask your Admin to bind your App Profile) to access your workouts.\n\n`) +
       `<b>Quick Commands:</b>\n` +
       `• /workouts — View your workout plans\n` +
+      `• /pdf — Receive your workout sheet as PDF\n` +
+      `• /excel — Receive your workout sheet as Excel (.xlsx)\n` +
+      `• /water — Check water intake &amp; hydration reminder\n` +
       `• /progress — Check weekly completion\n` +
       `• /status — Check alert status\n` +
       `• /id — Get your Chat ID\n` +
@@ -509,14 +769,14 @@ export async function buildTelegramCommandReply(params: {
     );
   }
 
-  // 7. Default fallback for arbitrary text
+  // 8. Default fallback for arbitrary text (whitelisted users only)
   return (
-    `🏋️ <b>Iron House — Gym Training Bot</b>\n\n` +
+    `🏋️ <b>Gym Workout Bot</b>\n\n` +
     `Hello <b>${safeName}</b>! Your Chat ID is <code>${escapeHtml(chatId)}</code>.\n` +
     (linkedAccount
       ? `Linked account: <b>${memberLabel}</b>.\n\n`
-      : `\nSend <code>/confirm</code> to register your chat, or `) +
-    `send <code>/help</code> to see all commands (<code>/workouts</code>, <code>/progress</code>, <code>/status</code>, <code>/id</code>).`
+      : `\nBind your account in <b>Profile → Telegram Bot</b>, or `) +
+    `Send <code>/help</code> to see all commands (<code>/workouts</code>, <code>/pdf</code>, <code>/excel</code>, <code>/water</code>, <code>/progress</code>, <code>/status</code>).`
   );
 }
 
@@ -535,6 +795,118 @@ export async function replyToTelegramMessage(
   const tgUsername = rawUser ? `@${rawUser}` : '';
   const firstName = fromUser.first_name || message.chat.first_name || 'Athlete';
   const text = (message.text || '').trim();
+  const { command, args } = normalizeCommandText(text);
+
+  // Intercept /pdf and /excel (/sheet, /xlsx) document export commands with identical whitelist + 1-to-1 isolation
+  if (command === 'pdf' || command === 'excel' || command === 'xlsx' || command === 'sheet') {
+    const [tgConfig, accounts, allPlans] = await Promise.all([
+      fetchFirestoreTelegramConfig().catch(() => null),
+      fetchFirestoreUserAccounts().catch(() => []),
+      fetchFirestoreWorkoutPlans().catch(() => []),
+    ]);
+
+    const access = resolveTelegramAccess(accounts, tgConfig, chatId, tgUsername);
+
+    const sendTextFallback = async (msgHtml: string) => {
+      try {
+        const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: msgHtml,
+            parse_mode: 'HTML',
+            disable_web_page_preview: true,
+          }),
+        });
+        const data: any = await res.json();
+        return { replied: Boolean(res.ok && data?.ok), replyText: msgHtml };
+      } catch (err: any) {
+        return { replied: false, replyText: msgHtml, error: err?.message };
+      }
+    };
+
+    if (!access.authorized) {
+      const deniedMsg = await buildTelegramCommandReply({ chatId, tgUsername, firstName, text });
+      return sendTextFallback(deniedMsg);
+    }
+
+    if (access.denyReason === 'ambiguous_account') {
+      return sendTextFallback(
+        `⚠️ <b>Account Link Ambiguous</b>\n\n` +
+        `Multiple Gym Workout profiles reference the same Telegram @username or Chat ID.\n` +
+        `To protect user privacy, please ask your Admin to explicitly bind your <b>Linked App Profile</b>.`
+      );
+    }
+
+    const linkedAccount = access.linkedAccount;
+    if (!linkedAccount) {
+      return sendTextFallback(
+        `📄 <b>Workout Sheet Export</b>\n\n` +
+        `Your Telegram chat (<code>${escapeHtml(chatId)}</code>) is whitelisted 🟢, but not bound to a Gym Workout profile yet.\n\n` +
+        `Save your Chat ID in <b>Gym Workout → Profile → Telegram Bot</b>, then send <code>/${command === 'pdf' ? 'pdf' : 'excel'}</code> again!`
+      );
+    }
+
+    const memberPlans = allPlans.filter(
+      (p) => (p.ownerUsername || '').trim().toLowerCase() === linkedAccount.username.trim().toLowerCase()
+    );
+
+    if (memberPlans.length === 0) {
+      return sendTextFallback(
+        `📄 <b>Workout Sheet Export</b>\n\n` +
+        `No workout plans are assigned to <b>${escapeHtml(linkedAccount.displayName?.trim() || linkedAccount.username)}</b> yet.`
+      );
+    }
+
+    const targetRec = pickMemberPlan(memberPlans, args);
+    if (!targetRec) {
+      return sendTextFallback('No matching workout plan found.');
+    }
+
+    const fullPlan = toFullWorkoutPlan(targetRec);
+    const ownerName = linkedAccount.displayName?.trim() || linkedAccount.username;
+    const waterGlasses = getUserTodayWaterGlasses(linkedAccount);
+    const planHint =
+      memberPlans.length > 1
+        ? `\n<i>You have ${memberPlans.length} plans — send /${command === 'pdf' ? 'pdf' : 'excel'} 2 for the next plan.</i>`
+        : '';
+
+    try {
+      if (command === 'pdf') {
+        const { filename, buffer } = exportWorkoutPlanToPdfBuffer(fullPlan, { ownerName, waterGlasses });
+        const caption =
+          `📄 <b>${escapeHtml(fullPlan.title)}</b> (PDF)\n` +
+          `Member: <b>${escapeHtml(ownerName)}</b> • ${fullPlan.exercises.length} exercises • ${fullPlan.weeks}w` +
+          planHint;
+        const sent = await sendTelegramDocument(token, chatId, buffer, filename, 'application/pdf', caption);
+        if (!sent.ok) {
+          return sendTextFallback(`⚠️ Failed to generate/send PDF: ${escapeHtml(sent.error || 'Unknown error')}`);
+        }
+        return { replied: true, replyText: `[PDF Sent: ${filename}]` };
+      } else {
+        const { filename, buffer } = await exportWorkoutPlanToExcelBuffer(fullPlan, { ownerName, waterGlasses });
+        const caption =
+          `📊 <b>${escapeHtml(fullPlan.title)}</b> (Excel .xlsx)\n` +
+          `Includes Workout Plan, Set-by-Set History (RPE & Volume), Warm-up Tracker, Notes & Summary.` +
+          planHint;
+        const sent = await sendTelegramDocument(
+          token,
+          chatId,
+          buffer,
+          filename,
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          caption
+        );
+        if (!sent.ok) {
+          return sendTextFallback(`⚠️ Failed to generate/send Excel sheet: ${escapeHtml(sent.error || 'Unknown error')}`);
+        }
+        return { replied: true, replyText: `[Excel Sent: ${filename}]` };
+      }
+    } catch (exportErr: any) {
+      return sendTextFallback(`⚠️ Could not export workout sheet: ${escapeHtml(exportErr?.message || 'Unknown error')}`);
+    }
+  }
 
   const replyText = await buildTelegramCommandReply({
     chatId,

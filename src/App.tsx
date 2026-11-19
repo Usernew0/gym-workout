@@ -113,7 +113,7 @@ export default function App() {
   }, [adminSettings]);
 
   useEffect(() => {
-    document.title = 'Iron House — Gym Training';
+    document.title = 'Gym Workout';
   }, []);
 
   // First-run bootstrap: seed a default admin account only when the database has

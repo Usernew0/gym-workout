@@ -493,7 +493,7 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess, userAccounts, admi
             transition={{ delay: 0.1, duration: 0.5 }}
             className="font-serif text-3xl font-extrabold tracking-tight text-white mb-2 bg-gradient-to-r from-white via-red-100 to-red-400 bg-clip-text text-transparent uppercase"
           >
-            Iron House
+            Gym Workout
           </motion.h1>
           <motion.p
             initial={{ y: 20, opacity: 0 }}

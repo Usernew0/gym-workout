@@ -1,15 +1,18 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import confetti from 'canvas-confetti';
 import {
   Dumbbell, LayoutDashboard, ListChecks, Upload, TrendingUp, LogOut,
-  Play, CheckCircle2, Circle, Video, Flame, CalendarDays,
+  Play, Pause, CheckCircle2, Circle, Video, Flame, CalendarDays,
   Trash2, Trophy, FileText, History, Check, X, ExternalLink,
   ChevronDown, ChevronUp, Plus, Minus, Zap, Pencil,
   FileSpreadsheet, Maximize2, ShieldCheck, Loader2, Download,
-  User, KeyRound, Eye, EyeOff, Send, ShieldAlert, AlertCircle, Bell
+  User, KeyRound, Eye, EyeOff, Send, ShieldAlert, AlertCircle, Bell,
+  Droplets, RotateCcw, Clock, Timer, Volume2
 } from 'lucide-react';
 import {
   WorkoutPlan, WorkoutExercise, ExerciseLogEntry, SetLogEntry, WeightUnit,
-  UserAccount, AdminSetting
+  UserAccount, AdminSetting, WarmupExercise, WarmupLogEntry
 } from '../../types';
 import {
   subscribeToWorkoutPlans,
@@ -23,10 +26,11 @@ import {
   getTelegramConfig,
   saveTelegramConfig as persistTelegramConfig,
   fetchTelegramChatIdsDetailed,
-  addAuthorizedTelegramUser,
   sendDirectTelegramMessage,
   sendTelegramAlert,
+  sendTelegramDocumentFile,
   formatSecurityAlertTelegramMessage,
+  formatWaterIntakeTelegramMessage,
 } from '../../lib/telegramService';
 import {
   getVideoThumbnailInfo,
@@ -35,7 +39,8 @@ import {
   parseSheetFileAllSheets,
   ParsedWeekData,
 } from '../../lib/sheetParser';
-import { exportWorkoutPlanToPdf } from '../../lib/workoutPdfExport';
+import { exportWorkoutPlanToPdf, exportWorkoutPlanToPdfBuffer } from '../../lib/workoutPdfExport';
+import { exportWorkoutPlanToExcel, exportWorkoutPlanToExcelBuffer } from '../../lib/workoutExcelExport';
 import { TwoFactorSetupModal } from '../TwoFactorSetupModal';
 import { SheetUploader } from './SheetUploader';
 
@@ -57,6 +62,138 @@ const GYM_TABS: { id: GymTab; label: string;  short: string; icon: React.Compone
 ];
 
 const weekKey = (weekIdx: number) => `w${weekIdx + 1}`;
+const SESSION_NOTE_KEY_PREFIX = '__session_note__';
+const WATER_DAILY_GOAL = 8;
+const EXERCISE_MOTIVATIONS = [
+  'All sets crushed — great discipline!',
+  'Target locked in — strong finish!',
+  'Full set volume logged — keep pushing!',
+  'Exercise complete — unstoppable momentum!',
+];
+
+function getSessionNoteKey(dayFilter: string): string {
+  if (!dayFilter || dayFilter === 'ALL') return `${SESSION_NOTE_KEY_PREFIX}ALL`;
+  return `${SESSION_NOTE_KEY_PREFIX}${dayFilter.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_')}`;
+}
+
+function getTodayDateKey(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function getWaterStorageKey(username: string): string {
+  return `gymworkout_water_${(username || 'member').toLowerCase().trim()}_${getTodayDateKey()}`;
+}
+
+function getWaterReminderStorageKey(username: string): string {
+  return `gymworkout_water_reminder_${(username || 'member').toLowerCase().trim()}`;
+}
+
+function readStoredWaterReminder(username: string): { enabled: boolean; intervalMinutes: number } {
+  try {
+    const raw = localStorage.getItem(getWaterReminderStorageKey(username));
+    if (!raw) return { enabled: false, intervalMinutes: 60 };
+    const parsed = JSON.parse(raw);
+    const interval = Number(parsed?.intervalMinutes);
+    return {
+      enabled: Boolean(parsed?.enabled),
+      intervalMinutes: [30, 45, 60, 90].includes(interval) ? interval : 60,
+    };
+  } catch {
+    return { enabled: false, intervalMinutes: 60 };
+  }
+}
+
+function formatTimerClock(totalSeconds: number): string {
+  const clamped = Math.max(0, Math.floor(totalSeconds));
+  const mins = Math.floor(clamped / 60);
+  const secs = clamped % 60;
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+const REST_TIMER_PRESETS = [45, 60, 90, 120, 180] as const;
+
+function getRestTimerStorageKey(username: string): string {
+  return `gymworkout_rest_sec_${(username || 'member').toLowerCase().trim()}`;
+}
+
+function readStoredRestSeconds(username: string): number {
+  try {
+    const raw = localStorage.getItem(getRestTimerStorageKey(username));
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed >= 10 && parsed <= 600) {
+      return Math.round(parsed);
+    }
+    return 90;
+  } catch {
+    return 90;
+  }
+}
+
+function saveStoredRestSeconds(username: string, seconds: number) {
+  try {
+    const clamped = Math.min(600, Math.max(10, Math.round(seconds)));
+    localStorage.setItem(getRestTimerStorageKey(username), String(clamped));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function playRestFinishedChime() {
+  try {
+    const win = window as unknown as {
+      AudioContext?: typeof AudioContext;
+      webkitAudioContext?: typeof AudioContext;
+    };
+    const AudioCtx = win.AudioContext || win.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    if (ctx.state === 'suspended') {
+      ctx.resume().catch(() => {});
+    }
+    const now = ctx.currentTime;
+    const notes = [523.25, 659.25, 783.99];
+    notes.forEach((freq, idx) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      const startAt = now + idx * 0.11;
+      const endAt = startAt + 0.34;
+      osc.frequency.setValueAtTime(freq, startAt);
+      gain.gain.setValueAtTime(0.0001, startAt);
+      gain.gain.exponentialRampToValueAtTime(0.075, startAt + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, endAt);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(startAt);
+      osc.stop(endAt + 0.02);
+    });
+    setTimeout(() => {
+      ctx.close().catch(() => {});
+    }, 1000);
+  } catch {
+    // ignore Web Audio restriction errors
+  }
+  try {
+    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+      navigator.vibrate([120, 60, 120]);
+    }
+  } catch {
+    // ignore vibration unsupported
+  }
+}
+
+function readStoredWaterCount(username: string): number {
+  try {
+    const raw = localStorage.getItem(getWaterStorageKey(username));
+    if (!raw) return 0;
+    const parsed = JSON.parse(raw);
+    const val = typeof parsed === 'number' ? parsed : Number(parsed?.count ?? 0);
+    return Number.isFinite(val) && val >= 0 ? Math.min(40, Math.floor(val)) : 0;
+  } catch {
+    return 0;
+  }
+}
 
 function planCompletion(plan: WorkoutPlan): { done: number; total: number; pct: number } {
   const total = (plan.exercises?.length || 0) * Math.max(1, plan.weeks || 1);
@@ -97,6 +234,7 @@ function normalizeSetEntries(
       weight: existing?.weight ?? '',
       unit: existing?.unit || logged.unit || defaultUnit,
       reps: existing?.reps ?? '',
+      rpe: existing?.rpe ?? '',
     }));
   }
 
@@ -108,6 +246,7 @@ function normalizeSetEntries(
       weight: logged.weight ?? '',
       unit: logged.unit || defaultUnit,
       reps: logged.reps ?? '',
+      rpe: '',
     }));
   }
 
@@ -116,12 +255,18 @@ function normalizeSetEntries(
     weight: '',
     unit: defaultUnit,
     reps: '',
+    rpe: '',
   }));
 }
 
 function entryHasLoggedData(entry?: ExerciseLogEntry): boolean {
   if (!entry) return false;
-  if (entry.setEntries && entry.setEntries.some(s => s.weight.trim() !== '' || s.reps.trim() !== '')) {
+  if (
+    entry.setEntries &&
+    entry.setEntries.some(
+      s => s.weight.trim() !== '' || s.reps.trim() !== '' || (s.rpe || '').trim() !== ''
+    )
+  ) {
     return true;
   }
   return Boolean(entry.weight?.trim() || entry.reps?.trim() || entry.sets?.trim());
@@ -132,6 +277,7 @@ interface WeekHistoryRecord {
   weekNum: number;
   planTitle?: string;
   updatedAt?: string;
+  note?: string;
   setEntries: SetLogEntry[];
 }
 
@@ -155,18 +301,22 @@ function buildWeeklyHistory(
     .sort((a, b) => a - b)
     .forEach((w) => {
       const entry = weekLogs[weekKey(w - 1)]?.[ex.id];
-      if (!entryHasLoggedData(entry)) return;
-      const setsList =
-        entry?.setEntries && entry.setEntries.length > 0
+      const weekNote = entry?.notes?.trim() || '';
+      const hasSets = entryHasLoggedData(entry);
+      if (!hasSets && !weekNote) return;
+      const setsList = hasSets
+        ? entry?.setEntries && entry.setEntries.length > 0
           ? entry.setEntries
-              .filter(s => s.weight.trim() !== '' || s.reps.trim() !== '')
+              .filter(s => s.weight.trim() !== '' || s.reps.trim() !== '' || (s.rpe || '').trim() !== '')
               .map(s => ({ ...s, unit: s.unit || entry.unit || planUnit }))
-          : [{ setNumber: 1, weight: entry?.weight || '', unit: entry?.unit || planUnit, reps: entry?.reps || '' }];
-      if (setsList.length === 0) return;
+          : [{ setNumber: 1, weight: entry?.weight || '', unit: entry?.unit || planUnit, reps: entry?.reps || '', rpe: '' }]
+        : [];
+      if (setsList.length === 0 && !weekNote) return;
       records.push({
         weekLabel: `Week ${w}`,
         weekNum: w,
         updatedAt: entry?.updatedAt,
+        note: weekNote || undefined,
         setEntries: setsList,
       });
     });
@@ -189,19 +339,23 @@ function buildWeeklyHistory(
 
       for (const wk of otherWeeks) {
         const entry = otherLogs[wk.key]?.[matchingEx.id];
-        if (!entryHasLoggedData(entry)) continue;
-        const setsList =
-          entry?.setEntries && entry.setEntries.length > 0
+        const weekNote = entry?.notes?.trim() || '';
+        const hasSets = entryHasLoggedData(entry);
+        if (!hasSets && !weekNote) continue;
+        const setsList = hasSets
+          ? entry?.setEntries && entry.setEntries.length > 0
             ? entry.setEntries
-                .filter(s => s.weight.trim() !== '' || s.reps.trim() !== '')
+                .filter(s => s.weight.trim() !== '' || s.reps.trim() !== '' || (s.rpe || '').trim() !== '')
                 .map(s => ({ ...s, unit: s.unit || entry.unit || otherUnit }))
-            : [{ setNumber: 1, weight: entry?.weight || '', unit: entry?.unit || otherUnit, reps: entry?.reps || '' }];
-        if (setsList.length === 0) continue;
+            : [{ setNumber: 1, weight: entry?.weight || '', unit: entry?.unit || otherUnit, reps: entry?.reps || '', rpe: '' }]
+          : [];
+        if (setsList.length === 0 && !weekNote) continue;
         records.push({
           weekLabel: `${other.title} · W${wk.num}`,
           weekNum: wk.num,
           planTitle: other.title,
           updatedAt: entry?.updatedAt,
+          note: weekNote || undefined,
           setEntries: setsList,
         });
       }
@@ -330,15 +484,99 @@ export const GymApp: React.FC<GymAppProps> = ({
 
   // Per-set draft inputs keyed by `${planId}__w${wk}__${exId}`
   const [draftSets, setDraftSets] = useState<Record<string, SetLogEntry[]>>({});
+  // Per-exercise week note checkbox + drafts keyed by `${planId}__w${wk}__${exId}`
+  const [exerciseNoteEnabledOverrides, setExerciseNoteEnabledOverrides] = useState<Record<string, boolean>>({});
+  const [exerciseNoteDrafts, setExerciseNoteDrafts] = useState<Record<string, string>>({});
+  // Warm-up UI, drafts, editing, countdown timer & set entries keyed by `${planId}__wu_w${wk}__${wuId}`
+  const [showWarmupSection, setShowWarmupSection] = useState(true);
+  const [showAddWarmupForm, setShowAddWarmupForm] = useState(false);
+  const [newWarmupDraft, setNewWarmupDraft] = useState({
+    name: '',
+    minutes: '5',
+    targetSets: '2',
+    target: '',
+    notes: '',
+  });
+  const [editingWarmupId, setEditingWarmupId] = useState<string | null>(null);
+  const [editWarmupDraft, setEditWarmupDraft] = useState<{
+    name: string;
+    minutes: string;
+    targetSets: string;
+    target: string;
+    notes: string;
+  } | null>(null);
+  const [warmupDraftSets, setWarmupDraftSets] = useState<Record<string, SetLogEntry[]>>({});
+  const [warmupTimer, setWarmupTimer] = useState<{
+    wuId: string;
+    remainingSec: number;
+    totalSec: number;
+    running: boolean;
+    finished?: boolean;
+  } | null>(null);
+
+  // Weekly & daily session notes toggle + drafts keyed by `${planId}__w${wk}__${noteKey}`
+  const [sessionNoteEnabledOverrides, setSessionNoteEnabledOverrides] = useState<Record<string, boolean>>({});
+  const [sessionNoteDrafts, setSessionNoteDrafts] = useState<Record<string, string>>({});
   const [savedNoticeId, setSavedNoticeId] = useState<string | null>(null);
 
-  // Inline exercise metadata editor (to freely modify sets/reps/superset/notes/video later)
+  // Auto-complete exercise celebration animation state & manual uncheck override tracking
+  const manuallyUncheckedRef = useRef<Set<string>>(new Set());
+  const autoSaveTimerRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const celebrationClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [justCompletedExKey, setJustCompletedExKey] = useState<string | null>(null);
+  const [justCompletedMotivation, setJustCompletedMotivation] = useState<string | null>(null);
+
+  // Water intake counter + Telegram hydration reminder state
+  const [waterGlasses, setWaterGlasses] = useState<number>(() => readStoredWaterCount(currentUser));
+  const [waterReminderEnabled, setWaterReminderEnabled] = useState<boolean>(
+    () => readStoredWaterReminder(currentUser).enabled
+  );
+  const [waterReminderIntervalMinutes, setWaterReminderIntervalMinutes] = useState<number>(
+    () => readStoredWaterReminder(currentUser).intervalMinutes
+  );
+  const [isSendingWaterAlert, setIsSendingWaterAlert] = useState(false);
+  const [waterAlertNotice, setWaterAlertNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  useEffect(() => {
+    setWaterGlasses(readStoredWaterCount(currentUser));
+    const rem = readStoredWaterReminder(currentUser);
+    setWaterReminderEnabled(rem.enabled);
+    setWaterReminderIntervalMinutes(rem.intervalMinutes);
+    const storedRest = readStoredRestSeconds(currentUser);
+    setDefaultRestSeconds(storedRest);
+    setCustomRestInput(String(storedRest));
+  }, [currentUser]);
+
+  // Per-set Rest Timer state (user-controlled countdown + configurable duration)
+  const [defaultRestSeconds, setDefaultRestSeconds] = useState<number>(() => readStoredRestSeconds(currentUser));
+  const [customRestInput, setCustomRestInput] = useState<string>(() => String(readStoredRestSeconds(currentUser)));
+  const [setRestTimer, setSetRestTimer] = useState<{
+    timerKey: string;
+    exerciseId: string;
+    exerciseName: string;
+    setNumber: number;
+    remainingSec: number;
+    totalSec: number;
+    running: boolean;
+    finished?: boolean;
+  } | null>(null);
+  const [restAlertBanner, setRestAlertBanner] = useState<{
+    id: string;
+    timerKey: string;
+    exerciseId: string;
+    exerciseName: string;
+    setNumber: number;
+    totalSec: number;
+  } | null>(null);
+
+  // Inline exercise metadata editor (to freely modify sets/reps/targetRpe/superset/notes/video later)
   const [editingExerciseId, setEditingExerciseId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<{
     name: string;
     day: string;
     sets: string;
     reps: string;
+    targetRpe: string;
     notes: string;
     videoUrl: string;
     isSuperset: boolean;
@@ -364,6 +602,7 @@ export const GymApp: React.FC<GymAppProps> = ({
       name: string;
       sets: string;
       reps: string;
+      targetRpe?: string;
       notes: string;
       videoUrl: string;
       isSuperset: boolean;
@@ -378,6 +617,19 @@ export const GymApp: React.FC<GymAppProps> = ({
   const [worksheetImportNotice, setWorksheetImportNotice] = useState<string | null>(null);
   const [isSavingWorksheet, setIsSavingWorksheet] = useState(false);
   const [exportNotice, setExportNotice] = useState<string | null>(null);
+  const [openExportMenu, setOpenExportMenu] = useState<'toolbar' | 'dashboard' | 'profile' | null>(null);
+  const exportButtonRefs = useRef<Record<'toolbar' | 'dashboard' | 'profile', HTMLButtonElement | null>>({
+    toolbar: null,
+    dashboard: null,
+    profile: null,
+  });
+  const [exportMenuCoords, setExportMenuCoords] = useState<{
+    top?: number;
+    bottom?: number;
+    left: number;
+  } | null>(null);
+  const [isExportingExcel, setIsExportingExcel] = useState(false);
+  const [isSendingSheetToBot, setIsSendingSheetToBot] = useState<'pdf' | 'excel' | null>(null);
 
   // Active video preview modal state (expanded WebView)
   const [activeVideoModal, setActiveVideoModal] = useState<{
@@ -391,6 +643,53 @@ export const GymApp: React.FC<GymAppProps> = ({
     const unsub = subscribeToWorkoutPlans(setPlans);
     return () => unsub();
   }, []);
+
+  useEffect(() => {
+    if (!openExportMenu) {
+      setExportMenuCoords(null);
+      return;
+    }
+
+    const updateMenuPosition = () => {
+      const btn = exportButtonRefs.current[openExportMenu];
+      if (!btn || typeof window === 'undefined') return;
+      const rect = btn.getBoundingClientRect();
+      const menuWidth = 264;
+      const estMenuHeight = 236;
+      const left = Math.max(12, Math.min(rect.right - menuWidth, window.innerWidth - menuWidth - 12));
+      const spaceBelow = window.innerHeight - rect.bottom;
+      const placeAbove = spaceBelow < estMenuHeight && rect.top > estMenuHeight;
+      if (placeAbove) {
+        setExportMenuCoords({ bottom: Math.max(12, window.innerHeight - rect.top + 8), left });
+      } else {
+        setExportMenuCoords({ top: Math.min(rect.bottom + 8, Math.max(12, window.innerHeight - estMenuHeight - 12)), left });
+      }
+    };
+
+    updateMenuPosition();
+
+    const handleOutside = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('[data-export-menu-root="true"]') || target?.closest('[data-export-menu-portal="true"]')) return;
+      setOpenExportMenu(null);
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpenExportMenu(null);
+    };
+    window.addEventListener('resize', updateMenuPosition);
+    window.addEventListener('scroll', updateMenuPosition, true);
+    document.addEventListener('mousedown', handleOutside);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('resize', updateMenuPosition);
+      window.removeEventListener('scroll', updateMenuPosition, true);
+      document.removeEventListener('mousedown', handleOutside);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [openExportMenu]);
+
+  const isOwnPlan = (plan: WorkoutPlan | null | undefined) =>
+    Boolean(plan && (plan.ownerUsername || '').toLowerCase().trim() === currentUser.toLowerCase().trim());
 
   const myPlans = useMemo(() => {
     const clean = currentUser.toLowerCase().trim();
@@ -443,33 +742,81 @@ export const GymApp: React.FC<GymAppProps> = ({
     return normalizeSetEntries(ex, logged, plan.defaultWeightUnit || 'kg');
   };
 
+  const triggerExerciseCompleteCelebration = (dKey: string) => {
+    if (celebrationClearTimerRef.current) {
+      clearTimeout(celebrationClearTimerRef.current);
+    }
+    const phrase = EXERCISE_MOTIVATIONS[Math.floor(Math.random() * EXERCISE_MOTIVATIONS.length)];
+    setJustCompletedExKey(dKey);
+    setJustCompletedMotivation(phrase);
+    try {
+      confetti({
+        particleCount: 28,
+        spread: 54,
+        origin: { y: 0.72 },
+        disableForReducedMotion: true,
+      });
+    } catch {
+      // ignore if canvas/confetti is unavailable
+    }
+    celebrationClearTimerRef.current = setTimeout(() => {
+      setJustCompletedExKey(prev => (prev === dKey ? null : prev));
+      setJustCompletedMotivation(null);
+    }, 3400);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (celebrationClearTimerRef.current) clearTimeout(celebrationClearTimerRef.current);
+      Object.values(autoSaveTimerRef.current).forEach(clearTimeout);
+    };
+  }, []);
+
   const updateSetField = (
     plan: WorkoutPlan,
     wk: number,
     ex: WorkoutExercise,
     setIdx: number,
-    field: 'weight' | 'reps' | 'unit',
+    field: 'weight' | 'reps' | 'rpe' | 'unit',
     value: string
   ) => {
     const dKey = draftKey(plan.id, wk, ex.id);
+    if (field === 'weight' || field === 'reps') {
+      manuallyUncheckedRef.current.delete(dKey);
+    }
     const current = getCurrentSetEntries(plan, wk, ex);
     const updated = current.map((s, idx) =>
       idx === setIdx ? { ...s, setNumber: idx + 1, [field]: value } : s
     );
     setDraftSets(prev => ({ ...prev, [dKey]: updated }));
+    if (autoSaveTimerRef.current[dKey]) {
+      clearTimeout(autoSaveTimerRef.current[dKey]);
+      delete autoSaveTimerRef.current[dKey];
+    }
     if (field === 'unit') {
       saveExerciseSets(plan, wk, ex, updated);
+      return;
+    }
+    // Once all set rows have non-empty reps, auto-commit after a short pause (still instant on blur/Enter)
+    const allRepsEntered = updated.length > 0 && updated.every(s => (s.reps || '').trim() !== '');
+    if (allRepsEntered) {
+      autoSaveTimerRef.current[dKey] = setTimeout(() => {
+        delete autoSaveTimerRef.current[dKey];
+        saveExerciseSets(plan, wk, ex, updated);
+      }, 800);
     }
   };
 
   const adjustSetCount = (plan: WorkoutPlan, wk: number, ex: WorkoutExercise, delta: 1 | -1) => {
+    if (!isOwnPlan(plan)) return;
     const dKey = draftKey(plan.id, wk, ex.id);
+    manuallyUncheckedRef.current.delete(dKey);
     const current = getCurrentSetEntries(plan, wk, ex);
     const planUnit: WeightUnit = plan.defaultWeightUnit || 'kg';
     let next = current;
     if (delta === 1 && current.length < 20) {
       const lastUnit = current[current.length - 1]?.unit || planUnit;
-      next = [...current, { setNumber: current.length + 1, weight: '', unit: lastUnit, reps: '' }];
+      next = [...current, { setNumber: current.length + 1, weight: '', unit: lastUnit, reps: '', rpe: '' }];
     } else if (delta === -1 && current.length > 1) {
       next = current.slice(0, current.length - 1);
     } else {
@@ -480,6 +827,7 @@ export const GymApp: React.FC<GymAppProps> = ({
   };
 
   const changePlanWeightUnit = async (plan: WorkoutPlan, unit: WeightUnit) => {
+    if (!isOwnPlan(plan)) return;
     if ((plan.defaultWeightUnit || 'kg') === unit) return;
     const nextPlan: WorkoutPlan = {
       ...plan,
@@ -508,6 +856,13 @@ export const GymApp: React.FC<GymAppProps> = ({
     ex: WorkoutExercise,
     overrideEntries?: SetLogEntry[]
   ) => {
+    if (!isOwnPlan(plan)) return;
+    const dKey = draftKey(plan.id, wk, ex.id);
+    if (autoSaveTimerRef.current[dKey]) {
+      clearTimeout(autoSaveTimerRef.current[dKey]);
+      delete autoSaveTimerRef.current[dKey];
+    }
+
     const wKey = weekKey(wk - 1);
     const planUnit: WeightUnit = plan.defaultWeightUnit || 'kg';
     const rawEntries = overrideEntries || getCurrentSetEntries(plan, wk, ex);
@@ -516,6 +871,7 @@ export const GymApp: React.FC<GymAppProps> = ({
       weight: (s.weight || '').trim(),
       unit: s.unit || planUnit,
       reps: (s.reps || '').trim(),
+      rpe: (s.rpe || '').trim(),
     }));
 
     const prevLogged = plan.exerciseLogs?.[wKey]?.[ex.id];
@@ -524,20 +880,27 @@ export const GymApp: React.FC<GymAppProps> = ({
         w: (s.weight || '').trim(),
         u: s.unit || prevLogged?.unit || planUnit,
         r: (s.reps || '').trim(),
+        e: (s.rpe || '').trim(),
       }))
     );
     const nextNormalized = JSON.stringify(
-      cleanedEntries.map(s => ({ w: s.weight, u: s.unit || planUnit, r: s.reps }))
+      cleanedEntries.map(s => ({ w: s.weight, u: s.unit || planUnit, r: s.reps, e: s.rpe }))
     );
 
-    if (prevNormalized === nextNormalized && prevLogged?.setEntries) {
+    const existingDoneList = plan.progress?.[wKey] || [];
+    const wasCompleted = existingDoneList.includes(ex.id);
+    const allSetsAndRepsDone = cleanedEntries.length > 0 && cleanedEntries.every(s => s.reps.trim() !== '');
+    const shouldAutoCheck = allSetsAndRepsDone && !wasCompleted && !manuallyUncheckedRef.current.has(dKey);
+
+    if (prevNormalized === nextNormalized && prevLogged?.setEntries && !shouldAutoCheck) {
       return;
     }
 
-    const firstPopulated = cleanedEntries.find(s => s.weight || s.reps);
+    const firstPopulated = cleanedEntries.find(s => s.weight || s.reps || s.rpe);
     const updatedWeekLogs: Record<string, ExerciseLogEntry> = {
       ...(plan.exerciseLogs?.[wKey] || {}),
       [ex.id]: {
+        ...(prevLogged || {}),
         sets: String(cleanedEntries.length),
         weight: firstPopulated?.weight || '',
         unit: firstPopulated?.unit || planUnit,
@@ -552,8 +915,16 @@ export const GymApp: React.FC<GymAppProps> = ({
       updatedPreviousLogs[ex.id] = { ...prevLogged };
     }
 
+    const updatedProgress = shouldAutoCheck
+      ? {
+          ...(plan.progress || {}),
+          [wKey]: [...existingDoneList, ex.id],
+        }
+      : plan.progress;
+
     const nextPlan: WorkoutPlan = {
       ...plan,
+      ...(updatedProgress ? { progress: updatedProgress } : {}),
       exerciseLogs: {
         ...(plan.exerciseLogs || {}),
         [wKey]: updatedWeekLogs,
@@ -565,8 +936,753 @@ export const GymApp: React.FC<GymAppProps> = ({
       await saveWorkoutPlanDoc(nextPlan);
       setSavedNoticeId(ex.id);
       setTimeout(() => setSavedNoticeId(prev => (prev === ex.id ? null : prev)), 2000);
+      if (shouldAutoCheck) {
+        triggerExerciseCompleteCelebration(dKey);
+      }
     } catch (err) {
       console.warn('Failed to save exercise sets:', err);
+    }
+  };
+
+  // --- PER-EXERCISE WEEKLY NOTE CHECKITEM & PERSISTENCE ---
+  const isExerciseNoteEnabled = (plan: WorkoutPlan, wk: number, exId: string): boolean => {
+    const key = draftKey(plan.id, wk, exId);
+    if (key in exerciseNoteEnabledOverrides) return exerciseNoteEnabledOverrides[key];
+    const entry = plan.exerciseLogs?.[weekKey(wk - 1)]?.[exId];
+    if (typeof entry?.noteEnabled === 'boolean') return entry.noteEnabled;
+    return Boolean(entry?.notes?.trim());
+  };
+
+  const getCurrentExerciseWeekNote = (plan: WorkoutPlan, wk: number, exId: string): string => {
+    const key = draftKey(plan.id, wk, exId);
+    if (key in exerciseNoteDrafts) return exerciseNoteDrafts[key];
+    return plan.exerciseLogs?.[weekKey(wk - 1)]?.[exId]?.notes || '';
+  };
+
+  const updateExerciseWeekNoteDraft = (plan: WorkoutPlan, wk: number, exId: string, value: string) => {
+    const key = draftKey(plan.id, wk, exId);
+    setExerciseNoteDrafts(prev => ({ ...prev, [key]: value }));
+  };
+
+  const toggleExerciseWeekNote = async (plan: WorkoutPlan, wk: number, ex: WorkoutExercise, enabled: boolean) => {
+    if (!isOwnPlan(plan)) return;
+    const key = draftKey(plan.id, wk, ex.id);
+    setExerciseNoteEnabledOverrides(prev => ({ ...prev, [key]: enabled }));
+    const wKey = weekKey(wk - 1);
+    const prevLogged = plan.exerciseLogs?.[wKey]?.[ex.id] || {};
+    const nextPlan: WorkoutPlan = {
+      ...plan,
+      exerciseLogs: {
+        ...(plan.exerciseLogs || {}),
+        [wKey]: {
+          ...(plan.exerciseLogs?.[wKey] || {}),
+          [ex.id]: {
+            ...prevLogged,
+            noteEnabled: enabled,
+            updatedAt: new Date().toISOString(),
+          },
+        },
+      },
+    };
+    try {
+      await saveWorkoutPlanDoc(nextPlan);
+    } catch (err) {
+      console.warn('Failed to toggle exercise week note:', err);
+    }
+  };
+
+  const saveExerciseWeekNote = async (plan: WorkoutPlan, wk: number, ex: WorkoutExercise) => {
+    if (!isOwnPlan(plan)) return;
+    const key = draftKey(plan.id, wk, ex.id);
+    const wKey = weekKey(wk - 1);
+    const raw = key in exerciseNoteDrafts ? exerciseNoteDrafts[key] : getCurrentExerciseWeekNote(plan, wk, ex.id);
+    const cleaned = raw.trim();
+    const prevLogged = plan.exerciseLogs?.[wKey]?.[ex.id] || {};
+    const prevNotes = (prevLogged.notes || '').trim();
+    const isEnabled = isExerciseNoteEnabled(plan, wk, ex.id);
+    if (cleaned === prevNotes && prevLogged.noteEnabled === isEnabled) return;
+
+    const nextPlan: WorkoutPlan = {
+      ...plan,
+      exerciseLogs: {
+        ...(plan.exerciseLogs || {}),
+        [wKey]: {
+          ...(plan.exerciseLogs?.[wKey] || {}),
+          [ex.id]: {
+            ...prevLogged,
+            notes: cleaned,
+            noteEnabled: isEnabled,
+            updatedAt: new Date().toISOString(),
+          },
+        },
+      },
+    };
+
+    try {
+      await saveWorkoutPlanDoc(nextPlan);
+      setExerciseNoteDrafts(prev => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+      setSavedNoticeId(`exnote_${ex.id}`);
+      setTimeout(() => setSavedNoticeId(prev => (prev === `exnote_${ex.id}` ? null : prev)), 2000);
+    } catch (err) {
+      console.warn('Failed to save exercise week note:', err);
+    }
+  };
+
+  // Warm-up Countdown Timer Effect
+  useEffect(() => {
+    if (!warmupTimer || !warmupTimer.running) return;
+    const id = setInterval(() => {
+      setWarmupTimer(prev => {
+        if (!prev || !prev.running) return prev;
+        if (prev.remainingSec <= 1) {
+          return { ...prev, remainingSec: 0, running: false, finished: true };
+        }
+        return { ...prev, remainingSec: prev.remainingSec - 1 };
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, [warmupTimer?.running]);
+
+  // Per-Set Rest Timer Countdown Effect
+  useEffect(() => {
+    if (!setRestTimer || !setRestTimer.running) return;
+    const id = setInterval(() => {
+      setSetRestTimer(prev => {
+        if (!prev || !prev.running) return prev;
+        if (prev.remainingSec <= 1) {
+          return { ...prev, remainingSec: 0, running: false, finished: true };
+        }
+        return { ...prev, remainingSec: prev.remainingSec - 1 };
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, [setRestTimer?.running]);
+
+  // Play subtle chime & show dismissible alert when set rest timer completes
+  useEffect(() => {
+    if (!setRestTimer?.finished) return;
+    playRestFinishedChime();
+    const bannerId = `${setRestTimer.timerKey}_${Date.now()}`;
+    setRestAlertBanner({
+      id: bannerId,
+      timerKey: setRestTimer.timerKey,
+      exerciseId: setRestTimer.exerciseId,
+      exerciseName: setRestTimer.exerciseName,
+      setNumber: setRestTimer.setNumber,
+      totalSec: setRestTimer.totalSec,
+    });
+    const autoClear = setTimeout(() => {
+      setRestAlertBanner(prev => (prev?.id === bannerId ? null : prev));
+    }, 9000);
+    return () => clearTimeout(autoClear);
+  }, [setRestTimer?.finished, setRestTimer?.timerKey]);
+
+  const updateDefaultRestSeconds = (seconds: number) => {
+    const clamped = Math.min(600, Math.max(10, Math.round(seconds)));
+    setDefaultRestSeconds(clamped);
+    setCustomRestInput(String(clamped));
+    saveStoredRestSeconds(currentUser, clamped);
+  };
+
+  const startOrToggleSetRestTimer = (
+    timerKey: string,
+    ex: WorkoutExercise,
+    setNumber: number,
+    overrideSec?: number
+  ) => {
+    const totalSec = Math.min(600, Math.max(10, Math.round(overrideSec ?? defaultRestSeconds)));
+    setRestAlertBanner(null);
+    setSetRestTimer(prev => {
+      if (prev && prev.timerKey === timerKey && overrideSec === undefined) {
+        if (prev.remainingSec <= 0 || prev.finished) {
+          return {
+            timerKey,
+            exerciseId: ex.id,
+            exerciseName: ex.name,
+            setNumber,
+            remainingSec: totalSec,
+            totalSec,
+            running: true,
+            finished: false,
+          };
+        }
+        return { ...prev, running: !prev.running, finished: false };
+      }
+      return {
+        timerKey,
+        exerciseId: ex.id,
+        exerciseName: ex.name,
+        setNumber,
+        remainingSec: totalSec,
+        totalSec,
+        running: true,
+        finished: false,
+      };
+    });
+  };
+
+  const stopSetRestTimer = () => {
+    setSetRestTimer(null);
+  };
+
+  const addSecondsToActiveRestTimer = (extraSeconds: number) => {
+    setRestAlertBanner(null);
+    setSetRestTimer(prev => {
+      if (!prev) return prev;
+      const nextRemaining = Math.min(600, Math.max(1, prev.remainingSec + extraSeconds));
+      return {
+        ...prev,
+        remainingSec: nextRemaining,
+        totalSec: Math.max(prev.totalSec, nextRemaining),
+        running: true,
+        finished: false,
+      };
+    });
+  };
+
+  const startOrToggleWarmupTimer = (wu: WarmupExercise) => {
+    const mins = parseFloat((wu.minutes || '').trim());
+    const totalSec = Number.isFinite(mins) && mins > 0 ? Math.round(mins * 60) : 300;
+    setWarmupTimer(prev => {
+      if (prev && prev.wuId === wu.id) {
+        if (prev.remainingSec <= 0) {
+          return { wuId: wu.id, remainingSec: totalSec, totalSec, running: true, finished: false };
+        }
+        return { ...prev, running: !prev.running, finished: false };
+      }
+      return { wuId: wu.id, remainingSec: totalSec, totalSec, running: true, finished: false };
+    });
+  };
+
+  const resetWarmupTimer = (wu: WarmupExercise) => {
+    const mins = parseFloat((wu.minutes || '').trim());
+    const totalSec = Number.isFinite(mins) && mins > 0 ? Math.round(mins * 60) : 300;
+    setWarmupTimer({ wuId: wu.id, remainingSec: totalSec, totalSec, running: false, finished: false });
+  };
+
+  // --- WARM-UP EXERCISES & SEPARATE WEEKLY WARM-UP SETS ---
+  const warmupDraftKey = (planId: string, wk: number, wuId: string) => `${planId}__wu_w${wk}__${wuId}`;
+
+  const getWarmupSetEntries = (plan: WorkoutPlan, wk: number, wu: WarmupExercise): SetLogEntry[] => {
+    const key = warmupDraftKey(plan.id, wk, wu.id);
+    if (warmupDraftSets[key]) return warmupDraftSets[key];
+    const logged = plan.warmupLogs?.[weekKey(wk - 1)]?.[wu.id];
+    const planUnit: WeightUnit = plan.defaultWeightUnit || 'kg';
+    if (logged?.setEntries && logged.setEntries.length > 0) {
+      return logged.setEntries.map((s, idx) => ({
+        setNumber: idx + 1,
+        weight: s.weight ?? '',
+        unit: s.unit || planUnit,
+        reps: s.reps ?? '',
+        rpe: s.rpe ?? '',
+      }));
+    }
+    const parsedCount = wu.targetSets?.trim()
+      ? parseSetsCount(wu.targetSets.trim())
+      : parseSetsCount(wu.target || '2');
+    const initialCount = Math.min(10, Math.max(1, parsedCount || 2));
+    return Array.from({ length: initialCount }, (_, idx) => ({
+      setNumber: idx + 1,
+      weight: '',
+      unit: planUnit,
+      reps: '',
+      rpe: '',
+    }));
+  };
+
+  const handleAddWarmupExercise = async (plan: WorkoutPlan) => {
+    if (!isOwnPlan(plan)) return;
+    const cleanName = newWarmupDraft.name.trim();
+    if (!cleanName) return;
+    const cleanMinutes = newWarmupDraft.minutes.trim();
+    const cleanSets = newWarmupDraft.targetSets.trim();
+    const cleanTarget = newWarmupDraft.target.trim();
+    const newItem: WarmupExercise = {
+      id: `wu_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      name: cleanName,
+      ...(cleanMinutes ? { minutes: cleanMinutes } : {}),
+      ...(cleanSets ? { targetSets: cleanSets } : {}),
+      ...(cleanTarget ? { target: cleanTarget } : {}),
+      ...(newWarmupDraft.notes.trim() ? { notes: newWarmupDraft.notes.trim() } : {}),
+    };
+    const nextPlan: WorkoutPlan = {
+      ...plan,
+      warmupExercises: [...(plan.warmupExercises || []), newItem],
+    };
+    setNewWarmupDraft({ name: '', minutes: '5', targetSets: '2', target: '', notes: '' });
+    setShowAddWarmupForm(false);
+    setShowWarmupSection(true);
+    try {
+      await saveWorkoutPlanDoc(nextPlan);
+      setSavedNoticeId(`wu_${plan.id}`);
+      setTimeout(() => setSavedNoticeId(prev => (prev === `wu_${plan.id}` ? null : prev)), 2000);
+    } catch (err) {
+      console.warn('Failed to add warm-up exercise:', err);
+    }
+  };
+
+  const startEditWarmup = (wu: WarmupExercise) => {
+    setEditingWarmupId(wu.id);
+    setEditWarmupDraft({
+      name: wu.name || '',
+      minutes: wu.minutes || '',
+      targetSets: wu.targetSets || '',
+      target: wu.target || '',
+      notes: wu.notes || '',
+    });
+  };
+
+  const saveEditWarmup = async (plan: WorkoutPlan, wu: WarmupExercise) => {
+    if (!isOwnPlan(plan) || !editWarmupDraft) return;
+    const cleanName = editWarmupDraft.name.trim() || wu.name;
+    const cleanMinutes = editWarmupDraft.minutes.trim();
+    const cleanSets = editWarmupDraft.targetSets.trim();
+    const cleanTarget = editWarmupDraft.target.trim();
+    const cleanNotes = editWarmupDraft.notes.trim();
+
+    const updatedWu: WarmupExercise = {
+      id: wu.id,
+      name: cleanName,
+      ...(cleanMinutes ? { minutes: cleanMinutes } : {}),
+      ...(cleanSets ? { targetSets: cleanSets } : {}),
+      ...(cleanTarget ? { target: cleanTarget } : {}),
+      ...(cleanNotes ? { notes: cleanNotes } : {}),
+    };
+
+    const nextWarmups = (plan.warmupExercises || []).map(w => (w.id === wu.id ? updatedWu : w));
+    const newCount = cleanSets ? Math.min(10, Math.max(1, parseSetsCount(cleanSets))) : null;
+    const wKey = weekKey(selectedWeek - 1);
+    const key = warmupDraftKey(plan.id, selectedWeek, wu.id);
+    const planUnit: WeightUnit = plan.defaultWeightUnit || 'kg';
+
+    let nextPlan: WorkoutPlan = {
+      ...plan,
+      warmupExercises: nextWarmups,
+    };
+
+    if (newCount !== null) {
+      const curr = getWarmupSetEntries(plan, selectedWeek, wu);
+      let resized = curr;
+      if (curr.length < newCount) {
+        const lastUnit = curr[curr.length - 1]?.unit || planUnit;
+        resized = [
+          ...curr,
+          ...Array.from({ length: newCount - curr.length }, (_, i) => ({
+            setNumber: curr.length + i + 1,
+            weight: '',
+            unit: lastUnit,
+            reps: '',
+            rpe: '',
+          })),
+        ];
+      } else if (curr.length > newCount) {
+        const copy = [...curr];
+        while (copy.length > newCount) {
+          const tail = copy[copy.length - 1];
+          if (!tail.weight.trim() && !tail.reps.trim() && !(tail.rpe || '').trim()) {
+            copy.pop();
+          } else {
+            break;
+          }
+        }
+        resized = copy;
+      }
+      setWarmupDraftSets(prev => ({ ...prev, [key]: resized }));
+      const existingLog = plan.warmupLogs?.[wKey]?.[wu.id];
+      if (existingLog) {
+        nextPlan = {
+          ...nextPlan,
+          warmupLogs: {
+            ...(plan.warmupLogs || {}),
+            [wKey]: {
+              ...(plan.warmupLogs?.[wKey] || {}),
+              [wu.id]: {
+                ...existingLog,
+                setEntries: resized,
+                updatedAt: new Date().toISOString(),
+              },
+            },
+          },
+        };
+      }
+    }
+
+    setEditingWarmupId(null);
+    setEditWarmupDraft(null);
+    try {
+      await saveWorkoutPlanDoc(nextPlan);
+      setSavedNoticeId(`wu_saved_${wu.id}`);
+      setTimeout(() => setSavedNoticeId(prev => (prev === `wu_saved_${wu.id}` ? null : prev)), 2000);
+    } catch (err) {
+      console.warn('Failed to update warm-up exercise:', err);
+    }
+  };
+
+  const handleDeleteWarmupExercise = async (plan: WorkoutPlan, wuId: string) => {
+    if (!isOwnPlan(plan)) return;
+    if (warmupTimer?.wuId === wuId) setWarmupTimer(null);
+    const nextPlan: WorkoutPlan = {
+      ...plan,
+      warmupExercises: (plan.warmupExercises || []).filter(w => w.id !== wuId),
+    };
+    try {
+      await saveWorkoutPlanDoc(nextPlan);
+    } catch (err) {
+      console.warn('Failed to delete warm-up exercise:', err);
+    }
+  };
+
+  const toggleWarmupCompleted = async (plan: WorkoutPlan, wk: number, wu: WarmupExercise) => {
+    if (!isOwnPlan(plan)) return;
+    const wKey = weekKey(wk - 1);
+    const existing: WarmupLogEntry = plan.warmupLogs?.[wKey]?.[wu.id] || {};
+    const nextPlan: WorkoutPlan = {
+      ...plan,
+      warmupLogs: {
+        ...(plan.warmupLogs || {}),
+        [wKey]: {
+          ...(plan.warmupLogs?.[wKey] || {}),
+          [wu.id]: {
+            ...existing,
+            completed: !existing.completed,
+            updatedAt: new Date().toISOString(),
+          },
+        },
+      },
+    };
+    try {
+      await saveWorkoutPlanDoc(nextPlan);
+    } catch (err) {
+      console.warn('Failed to toggle warm-up completion:', err);
+    }
+  };
+
+  const saveWarmupSets = async (
+    plan: WorkoutPlan,
+    wk: number,
+    wu: WarmupExercise,
+    overrideEntries?: SetLogEntry[]
+  ) => {
+    if (!isOwnPlan(plan)) return;
+    const wKey = weekKey(wk - 1);
+    const planUnit: WeightUnit = plan.defaultWeightUnit || 'kg';
+    const rawEntries = overrideEntries || getWarmupSetEntries(plan, wk, wu);
+    const cleanedEntries: SetLogEntry[] = rawEntries.map((s, idx) => ({
+      setNumber: idx + 1,
+      weight: (s.weight || '').trim(),
+      unit: s.unit || planUnit,
+      reps: (s.reps || '').trim(),
+      rpe: (s.rpe || '').trim(),
+    }));
+    const existing: WarmupLogEntry = plan.warmupLogs?.[wKey]?.[wu.id] || {};
+    const prevNormalized = JSON.stringify(
+      (existing.setEntries || []).map(s => ({
+        w: (s.weight || '').trim(),
+        u: s.unit || planUnit,
+        r: (s.reps || '').trim(),
+        e: (s.rpe || '').trim(),
+      }))
+    );
+    const nextNormalized = JSON.stringify(
+      cleanedEntries.map(s => ({ w: s.weight, u: s.unit || planUnit, r: s.reps, e: s.rpe }))
+    );
+    if (prevNormalized === nextNormalized && existing.setEntries) return;
+
+    const nextPlan: WorkoutPlan = {
+      ...plan,
+      warmupLogs: {
+        ...(plan.warmupLogs || {}),
+        [wKey]: {
+          ...(plan.warmupLogs?.[wKey] || {}),
+          [wu.id]: {
+            ...existing,
+            setEntries: cleanedEntries,
+            updatedAt: new Date().toISOString(),
+          },
+        },
+      },
+    };
+    try {
+      await saveWorkoutPlanDoc(nextPlan);
+      setSavedNoticeId(`wu_saved_${wu.id}`);
+      setTimeout(() => setSavedNoticeId(prev => (prev === `wu_saved_${wu.id}` ? null : prev)), 2000);
+    } catch (err) {
+      console.warn('Failed to save warm-up sets:', err);
+    }
+  };
+
+  const updateWarmupSetField = (
+    plan: WorkoutPlan,
+    wk: number,
+    wu: WarmupExercise,
+    setIdx: number,
+    field: 'weight' | 'reps' | 'rpe' | 'unit',
+    value: string
+  ) => {
+    const key = warmupDraftKey(plan.id, wk, wu.id);
+    const current = getWarmupSetEntries(plan, wk, wu);
+    const updated = current.map((s, idx) =>
+      idx === setIdx ? { ...s, setNumber: idx + 1, [field]: value } : s
+    );
+    setWarmupDraftSets(prev => ({ ...prev, [key]: updated }));
+    if (field === 'unit') {
+      saveWarmupSets(plan, wk, wu, updated);
+    }
+  };
+
+  const adjustWarmupSetCount = (plan: WorkoutPlan, wk: number, wu: WarmupExercise, delta: 1 | -1) => {
+    if (!isOwnPlan(plan)) return;
+    const key = warmupDraftKey(plan.id, wk, wu.id);
+    const current = getWarmupSetEntries(plan, wk, wu);
+    const planUnit: WeightUnit = plan.defaultWeightUnit || 'kg';
+    let next = current;
+    if (delta === 1 && current.length < 10) {
+      const lastUnit = current[current.length - 1]?.unit || planUnit;
+      next = [...current, { setNumber: current.length + 1, weight: '', unit: lastUnit, reps: '', rpe: '' }];
+    } else if (delta === -1 && current.length > 1) {
+      next = current.slice(0, current.length - 1);
+    } else {
+      return;
+    }
+    setWarmupDraftSets(prev => ({ ...prev, [key]: next }));
+    saveWarmupSets(plan, wk, wu, next);
+  };
+
+  const sessionNoteDraftKey = (planId: string, wk: number, dayFilter: string) =>
+    `${planId}__w${wk}__${getSessionNoteKey(dayFilter)}`;
+
+  const isSessionNoteEnabled = (plan: WorkoutPlan, wk: number, dayFilter: string): boolean => {
+    const dKey = sessionNoteDraftKey(plan.id, wk, dayFilter);
+    if (dKey in sessionNoteEnabledOverrides) return sessionNoteEnabledOverrides[dKey];
+    const wKey = weekKey(wk - 1);
+    const noteKey = getSessionNoteKey(dayFilter);
+    const entry = plan.exerciseLogs?.[wKey]?.[noteKey];
+    if (typeof entry?.noteEnabled === 'boolean') return entry.noteEnabled;
+    return Boolean(entry?.notes?.trim());
+  };
+
+  const toggleSessionNoteEnabled = async (plan: WorkoutPlan, wk: number, dayFilter: string, enabled: boolean) => {
+    if (!isOwnPlan(plan)) return;
+    const dKey = sessionNoteDraftKey(plan.id, wk, dayFilter);
+    setSessionNoteEnabledOverrides(prev => ({ ...prev, [dKey]: enabled }));
+    const wKey = weekKey(wk - 1);
+    const noteKey = getSessionNoteKey(dayFilter);
+    const prevEntry = plan.exerciseLogs?.[wKey]?.[noteKey] || {};
+    const updatedWeekLogs: Record<string, ExerciseLogEntry> = {
+      ...(plan.exerciseLogs?.[wKey] || {}),
+      [noteKey]: {
+        ...prevEntry,
+        noteEnabled: enabled,
+        day: dayFilter === 'ALL' ? 'All Days' : dayFilter.trim(),
+        updatedAt: new Date().toISOString(),
+      },
+    };
+    try {
+      await saveWorkoutPlanDoc({
+        ...plan,
+        exerciseLogs: {
+          ...(plan.exerciseLogs || {}),
+          [wKey]: updatedWeekLogs,
+        },
+      });
+    } catch (err) {
+      console.warn('Failed to toggle session notes:', err);
+    }
+  };
+
+  const getCurrentSessionNote = (plan: WorkoutPlan, wk: number, dayFilter: string): string => {
+    const dKey = sessionNoteDraftKey(plan.id, wk, dayFilter);
+    if (dKey in sessionNoteDrafts) return sessionNoteDrafts[dKey];
+    const wKey = weekKey(wk - 1);
+    const noteKey = getSessionNoteKey(dayFilter);
+    return plan.exerciseLogs?.[wKey]?.[noteKey]?.notes || '';
+  };
+
+  const updateSessionNoteDraft = (plan: WorkoutPlan, wk: number, dayFilter: string, value: string) => {
+    const dKey = sessionNoteDraftKey(plan.id, wk, dayFilter);
+    setSessionNoteDrafts(prev => ({ ...prev, [dKey]: value }));
+  };
+
+  const saveSessionNotes = async (
+    plan: WorkoutPlan,
+    wk: number,
+    dayFilter: string,
+    overrideText?: string
+  ) => {
+    if (!isOwnPlan(plan)) return;
+    const wKey = weekKey(wk - 1);
+    const noteKey = getSessionNoteKey(dayFilter);
+    const dKey = sessionNoteDraftKey(plan.id, wk, dayFilter);
+    const rawText = overrideText !== undefined ? overrideText : (dKey in sessionNoteDrafts ? sessionNoteDrafts[dKey] : getCurrentSessionNote(plan, wk, dayFilter));
+    const cleanedNotes = rawText.trim();
+
+    const prevEntry = plan.exerciseLogs?.[wKey]?.[noteKey];
+    const prevNotes = (prevEntry?.notes || '').trim();
+    const enabled = isSessionNoteEnabled(plan, wk, dayFilter);
+    if (cleanedNotes === prevNotes && prevEntry?.noteEnabled === enabled) return;
+
+    const updatedWeekLogs: Record<string, ExerciseLogEntry> = {
+      ...(plan.exerciseLogs?.[wKey] || {}),
+    };
+
+    if (cleanedNotes === '' && !enabled) {
+      delete updatedWeekLogs[noteKey];
+    } else {
+      updatedWeekLogs[noteKey] = {
+        ...(prevEntry || {}),
+        notes: cleanedNotes,
+        noteEnabled: enabled,
+        day: dayFilter === 'ALL' ? 'All Days' : dayFilter.trim(),
+        updatedAt: new Date().toISOString(),
+      };
+    }
+
+    const nextPlan: WorkoutPlan = {
+      ...plan,
+      exerciseLogs: {
+        ...(plan.exerciseLogs || {}),
+        [wKey]: updatedWeekLogs,
+      },
+    };
+
+    try {
+      await saveWorkoutPlanDoc(nextPlan);
+      setSessionNoteDrafts(prev => {
+        const next = { ...prev };
+        delete next[dKey];
+        return next;
+      });
+      const badgeId = `session_note_${plan.id}_${wKey}_${noteKey}`;
+      setSavedNoticeId(badgeId);
+      setTimeout(() => setSavedNoticeId(prev => (prev === badgeId ? null : prev)), 2500);
+    } catch (err) {
+      console.warn('Failed to save session notes:', err);
+    }
+  };
+
+  const persistWaterToProfile = (nextCount: number, remEnabled = waterReminderEnabled, remInterval = waterReminderIntervalMinutes) => {
+    if (!matchedAccount) return;
+    const nextAccount: UserAccount = {
+      ...matchedAccount,
+      waterIntake: {
+        date: getTodayDateKey(),
+        glasses: nextCount,
+        updatedAt: new Date().toISOString(),
+        reminderEnabled: remEnabled,
+        reminderIntervalMinutes: remInterval,
+      },
+    };
+    setLocalAccountOverride(nextAccount);
+    saveUserAccountDoc(nextAccount).catch(() => {});
+  };
+
+  const adjustWaterGlasses = (delta: 1 | -1) => {
+    setWaterGlasses(prev => {
+      const next = Math.max(0, Math.min(40, prev + delta));
+      try {
+        localStorage.setItem(
+          getWaterStorageKey(currentUser),
+          JSON.stringify({ count: next, updatedAt: new Date().toISOString() })
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+      persistWaterToProfile(next);
+      return next;
+    });
+  };
+
+  const resetWaterGlasses = () => {
+    setWaterGlasses(0);
+    try {
+      localStorage.setItem(
+        getWaterStorageKey(currentUser),
+        JSON.stringify({ count: 0, updatedAt: new Date().toISOString() })
+      );
+    } catch {
+      // ignore
+    }
+    persistWaterToProfile(0);
+  };
+
+  const saveWaterReminderPrefs = (enabled: boolean, intervalMinutes: number) => {
+    setWaterReminderEnabled(enabled);
+    setWaterReminderIntervalMinutes(intervalMinutes);
+    try {
+      localStorage.setItem(
+        getWaterReminderStorageKey(currentUser),
+        JSON.stringify({ enabled, intervalMinutes })
+      );
+    } catch {
+      // ignore
+    }
+    persistWaterToProfile(waterGlasses, enabled, intervalMinutes);
+  };
+
+  const dispatchWaterTelegramAlert = async (manual = false) => {
+    if (isSendingWaterAlert) return;
+    if (!activeTelegramConfig.enabled || !activeTelegramConfig.botToken.trim()) {
+      if (manual) {
+        setWaterAlertNotice({ type: 'error', text: 'Telegram Bot is not enabled in Admin Panel.' });
+        setTimeout(() => setWaterAlertNotice(null), 4000);
+      }
+      return;
+    }
+    if (activeTelegramConfig.notifyWater === false) {
+      if (manual) {
+        setWaterAlertNotice({ type: 'error', text: 'Water intake alerts are turned off in Admin Panel.' });
+        setTimeout(() => setWaterAlertNotice(null), 4000);
+      }
+      return;
+    }
+    if (memberWhitelistStatus !== 'active') {
+      if (manual) {
+        setWaterAlertNotice({ type: 'error', text: 'Your Telegram account must be whitelisted by Admin first.' });
+        setTimeout(() => setWaterAlertNotice(null), 4500);
+      }
+      return;
+    }
+    const targetChat = resolvedMemberChatId;
+    if (!targetChat) {
+      if (manual) {
+        setWaterAlertNotice({ type: 'error', text: 'Save your Chat ID in Profile -> Telegram Bot first.' });
+        setTimeout(() => setWaterAlertNotice(null), 4500);
+      }
+      return;
+    }
+
+    setIsSendingWaterAlert(true);
+    try {
+      const note =
+        waterGlasses >= WATER_DAILY_GOAL
+          ? 'Great work staying hydrated!'
+          : 'Time for another glass of water to fuel your recovery!';
+      const msg = formatWaterIntakeTelegramMessage(
+        resolvedDisplayName,
+        waterGlasses,
+        WATER_DAILY_GOAL,
+        note
+      );
+      const res = await sendDirectTelegramMessage(activeTelegramConfig.botToken, targetChat, msg);
+      if (res.success) {
+        setWaterAlertNotice({
+          type: 'success',
+          text: manual ? 'Water alert sent to Telegram Bot!' : 'Scheduled hydration alert sent!',
+        });
+      } else if (manual) {
+        setWaterAlertNotice({ type: 'error', text: res.error || 'Failed to send water alert' });
+      }
+    } catch (err: any) {
+      if (manual) {
+        setWaterAlertNotice({ type: 'error', text: err?.message || 'Failed to send water alert' });
+      }
+    } finally {
+      setIsSendingWaterAlert(false);
+      setTimeout(() => setWaterAlertNotice(null), 4000);
     }
   };
 
@@ -578,6 +1694,7 @@ export const GymApp: React.FC<GymAppProps> = ({
       day: ex.day || '',
       sets: setsDisplay || '',
       reps: repsDisplay || '',
+      targetRpe: ex.targetRpe || '',
       notes: ex.notes || '',
       videoUrl: ex.videoUrl || '',
       isSuperset: !!ex.isSuperset,
@@ -586,7 +1703,7 @@ export const GymApp: React.FC<GymAppProps> = ({
   };
 
   const saveEditExercise = async (plan: WorkoutPlan, ex: WorkoutExercise) => {
-    if (!editDraft) return;
+    if (!editDraft || !isOwnPlan(plan)) return;
     let nextSets = editDraft.sets.trim();
     let nextReps = editDraft.reps.trim();
     const split = splitSetsAndReps(nextSets);
@@ -601,6 +1718,7 @@ export const GymApp: React.FC<GymAppProps> = ({
       ...(editDraft.day.trim() ? { day: editDraft.day.trim() } : {}),
       ...(nextSets ? { sets: nextSets } : {}),
       ...(nextReps ? { reps: nextReps } : {}),
+      ...(editDraft.targetRpe.trim() ? { targetRpe: editDraft.targetRpe.trim() } : {}),
       ...(editDraft.notes.trim() ? { notes: editDraft.notes.trim() } : {}),
       ...(editDraft.videoUrl.trim() ? { videoUrl: editDraft.videoUrl.trim() } : {}),
       ...(editDraft.isSuperset ? { isSuperset: true } : {}),
@@ -623,14 +1741,15 @@ export const GymApp: React.FC<GymAppProps> = ({
           weight: '',
           unit: planUnit,
           reps: '',
+          rpe: '',
         })),
       ];
     } else if (currEntries.length > newTargetCount) {
-      // Only shrink trailing empty sets so logged weights/reps are never lost
+      // Only shrink trailing empty sets so logged weights/reps/RPE are never lost
       const copy = [...currEntries];
       while (copy.length > newTargetCount) {
         const tail = copy[copy.length - 1];
-        if (!tail.weight.trim() && !tail.reps.trim()) {
+        if (!tail.weight.trim() && !tail.reps.trim() && !(tail.rpe || '').trim()) {
           copy.pop();
         } else {
           break;
@@ -678,9 +1797,17 @@ export const GymApp: React.FC<GymAppProps> = ({
   };
 
   const toggleExercise = (plan: WorkoutPlan, weekIdx: number, exerciseId: string) => {
+    if (!isOwnPlan(plan)) return;
     const key = weekKey(weekIdx);
+    const dKey = draftKey(plan.id, weekIdx + 1, exerciseId);
     const current = plan.progress?.[key] || [];
-    const updated = current.includes(exerciseId)
+    const wasChecked = current.includes(exerciseId);
+    if (wasChecked) {
+      manuallyUncheckedRef.current.add(dKey);
+    } else {
+      manuallyUncheckedRef.current.delete(dKey);
+    }
+    const updated = wasChecked
       ? current.filter((id) => id !== exerciseId)
       : [...current, exerciseId];
     const next: WorkoutPlan = { ...plan, progress: { ...(plan.progress || {}), [key]: updated } };
@@ -688,7 +1815,7 @@ export const GymApp: React.FC<GymAppProps> = ({
   };
 
   const confirmDeletePlan = async () => {
-    if (!planToDelete) return;
+    if (!planToDelete || !isOwnPlan(planToDelete)) return;
     const id = planToDelete.id;
     setIsDeletingPlan(true);
     if (selectedPlanId === id) setSelectedPlanId(null);
@@ -704,13 +1831,223 @@ export const GymApp: React.FC<GymAppProps> = ({
   };
 
   const handleExportPlanPdf = (plan: WorkoutPlan) => {
+    if (!isOwnPlan(plan)) return;
+    setOpenExportMenu(null);
     try {
-      const filename = exportWorkoutPlanToPdf(plan, { ownerName: resolvedDisplayName });
+      const filename = exportWorkoutPlanToPdf(plan, {
+        ownerName: resolvedDisplayName,
+        waterGlasses,
+      });
       setExportNotice(`Exported ${filename}`);
       setTimeout(() => setExportNotice(prev => (prev === `Exported ${filename}` ? null : prev)), 3000);
     } catch (err) {
       console.warn('PDF export failed:', err);
     }
+  };
+
+  const handleExportPlanExcel = async (plan: WorkoutPlan) => {
+    if (!isOwnPlan(plan) || isExportingExcel) return;
+    setOpenExportMenu(null);
+    setIsExportingExcel(true);
+    try {
+      const filename = await exportWorkoutPlanToExcel(plan, {
+        ownerName: resolvedDisplayName,
+        waterGlasses,
+      });
+      setExportNotice(`Exported ${filename}`);
+      setTimeout(() => setExportNotice(prev => (prev === `Exported ${filename}` ? null : prev)), 3000);
+    } catch (err) {
+      console.warn('Excel export failed:', err);
+    } finally {
+      setIsExportingExcel(false);
+    }
+  };
+
+  const handleSendSheetToTelegram = async (plan: WorkoutPlan, format: 'pdf' | 'excel') => {
+    if (!isOwnPlan(plan) || isSendingSheetToBot) return;
+    setOpenExportMenu(null);
+    const botToken = activeTelegramConfig.botToken?.trim();
+    if (!botToken) {
+      setExportNotice('Telegram Bot Token is not configured in Admin Panel yet.');
+      setTimeout(() => setExportNotice(null), 4000);
+      return;
+    }
+    if (memberWhitelistStatus !== 'active') {
+      setExportNotice('Telegram account must be whitelisted by Admin to send sheets to Bot.');
+      setTimeout(() => setExportNotice(null), 4500);
+      return;
+    }
+    if (!resolvedMemberChatId) {
+      setExportNotice('Save your personal Telegram Chat ID in Profile -> Telegram Bot first.');
+      setTimeout(() => setExportNotice(null), 4500);
+      return;
+    }
+
+    setIsSendingSheetToBot(format);
+    try {
+      if (format === 'pdf') {
+        const { filename, buffer } = exportWorkoutPlanToPdfBuffer(plan, {
+          ownerName: resolvedDisplayName,
+          waterGlasses,
+        });
+        const caption = `📄 <b>${plan.title}</b> (PDF)\nAthlete: <b>${resolvedDisplayName}</b> • ${plan.exercises.length} exercises • ${plan.weeks}w`;
+        const res = await sendTelegramDocumentFile({
+          botToken,
+          chatId: resolvedMemberChatId,
+          bytes: buffer,
+          filename,
+          mimeType: 'application/pdf',
+          caption,
+        });
+        setExportNotice(res.success ? `Sent ${filename} to Telegram Bot!` : (res.error || 'Failed to send PDF to Bot'));
+      } else {
+        const { filename, buffer } = await exportWorkoutPlanToExcelBuffer(plan, {
+          ownerName: resolvedDisplayName,
+          waterGlasses,
+        });
+        const caption = `📊 <b>${plan.title}</b> (Excel .xlsx)\nIncludes Workout Plan, Set-by-Set History (RPE & Volume), Warm-up Tracker & Notes.`;
+        const res = await sendTelegramDocumentFile({
+          botToken,
+          chatId: resolvedMemberChatId,
+          bytes: buffer,
+          filename,
+          mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          caption,
+        });
+        setExportNotice(res.success ? `Sent ${filename} to Telegram Bot!` : (res.error || 'Failed to send Excel sheet to Bot'));
+      }
+    } catch (err: any) {
+      setExportNotice(err?.message || 'Failed to send sheet to Telegram Bot');
+    } finally {
+      setIsSendingSheetToBot(null);
+      setTimeout(() => setExportNotice(null), 4000);
+    }
+  };
+
+  const renderExportControl = (
+    plan: WorkoutPlan,
+    menuId: 'toolbar' | 'dashboard' | 'profile',
+    variant: 'toolbar' | 'hero' | 'profile'
+  ) => {
+    const isOpen = openExportMenu === menuId;
+    const buttonClasses =
+      variant === 'hero'
+        ? 'inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-gradient-to-r from-red-600 to-red-500 hover:from-red-500 hover:to-red-400 text-white text-xs font-bold shadow-lg shadow-red-950/50 transition-all cursor-pointer whitespace-nowrap shrink-0'
+        : variant === 'profile'
+        ? 'inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-semibold text-neutral-200 cursor-pointer whitespace-nowrap shrink-0'
+        : 'h-9 px-2.5 sm:px-3 shrink-0 inline-flex items-center justify-center gap-1.5 rounded-xl text-xs font-bold border bg-red-600/20 hover:bg-red-600/35 text-red-200 border-red-500/35 cursor-pointer whitespace-nowrap';
+
+    const busy = isExportingExcel || isSendingSheetToBot !== null;
+
+    const dropdownMenu =
+      isOpen && typeof document !== 'undefined'
+        ? createPortal(
+            <div
+              role="menu"
+              data-export-menu-portal="true"
+              style={
+                exportMenuCoords
+                  ? {
+                      position: 'fixed',
+                      left: `${exportMenuCoords.left}px`,
+                      ...(exportMenuCoords.top !== undefined ? { top: `${exportMenuCoords.top}px` } : {}),
+                      ...(exportMenuCoords.bottom !== undefined ? { bottom: `${exportMenuCoords.bottom}px` } : {}),
+                      width: '264px',
+                    }
+                  : {
+                      position: 'fixed',
+                      top: '-9999px',
+                      left: '-9999px',
+                      width: '264px',
+                    }
+              }
+              className="rounded-xl border border-white/20 bg-neutral-950/98 backdrop-blur-xl shadow-2xl shadow-black/80 p-1.5 z-[9999] space-y-1"
+            >
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => handleExportPlanPdf(plan)}
+                className="w-full flex items-start gap-2.5 px-3 py-2 rounded-lg hover:bg-red-500/15 text-left transition-colors cursor-pointer"
+              >
+                <FileText className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                <div className="min-w-0">
+                  <div className="text-xs font-bold text-white">Export as PDF (.pdf)</div>
+                  <div className="text-[11px] text-neutral-400 leading-snug">Combined by days, RPE &amp; weekly history</div>
+                </div>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                disabled={isExportingExcel}
+                onClick={() => handleExportPlanExcel(plan)}
+                className="w-full flex items-start gap-2.5 px-3 py-2 rounded-lg hover:bg-emerald-500/15 disabled:opacity-50 text-left transition-colors cursor-pointer"
+              >
+                <FileSpreadsheet className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                <div className="min-w-0">
+                  <div className="text-xs font-bold text-white">Export as Excel (.xlsx)</div>
+                  <div className="text-[11px] text-neutral-400 leading-snug">Redesigned 5-sheet workbook &amp; analytics</div>
+                </div>
+              </button>
+
+              <div className="border-t border-white/10 my-1 pt-1 space-y-1">
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={isSendingSheetToBot !== null}
+                  onClick={() => handleSendSheetToTelegram(plan, 'pdf')}
+                  className="w-full flex items-start gap-2.5 px-3 py-2 rounded-lg hover:bg-sky-500/15 disabled:opacity-50 text-left transition-colors cursor-pointer"
+                >
+                  <Send className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
+                  <div className="min-w-0">
+                    <div className="text-xs font-bold text-white">Send PDF to Telegram Bot</div>
+                    <div className="text-[11px] text-neutral-400 leading-snug">Delivers .pdf file to your bot chat</div>
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={isSendingSheetToBot !== null}
+                  onClick={() => handleSendSheetToTelegram(plan, 'excel')}
+                  className="w-full flex items-start gap-2.5 px-3 py-2 rounded-lg hover:bg-sky-500/15 disabled:opacity-50 text-left transition-colors cursor-pointer"
+                >
+                  <Send className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
+                  <div className="min-w-0">
+                    <div className="text-xs font-bold text-white">Send Excel to Telegram Bot</div>
+                    <div className="text-[11px] text-neutral-400 leading-snug">Delivers .xlsx sheet to your bot chat</div>
+                  </div>
+                </button>
+              </div>
+            </div>,
+            document.body
+          )
+        : null;
+
+    return (
+      <div className="relative" data-export-menu-root="true">
+        <button
+          ref={(el) => {
+            exportButtonRefs.current[menuId] = el;
+          }}
+          type="button"
+          onClick={() => setOpenExportMenu(prev => (prev === menuId ? null : menuId))}
+          aria-expanded={isOpen}
+          aria-haspopup="menu"
+          aria-label={`Export ${plan.title} as PDF or Excel`}
+          className={buttonClasses}
+          title="Export workout plan as PDF or Excel (.xlsx), or send directly to Telegram Bot"
+        >
+          {busy ? (
+            <Loader2 className={`w-3.5 h-3.5 animate-spin ${variant === 'hero' ? 'text-white' : 'text-red-400'}`} />
+          ) : (
+            <Download className={`w-3.5 h-3.5 ${variant === 'hero' ? 'text-white' : 'text-red-400'}`} />
+          )}
+          <span className={variant === 'toolbar' ? 'hidden sm:inline' : ''}>Export</span>
+          <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+        </button>
+
+        {dropdownMenu}
+      </div>
+    );
   };
 
   // Helper to get or build the writable UserAccount document for currentUser
@@ -816,6 +2153,75 @@ export const GymApp: React.FC<GymAppProps> = ({
 
   const activeTelegramConfig = useMemo(() => getTelegramConfig(adminSettings), [adminSettings]);
 
+  const memberWhitelistStatus = useMemo<'active' | 'paused' | 'not_whitelisted'>(() => {
+    const cleanBareHandle = tgUsernameInput.trim().replace(/^@/, '').toLowerCase();
+    const cleanChat = tgChatIdInput.trim();
+    const cleanUserLower = currentUser.toLowerCase().trim();
+
+    const matchingAuth = (activeTelegramConfig.authorizedUsers || []).filter((u) => {
+      const uApp = (u.appUsername || '').trim().toLowerCase();
+      const uBare = (u.telegramUsername || '').trim().replace(/^@/, '').toLowerCase();
+      const uChat = (u.chatId || '').trim();
+      return (
+        (uApp && uApp === cleanUserLower) ||
+        (cleanBareHandle && uBare === cleanBareHandle) ||
+        (cleanChat && uChat === cleanChat)
+      );
+    });
+
+    if (matchingAuth.some((u) => u.isActive === false)) return 'paused';
+    if (matchingAuth.some((u) => u.isActive !== false)) return 'active';
+
+    const inWhitelist =
+      Boolean(cleanBareHandle) &&
+      (activeTelegramConfig.whitelistedUsernames || []).some(
+        (w) => (w || '').trim().replace(/^@/, '').toLowerCase() === cleanBareHandle
+      );
+    const isPrimaryChat =
+      Boolean(cleanChat && activeTelegramConfig.chatId?.trim()) &&
+      activeTelegramConfig.chatId!.trim() === cleanChat;
+
+    return inWhitelist || isPrimaryChat ? 'active' : 'not_whitelisted';
+  }, [activeTelegramConfig, tgUsernameInput, tgChatIdInput, currentUser]);
+
+  const resolvedMemberChatId = useMemo(() => {
+    const fromInput = tgChatIdInput.trim();
+    if (fromInput) return fromInput;
+    const fromAccount = matchedAccount?.telegramChatId?.trim();
+    if (fromAccount) return fromAccount;
+
+    const cleanUserLower = currentUser.toLowerCase().trim();
+    const cleanBareHandle = tgUsernameInput.trim().replace(/^@/, '').toLowerCase();
+    const matchingAuth = (activeTelegramConfig.authorizedUsers || []).find((u) => {
+      if (u.isActive === false || !u.chatId?.trim()) return false;
+      const uApp = (u.appUsername || '').trim().toLowerCase();
+      const uBare = (u.telegramUsername || '').trim().replace(/^@/, '').toLowerCase();
+      return (uApp && uApp === cleanUserLower) || (cleanBareHandle && uBare === cleanBareHandle);
+    });
+    return matchingAuth?.chatId?.trim() || '';
+  }, [tgChatIdInput, matchedAccount?.telegramChatId, activeTelegramConfig.authorizedUsers, currentUser, tgUsernameInput]);
+
+  useEffect(() => {
+    if (!waterReminderEnabled) return;
+    if (memberWhitelistStatus !== 'active' || !resolvedMemberChatId) return;
+    if (!activeTelegramConfig.enabled || activeTelegramConfig.notifyWater === false || !activeTelegramConfig.botToken.trim()) return;
+
+    const intervalMs = Math.max(5, waterReminderIntervalMinutes || 60) * 60 * 1000;
+    const timer = window.setInterval(() => {
+      dispatchWaterTelegramAlert(false);
+    }, intervalMs);
+    return () => window.clearInterval(timer);
+  }, [
+    waterReminderEnabled,
+    waterReminderIntervalMinutes,
+    waterGlasses,
+    memberWhitelistStatus,
+    resolvedMemberChatId,
+    activeTelegramConfig.enabled,
+    activeTelegramConfig.notifyWater,
+    activeTelegramConfig.botToken,
+  ]);
+
   const handleSaveMemberTelegram = async (e: React.FormEvent) => {
     e.preventDefault();
     setTelegramFeedback(null);
@@ -835,22 +2241,28 @@ export const GymApp: React.FC<GymAppProps> = ({
       await saveUserAccountDoc(nextAccount);
       setLocalAccountOverride(nextAccount);
 
-      // Sync with global Telegram authorizedUsers registry when handle + chatId are available
-      if (cleanHandle && activeTelegramConfig.botToken) {
-        const addedTgCfg = addAuthorizedTelegramUser(activeTelegramConfig, {
-          telegramUsername: cleanHandle,
-          chatId: cleanChatId || undefined,
-          appUsername: currentUser,
-          role: 'partner',
-          confirmed: !!cleanChatId,
-        });
+      // Update ONLY an existing Admin-approved authorizedUsers entry for this member (never self-whitelist)
+      const cleanUserLower = currentUser.toLowerCase().trim();
+      const hasExistingEntry = (activeTelegramConfig.authorizedUsers || []).some(
+        (u) =>
+          (u.appUsername || '').trim().toLowerCase() === cleanUserLower ||
+          (cleanHandle && u.telegramUsername.toLowerCase() === cleanHandle)
+      );
+      if (hasExistingEntry && activeTelegramConfig.botToken) {
         const updatedTgCfg = {
-          ...addedTgCfg,
-          authorizedUsers: (addedTgCfg.authorizedUsers || []).map((u) =>
-            u.telegramUsername.toLowerCase() === cleanHandle
-              ? { ...u, isActive: tgNotificationsEnabled }
-              : u
-          ),
+          ...activeTelegramConfig,
+          authorizedUsers: (activeTelegramConfig.authorizedUsers || []).map((u) => {
+            const matchesThisMember =
+              (u.appUsername || '').trim().toLowerCase() === cleanUserLower ||
+              (cleanHandle && u.telegramUsername.toLowerCase() === cleanHandle);
+            if (!matchesThisMember) return u;
+            return {
+              ...u,
+              chatId: cleanChatId || u.chatId,
+              appUsername: u.appUsername || currentUser,
+              confirmed: Boolean(cleanChatId || u.chatId),
+            };
+          }),
         };
         await persistTelegramConfig(updatedTgCfg, async (setting) => {
           await saveAdminSettingDoc(setting);
@@ -873,14 +2285,17 @@ export const GymApp: React.FC<GymAppProps> = ({
       setTelegramFeedback({ type: 'error', text: 'Bot token is not configured by Admin yet. Ask your coach/admin to set the Telegram Bot Token first.' });
       return;
     }
+    const cleanInputHandle = tgUsernameInput.trim().toLowerCase();
+    if (!cleanInputHandle) {
+      setTelegramFeedback({ type: 'error', text: 'Enter your exact Telegram @username first, then click Auto-Detect.' });
+      return;
+    }
     setIsDetectingTelegram(true);
     try {
       const detailed = await fetchTelegramChatIdsDetailed(activeTelegramConfig.botToken);
       const candidates = [
-        tgUsernameInput.trim().toLowerCase(),
-        tgUsernameInput.trim().replace(/^@/, '').toLowerCase(),
-        `@${currentUser.toLowerCase().trim()}`,
-        currentUser.toLowerCase().trim(),
+        cleanInputHandle.startsWith('@') ? cleanInputHandle : `@${cleanInputHandle}`,
+        cleanInputHandle.replace(/^@/, ''),
       ].filter(Boolean);
 
       let foundChatId = '';
@@ -896,8 +2311,7 @@ export const GymApp: React.FC<GymAppProps> = ({
         const matchingSender = detailed.senders.find(s =>
           candidates.some(c =>
             s.username?.toLowerCase() === c ||
-            s.username?.replace(/^@/, '').toLowerCase() === c ||
-            s.firstName?.toLowerCase() === c
+            s.username?.replace(/^@/, '').toLowerCase() === c
           )
         );
         if (matchingSender) {
@@ -938,7 +2352,7 @@ export const GymApp: React.FC<GymAppProps> = ({
     setIsTestingTelegram(true);
     try {
       const msg =
-        `🏋️ <b>Iron House Profile Test</b>\n\n` +
+        `🏋️ <b>Gym Workout Profile Test</b>\n\n` +
         `Hello <b>${resolvedDisplayName}</b> (@${currentUser})!\n` +
         `Your Telegram notifications are linked and working properly.`;
       const res = await sendDirectTelegramMessage(token, chatId, msg);
@@ -1000,6 +2414,7 @@ export const GymApp: React.FC<GymAppProps> = ({
           name: ex.name || '',
           sets: setsDisplay || '',
           reps: repsDisplay || '',
+          targetRpe: ex.targetRpe || '',
           notes: ex.notes || '',
           videoUrl: ex.videoUrl || '',
           isSuperset: !!ex.isSuperset,
@@ -1066,6 +2481,7 @@ export const GymApp: React.FC<GymAppProps> = ({
           name: row.name || '',
           sets: row.sets || '',
           reps: row.reps || '',
+          targetRpe: row.rpe || matched?.targetRpe || '',
           notes: row.notes || '',
           videoUrl: row.video || '',
           isSuperset: !!row.isSuperset,
@@ -1084,7 +2500,7 @@ export const GymApp: React.FC<GymAppProps> = ({
         .join('\n\n');
 
       const prefilledCount = mappedExercises.filter(
-        m => m.weeklyLogs || m.loggedWeight || m.loggedReps || m.completed
+        m => m.weeklyLogs || m.loggedWeight || m.loggedReps || m.targetRpe || m.completed
       ).length;
 
       setWorksheetDraft((prev) =>
@@ -1100,7 +2516,7 @@ export const GymApp: React.FC<GymAppProps> = ({
           : prev
       );
       setWorksheetImportNotice(
-        `Loaded ${mappedExercises.length} exercises from "${file.name}" (${usedExistingIds.size} matched to keep saved data${prefilledCount > 0 ? `, ${prefilledCount} rows with sheet data ready to fill empty slots` : ''}). Click Save Worksheet to apply.`
+        `Loaded ${mappedExercises.length} exercises from "${file.name}" (${usedExistingIds.size} matched to keep saved data${prefilledCount > 0 ? `, ${prefilledCount} rows with sheet data/RPE ready to fill empty slots` : ''}). Click Save Worksheet to apply.`
       );
     } catch (err: any) {
       setWorksheetImportNotice(`Failed to read file: ${err?.message || String(err)}`);
@@ -1110,7 +2526,7 @@ export const GymApp: React.FC<GymAppProps> = ({
   };
 
   const saveModifiedWorksheet = async (plan: WorkoutPlan) => {
-    if (!worksheetDraft) return;
+    if (!worksheetDraft || !isOwnPlan(plan)) return;
     setIsSavingWorksheet(true);
     try {
       const merged = mergeUpdatedWorksheetIntoPlan(plan, {
@@ -1128,6 +2544,7 @@ export const GymApp: React.FC<GymAppProps> = ({
             name: row.name,
             sets: split ? split.sets : row.sets,
             reps: row.reps.trim() || (split ? split.reps : ''),
+            targetRpe: row.targetRpe?.trim() || '',
             notes: row.notes,
             videoUrl: row.videoUrl,
             isSuperset: row.isSuperset,
@@ -1318,15 +2735,7 @@ export const GymApp: React.FC<GymAppProps> = ({
     <span className="hidden sm:inline">{worksheetEditPlanId === plan.id ? 'Close Editor' : 'Modify Worksheet'}</span>
   </button>
 
-  <button
-    type="button"
-    onClick={() => handleExportPlanPdf(plan)}
-    aria-label="Export PDF"
-    className="h-9 w-9 sm:w-auto sm:px-3 shrink-0 inline-flex items-center justify-center gap-1.5 rounded-xl text-xs font-bold border bg-red-600/20 hover:bg-red-600/35 text-red-200 border-red-500/35 cursor-pointer"
-  >
-    <Download className="w-3.5 h-3.5 text-red-400" />
-    <span className="hidden sm:inline">Export</span>
-  </button>
+  {renderExportControl(plan, 'toolbar', 'toolbar')}
 
   <button
     type="button"
@@ -1462,14 +2871,15 @@ export const GymApp: React.FC<GymAppProps> = ({
 
             {/* Editable Worksheet Table */}
             <div className="rounded-xl border border-white/10 bg-black/40 overflow-x-auto">
-              <table className="w-full text-left border-collapse min-w-[820px]">
+              <table className="w-full text-left border-collapse min-w-[900px]">
                 <thead>
                   <tr className="text-[10px] uppercase tracking-wider text-neutral-500 bg-neutral-900/80">
                     <th className="px-2 py-2 w-32">Day</th>
                     <th className="px-2 py-2 w-20">Type</th>
                     <th className="px-2 py-2">Exercise Name</th>
-                    <th className="px-2 py-2 w-24">Sets</th>
+                    <th className="px-2 py-2 w-20">Sets</th>
                     <th className="px-2 py-2 w-24">Reps</th>
+                    <th className="px-2 py-2 w-20">RPE</th>
                     <th className="px-2 py-2">Notes</th>
                     <th className="px-2 py-2 w-56">Video URL</th>
                     <th className="px-2 py-2 w-10"></th>
@@ -1551,6 +2961,18 @@ export const GymApp: React.FC<GymAppProps> = ({
                       </td>
                       <td className="px-1.5 py-1">
                         <input
+                          value={row.targetRpe || ''}
+                          onChange={(e) => {
+                            const next = [...worksheetDraft.exercises];
+                            next[rIdx] = { ...next[rIdx], targetRpe: e.target.value };
+                            setWorksheetDraft({ ...worksheetDraft, exercises: next });
+                          }}
+                          placeholder="8"
+                          className="w-full bg-neutral-900 border border-white/10 rounded-lg px-2 py-1 text-xs text-amber-200 font-mono outline-none"
+                        />
+                      </td>
+                      <td className="px-1.5 py-1">
+                        <input
                           value={row.notes}
                           onChange={(e) => {
                             const next = [...worksheetDraft.exercises];
@@ -1604,6 +3026,7 @@ export const GymApp: React.FC<GymAppProps> = ({
                         name: '',
                         sets: '3',
                         reps: '8-12',
+                        targetRpe: '',
                         notes: '',
                         videoUrl: '',
                         isSuperset: false,
@@ -1738,6 +3161,600 @@ export const GymApp: React.FC<GymAppProps> = ({
           </div>
         </div>
 
+        {/* WARM-UP SECTION (TOP OF WORKOUT PLAN — SEPARATE WARM-UP SETS) */}
+        {(() => {
+          const warmupList = plan.warmupExercises || [];
+          const wKey = weekKey(selectedWeek - 1);
+          const warmupDoneCount = warmupList.filter(wu => Boolean(plan.warmupLogs?.[wKey]?.[wu.id]?.completed)).length;
+
+          return (
+            <div className="rounded-2xl border border-amber-500/30 bg-amber-950/10 overflow-hidden">
+              <div className="px-4 py-3 flex flex-wrap items-center justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowWarmupSection(v => !v)}
+                  className="flex items-center gap-2 text-left cursor-pointer min-w-0"
+                >
+                  <Flame className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span className="text-xs font-bold text-amber-200 uppercase tracking-wider">
+                    Warm-up ({warmupList.length})
+                  </span>
+                  {warmupList.length > 0 && (
+                    <span className="text-[11px] font-mono tabular-nums text-amber-300/90">
+                      {warmupDoneCount}/{warmupList.length} done · Week {selectedWeek}
+                    </span>
+                  )}
+                  {showWarmupSection ? (
+                    <ChevronUp className="w-4 h-4 text-amber-400" />
+                  ) : (
+                    <ChevronDown className="w-4 h-4 text-amber-400" />
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowWarmupSection(true);
+                    setShowAddWarmupForm(v => !v);
+                  }}
+                  className="h-8 px-2.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/35 text-amber-200 text-xs font-bold inline-flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                >
+                  <Plus className="w-3.5 h-3.5" /> Add Warm-up
+                </button>
+              </div>
+
+              {showWarmupSection && (
+                <div className="px-4 pb-4 pt-2 border-t border-amber-500/20 space-y-3">
+                  {showAddWarmupForm && (
+                    <div className="rounded-xl border border-amber-500/30 bg-neutral-950/80 p-3 space-y-2.5">
+                      <div className="grid grid-cols-1 sm:grid-cols-12 gap-2">
+                        <label className="flex flex-col gap-1 sm:col-span-5">
+                          <span className="text-[10px] uppercase tracking-wider text-neutral-400 font-semibold">Warm-up Movement / Drill</span>
+                          <input
+                            value={newWarmupDraft.name}
+                            onChange={(e) => setNewWarmupDraft({ ...newWarmupDraft, name: e.target.value })}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault();
+                                handleAddWarmupExercise(plan);
+                              }
+                            }}
+                            placeholder="e.g. Incline Walk, Band Pull-Aparts, Ramp-up"
+                            className="bg-neutral-900 border border-white/15 focus:border-amber-500/60 rounded-lg px-3 py-1.5 text-xs text-white outline-none"
+                          />
+                        </label>
+
+                        <div className="flex flex-col gap-1 sm:col-span-3">
+                          <span className="text-[10px] uppercase tracking-wider text-neutral-400 font-semibold">Minutes</span>
+                          <div className="flex items-center gap-1">
+                            <input
+                              type="number"
+                              min="0"
+                              max="120"
+                              value={newWarmupDraft.minutes}
+                              onChange={(e) => setNewWarmupDraft({ ...newWarmupDraft, minutes: e.target.value })}
+                              placeholder="5"
+                              aria-label="Warm-up duration in minutes"
+                              className="w-full min-w-0 bg-neutral-900 border border-white/15 focus:border-amber-500/60 rounded-lg px-2.5 py-1.5 text-xs text-white font-mono tabular-nums outline-none"
+                            />
+                            {['3', '5', '10'].map(preset => (
+                              <button
+                                key={preset}
+                                type="button"
+                                onClick={() => setNewWarmupDraft(prev => ({ ...prev, minutes: preset }))}
+                                className={`h-7 px-1.5 rounded text-[10px] font-mono font-bold border cursor-pointer shrink-0 ${
+                                  newWarmupDraft.minutes === preset
+                                    ? 'bg-amber-500/25 border-amber-400/60 text-amber-200'
+                                    : 'bg-neutral-900 border-white/10 text-neutral-400 hover:text-white'
+                                }`}
+                              >
+                                {preset}m
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+
+                        <div className="flex flex-col gap-1 sm:col-span-2">
+                          <span className="text-[10px] uppercase tracking-wider text-neutral-400 font-semibold">Target Sets</span>
+                          <div className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const cur = parseInt(newWarmupDraft.targetSets || '2', 10) || 2;
+                                setNewWarmupDraft(prev => ({ ...prev, targetSets: String(Math.max(1, cur - 1)) }));
+                              }}
+                              aria-label="Decrease target warm-up sets"
+                              className="h-7 w-7 inline-flex items-center justify-center rounded-lg bg-white/5 hover:bg-white/10 text-neutral-300 cursor-pointer shrink-0"
+                            >
+                              <Minus className="w-3 h-3" />
+                            </button>
+                            <input
+                              type="number"
+                              min="1"
+                              max="10"
+                              value={newWarmupDraft.targetSets}
+                              onChange={(e) => setNewWarmupDraft({ ...newWarmupDraft, targetSets: e.target.value })}
+                              aria-label="Warm-up target sets"
+                              className="w-full min-w-0 text-center bg-neutral-900 border border-white/15 focus:border-amber-500/60 rounded-lg px-1.5 py-1.5 text-xs text-white font-mono tabular-nums outline-none"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const cur = parseInt(newWarmupDraft.targetSets || '2', 10) || 2;
+                                setNewWarmupDraft(prev => ({ ...prev, targetSets: String(Math.min(10, cur + 1)) }));
+                              }}
+                              aria-label="Increase target warm-up sets"
+                              className="h-7 w-7 inline-flex items-center justify-center rounded-lg bg-white/5 hover:bg-white/10 text-neutral-300 cursor-pointer shrink-0"
+                            >
+                              <Plus className="w-3 h-3" />
+                            </button>
+                          </div>
+                        </div>
+
+                        <label className="flex flex-col gap-1 sm:col-span-2">
+                          <span className="text-[10px] uppercase tracking-wider text-neutral-400 font-semibold">Reps / Pace</span>
+                          <input
+                            value={newWarmupDraft.target}
+                            onChange={(e) => setNewWarmupDraft({ ...newWarmupDraft, target: e.target.value })}
+                            placeholder="10-12 reps"
+                            className="bg-neutral-900 border border-white/15 focus:border-amber-500/60 rounded-lg px-2.5 py-1.5 text-xs text-white font-mono outline-none"
+                          />
+                        </label>
+                      </div>
+                      <label className="flex flex-col gap-1">
+                        <span className="text-[10px] uppercase tracking-wider text-neutral-400 font-semibold">Warm-up Cue (optional)</span>
+                        <input
+                          value={newWarmupDraft.notes}
+                          onChange={(e) => setNewWarmupDraft({ ...newWarmupDraft, notes: e.target.value })}
+                          placeholder="Light tempo, focus on mobility / shoulder prep..."
+                          className="bg-neutral-900 border border-white/15 focus:border-amber-500/60 rounded-lg px-3 py-1.5 text-xs text-neutral-200 outline-none"
+                        />
+                      </label>
+                      <div className="flex items-center justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowAddWarmupForm(false);
+                            setNewWarmupDraft({ name: '', minutes: '5', targetSets: '2', target: '', notes: '' });
+                          }}
+                          className="px-3 py-1.5 rounded-lg bg-neutral-800 text-neutral-300 text-xs font-semibold cursor-pointer"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          disabled={!newWarmupDraft.name.trim()}
+                          onClick={() => handleAddWarmupExercise(plan)}
+                          className="px-3.5 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-black text-xs font-bold inline-flex items-center gap-1 cursor-pointer"
+                        >
+                          <Check className="w-3.5 h-3.5" /> Save Warm-up
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {warmupList.length === 0 ? (
+                    <p className="text-xs text-neutral-400">
+                      No warm-up drills added yet. Click <span className="text-amber-300 font-semibold">+ Add Warm-up</span> above to set minutes, target sets &amp; ramp-up sets.
+                    </p>
+                  ) : (
+                    <div className="space-y-2.5">
+                      {warmupList.map((wu, wuIdx) => {
+                        const wuEntry = plan.warmupLogs?.[wKey]?.[wu.id];
+                        const wuDone = Boolean(wuEntry?.completed);
+                        const wuSetEntries = getWarmupSetEntries(plan, selectedWeek, wu);
+                        const isWuSavedRecently = savedNoticeId === `wu_saved_${wu.id}`;
+                        const isEditingWu = editingWarmupId === wu.id && editWarmupDraft !== null;
+                        const activeTimer = warmupTimer?.wuId === wu.id ? warmupTimer : null;
+                        const configuredMins = parseFloat((wu.minutes || '').trim());
+                        const hasMinutes = Number.isFinite(configuredMins) && configuredMins > 0;
+                        const targetSetsNum = wu.targetSets?.trim()
+                          ? parseSetsCount(wu.targetSets.trim())
+                          : null;
+
+                        return (
+                          <div
+                            key={wu.id}
+                            className={`rounded-xl border p-3 space-y-2.5 transition-colors ${
+                              wuDone
+                                ? 'border-amber-400/50 bg-amber-950/25'
+                                : 'border-white/10 bg-neutral-900/75'
+                            }`}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="flex items-start gap-2.5 min-w-0">
+                                <button
+                                  type="button"
+                                  onClick={() => toggleWarmupCompleted(plan, selectedWeek, wu)}
+                                  className="mt-0.5 text-amber-400 shrink-0 hover:scale-110 transition-transform cursor-pointer"
+                                  title={wuDone ? 'Mark warm-up incomplete' : 'Mark warm-up done'}
+                                >
+                                  {wuDone ? <CheckCircle2 className="w-5 h-5" /> : <Circle className="w-5 h-5 text-neutral-600" />}
+                                </button>
+                                <div className="min-w-0">
+                                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                                    <span className="text-[11px] font-mono text-amber-400/80">W#{wuIdx + 1}</span>
+                                    <span className={`text-sm font-bold ${wuDone ? 'line-through opacity-75' : 'text-white'}`}>
+                                      {wu.name}
+                                    </span>
+                                    {(hasMinutes || targetSetsNum || wu.target) && (
+                                      <span className="text-[11px] font-mono tabular-nums text-amber-200/90 inline-flex items-center gap-1.5">
+                                        {hasMinutes && (
+                                          <span className="inline-flex items-center gap-1">
+                                            <Clock className="w-3 h-3 text-amber-400" />
+                                            {wu.minutes} min
+                                          </span>
+                                        )}
+                                        {hasMinutes && (targetSetsNum || wu.target) && <span aria-hidden="true">·</span>}
+                                        {targetSetsNum && <span>{targetSetsNum} sets</span>}
+                                        {targetSetsNum && wu.target && <span aria-hidden="true">·</span>}
+                                        {wu.target && <span>{wu.target}</span>}
+                                      </span>
+                                    )}
+                                    {isWuSavedRecently && (
+                                      <span className="text-[10px] font-mono text-emerald-300 inline-flex items-center gap-1">
+                                        <Check className="w-3 h-3" /> Saved
+                                      </span>
+                                    )}
+                                  </div>
+                                  {wu.notes && !isEditingWu && (
+                                    <p className="text-xs text-neutral-400 mt-0.5">{wu.notes}</p>
+                                  )}
+                                </div>
+                              </div>
+
+                              <div className="flex items-center gap-1 shrink-0">
+                                {hasMinutes && (
+                                  <div className="inline-flex items-center gap-1 mr-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => startOrToggleWarmupTimer(wu)}
+                                      className={`h-7 px-2 rounded-lg border text-[11px] font-mono tabular-nums font-bold inline-flex items-center gap-1 cursor-pointer ${
+                                        activeTimer?.finished
+                                          ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-200'
+                                          : activeTimer?.running
+                                          ? 'bg-amber-500/25 border-amber-400/60 text-amber-100'
+                                          : 'bg-white/5 hover:bg-white/10 border-white/10 text-amber-200'
+                                      }`}
+                                      title={activeTimer?.running ? 'Pause warm-up timer' : 'Start warm-up timer'}
+                                    >
+                                      {activeTimer?.running ? <Pause className="w-3 h-3" /> : <Timer className="w-3 h-3" />}
+                                      {activeTimer
+                                        ? activeTimer.finished
+                                          ? 'Done!'
+                                          : formatTimerClock(activeTimer.remainingSec)
+                                        : formatTimerClock(Math.round(configuredMins * 60))}
+                                    </button>
+                                    {activeTimer && (
+                                      <button
+                                        type="button"
+                                        onClick={() => resetWarmupTimer(wu)}
+                                        aria-label="Reset warm-up timer"
+                                        className="h-7 w-7 inline-flex items-center justify-center rounded-lg bg-white/5 hover:bg-white/10 text-neutral-400 hover:text-white cursor-pointer"
+                                        title="Reset warm-up timer"
+                                      >
+                                        <RotateCcw className="w-3 h-3" />
+                                      </button>
+                                    )}
+                                  </div>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => (isEditingWu ? setEditingWarmupId(null) : startEditWarmup(wu))}
+                                  aria-label={`Edit warm-up ${wu.name}`}
+                                  className="p-1.5 text-neutral-400 hover:text-amber-300 rounded-lg hover:bg-white/5 cursor-pointer"
+                                  title="Edit warm-up minutes & target sets"
+                                >
+                                  <Pencil className="w-3.5 h-3.5" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteWarmupExercise(plan, wu.id)}
+                                  aria-label={`Remove warm-up ${wu.name}`}
+                                  className="p-1.5 text-neutral-500 hover:text-red-400 rounded-lg hover:bg-red-500/10 cursor-pointer"
+                                  title="Remove warm-up exercise"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </div>
+
+                            {isEditingWu && editWarmupDraft && (
+                              <div className="rounded-xl border border-amber-500/30 bg-black/50 p-3 space-y-2 text-xs">
+                                <div className="grid grid-cols-1 sm:grid-cols-12 gap-2">
+                                  <label className="flex flex-col gap-1 sm:col-span-5">
+                                    <span className="text-[10px] uppercase text-neutral-400 font-semibold">Warm-up Movement</span>
+                                    <input
+                                      value={editWarmupDraft.name}
+                                      onChange={(e) => setEditWarmupDraft({ ...editWarmupDraft, name: e.target.value })}
+                                      className="bg-neutral-900 border border-white/15 rounded-lg px-2.5 py-1.5 text-white outline-none"
+                                    />
+                                  </label>
+                                  <label className="flex flex-col gap-1 sm:col-span-2">
+                                    <span className="text-[10px] uppercase text-neutral-400 font-semibold">Minutes</span>
+                                    <input
+                                      type="number"
+                                      min="0"
+                                      max="120"
+                                      value={editWarmupDraft.minutes}
+                                      onChange={(e) => setEditWarmupDraft({ ...editWarmupDraft, minutes: e.target.value })}
+                                      placeholder="5"
+                                      className="bg-neutral-900 border border-white/15 rounded-lg px-2.5 py-1.5 text-white font-mono tabular-nums outline-none"
+                                    />
+                                  </label>
+                                  <label className="flex flex-col gap-1 sm:col-span-2">
+                                    <span className="text-[10px] uppercase text-neutral-400 font-semibold">Target Sets</span>
+                                    <input
+                                      type="number"
+                                      min="1"
+                                      max="10"
+                                      value={editWarmupDraft.targetSets}
+                                      onChange={(e) => setEditWarmupDraft({ ...editWarmupDraft, targetSets: e.target.value })}
+                                      placeholder="2"
+                                      className="bg-neutral-900 border border-white/15 rounded-lg px-2.5 py-1.5 text-white font-mono tabular-nums outline-none"
+                                    />
+                                  </label>
+                                  <label className="flex flex-col gap-1 sm:col-span-3">
+                                    <span className="text-[10px] uppercase text-neutral-400 font-semibold">Reps / Pace</span>
+                                    <input
+                                      value={editWarmupDraft.target}
+                                      onChange={(e) => setEditWarmupDraft({ ...editWarmupDraft, target: e.target.value })}
+                                      placeholder="10-12 reps"
+                                      className="bg-neutral-900 border border-white/15 rounded-lg px-2.5 py-1.5 text-white font-mono outline-none"
+                                    />
+                                  </label>
+                                  <label className="flex flex-col gap-1 sm:col-span-12">
+                                    <span className="text-[10px] uppercase text-neutral-400 font-semibold">Notes</span>
+                                    <input
+                                      value={editWarmupDraft.notes}
+                                      onChange={(e) => setEditWarmupDraft({ ...editWarmupDraft, notes: e.target.value })}
+                                      className="bg-neutral-900 border border-white/15 rounded-lg px-2.5 py-1.5 text-neutral-200 outline-none"
+                                    />
+                                  </label>
+                                </div>
+                                <div className="flex items-center justify-end gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => { setEditingWarmupId(null); setEditWarmupDraft(null); }}
+                                    className="px-3 py-1 rounded-lg bg-neutral-800 text-neutral-300 text-xs font-semibold cursor-pointer"
+                                  >
+                                    Cancel
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => saveEditWarmup(plan, wu)}
+                                    className="px-3 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-black text-xs font-bold inline-flex items-center gap-1 cursor-pointer"
+                                  >
+                                    <Check className="w-3.5 h-3.5" /> Save Warm-up
+                                  </button>
+                                </div>
+                              </div>
+                            )}
+
+                            {/* Warm-up separate set logging rows */}
+                            <div className="rounded-lg border border-white/10 bg-neutral-950/70 p-2.5 space-y-2">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <span className="text-[10px] font-bold uppercase tracking-wider text-amber-300/90 font-mono tabular-nums">
+                                  Warm-up Sets ({wuSetEntries.length}{targetSetsNum ? ` / Target ${targetSetsNum}` : ''})
+                                </span>
+                                <div className="flex items-center gap-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => adjustWarmupSetCount(plan, selectedWeek, wu, -1)}
+                                    disabled={wuSetEntries.length <= 1}
+                                    aria-label="Remove warm-up set"
+                                    className="h-7 w-7 inline-flex items-center justify-center rounded-md bg-white/5 hover:bg-white/10 disabled:opacity-30 text-neutral-300 cursor-pointer"
+                                  >
+                                    <Minus className="w-3 h-3" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => adjustWarmupSetCount(plan, selectedWeek, wu, 1)}
+                                    aria-label="Add warm-up set"
+                                    className="h-7 w-7 inline-flex items-center justify-center rounded-md bg-white/5 hover:bg-white/10 text-neutral-300 cursor-pointer"
+                                  >
+                                    <Plus className="w-3 h-3" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => saveWarmupSets(plan, selectedWeek, wu)}
+                                    className="h-7 px-2 rounded-md bg-amber-500/20 hover:bg-amber-500/35 border border-amber-500/35 text-amber-200 text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer"
+                                  >
+                                    <Check className="w-3 h-3" /> Save
+                                  </button>
+                                </div>
+                              </div>
+
+                              <div className="grid grid-cols-[30px_minmax(0,1.35fr)_minmax(0,0.85fr)_minmax(0,0.75fr)] gap-1.5 sm:hidden text-[9px] uppercase tracking-wider text-neutral-500 font-mono px-0.5">
+                                <span className="text-center">Set</span><span>Weight</span><span>Reps</span><span>RPE</span>
+                              </div>
+
+                              <div className="space-y-1.5">
+                                {wuSetEntries.map((sRow, sIdx) => {
+                                  const sUnit: WeightUnit = sRow.unit || planUnit;
+                                  return (
+                                    <div
+                                      key={sIdx}
+                                      className="grid grid-cols-[30px_minmax(0,1.35fr)_minmax(0,0.85fr)_minmax(0,0.75fr)] sm:grid-cols-[60px_145px_110px_92px] items-center gap-1.5 sm:gap-2"
+                                    >
+                                      <span className="h-10 sm:h-auto flex items-center justify-center text-[11px] font-mono font-bold text-amber-300 bg-amber-500/10 border border-amber-500/25 rounded-lg sm:py-1">
+                                        <span className="sm:hidden">W{sIdx + 1}</span>
+                                        <span className="hidden sm:inline">Set {sIdx + 1}</span>
+                                      </span>
+                                      <div className="relative flex items-center min-w-0">
+                                        <span className="hidden sm:block absolute left-2 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">Wt</span>
+                                        <input
+                                          type="text"
+                                          inputMode="decimal"
+                                          value={sRow.weight}
+                                          onChange={(e) => updateWarmupSetField(plan, selectedWeek, wu, sIdx, 'weight', e.target.value)}
+                                          onBlur={() => saveWarmupSets(plan, selectedWeek, wu)}
+                                          placeholder="0"
+                                          aria-label={`Warm-up ${wu.name} Set ${sIdx + 1} Weight (${sUnit})`}
+                                          className="w-full min-w-0 h-10 sm:h-auto bg-neutral-900 border border-white/15 focus:border-amber-500/60 rounded-lg pl-2.5 pr-10 sm:pl-7 sm:pr-10 sm:py-1 text-sm sm:text-xs text-white font-mono outline-none"
+                                        />
+                                        <button
+                                          type="button"
+                                          onClick={() => updateWarmupSetField(plan, selectedWeek, wu, sIdx, 'unit', sUnit === 'kg' ? 'lbs' : 'kg')}
+                                          aria-label="Switch warm-up weight unit"
+                                          className="absolute right-1 h-7 sm:h-auto px-1 sm:py-0.5 rounded bg-white/10 text-[9px] font-bold uppercase text-neutral-200 cursor-pointer"
+                                        >
+                                          {sUnit}
+                                        </button>
+                                      </div>
+                                      <label className="relative flex items-center min-w-0">
+                                        <span className="hidden sm:block absolute left-2 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">Reps</span>
+                                        <input
+                                          type="text"
+                                          inputMode="numeric"
+                                          value={sRow.reps}
+                                          onChange={(e) => updateWarmupSetField(plan, selectedWeek, wu, sIdx, 'reps', e.target.value)}
+                                          onBlur={() => saveWarmupSets(plan, selectedWeek, wu)}
+                                          placeholder="0"
+                                          aria-label={`Warm-up ${wu.name} Set ${sIdx + 1} Reps`}
+                                          className="w-full min-w-0 h-10 sm:h-auto bg-neutral-900 border border-white/15 focus:border-amber-500/60 rounded-lg px-2.5 sm:pl-9 sm:pr-2 sm:py-1 text-sm sm:text-xs text-white font-mono outline-none"
+                                        />
+                                      </label>
+                                      <label className="relative flex items-center min-w-0">
+                                        <span className="hidden sm:block absolute left-2 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">RPE</span>
+                                        <input
+                                          type="text"
+                                          inputMode="decimal"
+                                          value={sRow.rpe || ''}
+                                          onChange={(e) => updateWarmupSetField(plan, selectedWeek, wu, sIdx, 'rpe', e.target.value)}
+                                          onBlur={() => saveWarmupSets(plan, selectedWeek, wu)}
+                                          placeholder="-"
+                                          aria-label={`Warm-up ${wu.name} Set ${sIdx + 1} RPE`}
+                                          className="w-full min-w-0 h-10 sm:h-auto bg-neutral-900 border border-white/15 focus:border-amber-500/60 rounded-lg px-2.5 sm:pl-8 sm:pr-2 sm:py-1 text-sm sm:text-xs text-white font-mono outline-none"
+                                        />
+                                      </label>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
+        {/* REST TIMER CONFIG BAR + ACTIVE COUNTDOWN STATUS */}
+        <div className="rounded-xl border border-white/10 bg-neutral-900/75 px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2.5">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="inline-flex items-center gap-1.5 text-[11px] uppercase tracking-wider font-bold text-neutral-300">
+              <Timer className="w-3.5 h-3.5 text-amber-400" />
+              Rest Timer
+            </span>
+            <div className="flex flex-wrap items-center gap-1">
+              {REST_TIMER_PRESETS.map(sec => {
+                const activePreset = defaultRestSeconds === sec;
+                return (
+                  <button
+                    key={sec}
+                    type="button"
+                    onClick={() => updateDefaultRestSeconds(sec)}
+                    className={`h-7 px-2 rounded-lg text-[11px] font-mono tabular-nums font-bold border transition-all cursor-pointer ${
+                      activePreset
+                        ? 'bg-amber-500/25 border-amber-400/60 text-amber-200'
+                        : 'bg-neutral-950 border-white/10 text-neutral-400 hover:text-white'
+                    }`}
+                  >
+                    {sec}s
+                  </button>
+                );
+              })}
+              <div className="flex items-center gap-1 ml-1">
+                <input
+                  type="number"
+                  min={10}
+                  max={600}
+                  step={5}
+                  value={customRestInput}
+                  onChange={(e) => {
+                    const raw = e.target.value;
+                    setCustomRestInput(raw);
+                    const n = parseInt(raw, 10);
+                    if (Number.isFinite(n) && n >= 10 && n <= 600) {
+                      setDefaultRestSeconds(n);
+                      saveStoredRestSeconds(currentUser, n);
+                    }
+                  }}
+                  onBlur={() => {
+                    const n = parseInt(customRestInput, 10);
+                    if (!Number.isFinite(n) || n < 10) {
+                      updateDefaultRestSeconds(defaultRestSeconds);
+                    } else {
+                      updateDefaultRestSeconds(n);
+                    }
+                  }}
+                  aria-label="Custom rest seconds"
+                  className="w-14 h-7 bg-neutral-950 border border-white/15 focus:border-amber-500/70 rounded-lg px-1.5 text-[11px] font-mono tabular-nums text-amber-200 text-center outline-none"
+                />
+                <span className="text-[10px] font-mono text-neutral-500">sec</span>
+              </div>
+            </div>
+          </div>
+
+          {setRestTimer && (
+            <div className="flex flex-wrap items-center gap-2 bg-black/50 border border-amber-500/35 rounded-xl px-2.5 py-1">
+              <span className="text-[11px] text-neutral-300 truncate max-w-[170px]">
+                {setRestTimer.exerciseName} · S{setRestTimer.setNumber}
+              </span>
+              <span
+                className={`text-xs font-mono tabular-nums font-black ${
+                  setRestTimer.finished
+                    ? 'text-emerald-300'
+                    : setRestTimer.running
+                    ? 'text-amber-300'
+                    : 'text-neutral-300'
+                }`}
+              >
+                {setRestTimer.finished ? 'READY' : formatTimerClock(setRestTimer.remainingSec)}
+              </span>
+              <button
+                type="button"
+                onClick={() => addSecondsToActiveRestTimer(15)}
+                className="h-6 px-1.5 rounded bg-white/10 hover:bg-white/20 text-[10px] font-mono text-neutral-200 cursor-pointer"
+                title="Add 15 seconds"
+              >
+                +15s
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (setRestTimer.finished) {
+                    setSetRestTimer(prev =>
+                      prev
+                        ? { ...prev, remainingSec: prev.totalSec, running: true, finished: false }
+                        : prev
+                    );
+                  } else {
+                    setSetRestTimer(prev => (prev ? { ...prev, running: !prev.running } : prev));
+                  }
+                }}
+                aria-label={setRestTimer.running ? 'Pause active rest timer' : 'Resume rest timer'}
+                className="h-6 w-6 inline-flex items-center justify-center rounded bg-amber-500/20 hover:bg-amber-500/35 text-amber-200 cursor-pointer"
+              >
+                {setRestTimer.running ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
+              </button>
+              <button
+                type="button"
+                onClick={stopSetRestTimer}
+                aria-label="Dismiss rest timer"
+                className="h-6 w-6 inline-flex items-center justify-center rounded bg-white/5 hover:bg-red-500/25 text-neutral-400 hover:text-red-300 cursor-pointer"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          )}
+        </div>
+
         {/* EXERCISES LIST */}
         <div className="space-y-3">
           {visibleExercises.map((ex, idx) => {
@@ -1750,8 +3767,12 @@ export const GymApp: React.FC<GymAppProps> = ({
             const videoInfo = getVideoThumbnailInfo(ex.videoUrl);
             const isSavedRecently = savedNoticeId === ex.id;
             const isEditingThis = editingExerciseId === ex.id && editDraft !== null;
+            const exDKey = draftKey(plan.id, selectedWeek, ex.id);
+            const isCelebrating = justCompletedExKey === exDKey;
 
-            const cardClasses = checked
+            const cardClasses = isCelebrating
+              ? 'border-emerald-400/70 bg-emerald-950/30 ring-2 ring-emerald-500/35 animate-exercise-complete'
+              : checked
               ? isSuperset
                 ? 'border-fuchsia-400/60 border-l-4 border-l-fuchsia-400 bg-fuchsia-950/35'
                 : 'border-red-500/40 bg-red-950/20'
@@ -1766,12 +3787,26 @@ export const GymApp: React.FC<GymAppProps> = ({
                   <div className="flex items-start gap-3 flex-1 min-w-0 w-full">
                     <button
                       onClick={() => toggleExercise(plan, selectedWeek - 1, ex.id)}
-                      className={`mt-0.5 shrink-0 hover:scale-110 transition-transform cursor-pointer ${
-                        isSuperset ? 'text-fuchsia-400' : 'text-red-500'
+                      className={`relative mt-0.5 shrink-0 hover:scale-110 transition-transform cursor-pointer ${
+                        isCelebrating
+                          ? 'text-emerald-400'
+                          : isSuperset
+                          ? 'text-fuchsia-400'
+                          : 'text-red-500'
                       }`}
                       title={checked ? 'Mark as not done' : 'Mark as done'}
                     >
-                      {checked ? <CheckCircle2 className="w-6 h-6" /> : <Circle className="w-6 h-6 text-neutral-600" />}
+                      {isCelebrating && (
+                        <span
+                          aria-hidden="true"
+                          className="absolute inset-0 rounded-full border-2 border-emerald-400 animate-check-ring pointer-events-none"
+                        />
+                      )}
+                      {checked ? (
+                        <CheckCircle2 className={`w-6 h-6 ${isCelebrating ? 'animate-check-pop text-emerald-400' : ''}`} />
+                      ) : (
+                        <Circle className="w-6 h-6 text-neutral-600" />
+                      )}
                     </button>
 
                     <div className="min-w-0 flex-1 space-y-3">
@@ -1794,6 +3829,11 @@ export const GymApp: React.FC<GymAppProps> = ({
                         {(setsDisplay || repsDisplay) && (
                           <span className="text-[11px] text-neutral-200 font-mono bg-white/5 border border-white/10 px-2 py-0.5 rounded-md">
                             Target: {[setsDisplay && `${setsDisplay} sets`, repsDisplay && `${repsDisplay} reps`].filter(Boolean).join(' × ')}
+                          </span>
+                        )}
+                        {ex.targetRpe && (
+                          <span className="text-[11px] text-amber-200 font-mono font-semibold bg-amber-500/15 border border-amber-500/30 px-2 py-0.5 rounded-md">
+                            Target RPE: {ex.targetRpe}
                           </span>
                         )}
                         {videoInfo && (
@@ -1819,6 +3859,14 @@ export const GymApp: React.FC<GymAppProps> = ({
                           </span>
                         )}
                       </div>
+
+                      {isCelebrating && justCompletedMotivation && (
+                        <div className="-ml-9 sm:ml-0 flex items-center gap-2 rounded-xl border border-emerald-500/40 bg-emerald-500/15 px-3 py-1.5 text-xs text-emerald-100 animate-motivation-slide">
+                          <Trophy className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                          <span className="font-bold text-emerald-300">Exercise Done!</span>
+                          <span className="text-emerald-100/90">{justCompletedMotivation}</span>
+                        </div>
+                      )}
 
                       {ex.notes && !isEditingThis && (
                         <p className="text-[12px] text-neutral-400 leading-relaxed">{ex.notes}</p>
@@ -1871,7 +3919,16 @@ export const GymApp: React.FC<GymAppProps> = ({
                                 className="bg-neutral-900 border border-white/15 rounded-lg px-2.5 py-1.5 text-white font-mono outline-none"
                               />
                             </label>
-                            <label className="flex flex-col gap-1 sm:col-span-2">
+                            <label className="flex flex-col gap-1">
+                              <span className="text-[10px] uppercase text-neutral-400 font-semibold">Target RPE (from sheet / goal)</span>
+                              <input
+                                value={editDraft.targetRpe}
+                                onChange={(e) => setEditDraft({ ...editDraft, targetRpe: e.target.value })}
+                                placeholder="e.g. 8 or 7.5-8.5"
+                                className="bg-neutral-900 border border-white/15 rounded-lg px-2.5 py-1.5 text-amber-200 font-mono outline-none"
+                              />
+                            </label>
+                            <label className="flex flex-col gap-1">
                               <span className="text-[10px] uppercase text-neutral-400 font-semibold">Video URL</span>
                               <input
                                 value={editDraft.videoUrl}
@@ -1934,26 +3991,7 @@ export const GymApp: React.FC<GymAppProps> = ({
                         </div>
                       )}
 
-                      {/* PREVIOUS SESSION REFERENCE (READ-ONLY) */}
-                      {prevWeekData && (
-                        <div className="-ml-9 sm:ml-0 flex flex-wrap items-center gap-2 bg-indigo-500/10 border border-indigo-500/25 rounded-xl px-3 py-1.5 text-[11px]">
-                          <span className="inline-flex items-center gap-1 text-indigo-300 font-semibold">
-                            <History className="w-3.5 h-3.5 text-indigo-400" />
-                            Previous ({prevWeekData.sourceLabel}):
-                          </span>
-                          <span className="font-mono text-neutral-200 flex flex-wrap gap-2">
-                            {prevWeekData.setEntries
-                              .filter(s => s.weight || s.reps)
-                              .map(s => (
-                                <span key={s.setNumber} className="bg-black/30 px-1.5 py-0.5 rounded">
-                                  S{s.setNumber}: {s.weight ? `${s.weight} ${s.unit || planUnit}` : '—'} × {s.reps || '—'}
-                                </span>
-                              ))}
-                          </span>
-                        </div>
-                      )}
-
-                      {/* SETS TABLE */}
+                      {/* SETS TABLE (Weight + Reps + RPE + Per-Set Rest Timer) */}
                       <div className={`-ml-9 sm:ml-0 rounded-xl border p-3 space-y-2 ${isSuperset ? 'border-fuchsia-500/30 bg-black/45' : 'border-white/10 bg-neutral-950/60'}`}>
                         <div className="flex flex-wrap items-center justify-between gap-2">
                           <span className="text-[11px] font-bold uppercase tracking-wider text-neutral-400">
@@ -1992,18 +4030,23 @@ export const GymApp: React.FC<GymAppProps> = ({
                         </div>
 
                         {/* column labels, phones only */}
-                        <div className="grid grid-cols-[34px_minmax(0,1.4fr)_minmax(0,1fr)] gap-2 sm:hidden text-[9px] uppercase tracking-wider text-neutral-500 font-mono px-0.5">
-                          <span className="text-center">Set</span><span>Weight</span><span>Reps</span>
+                        <div className="grid grid-cols-[26px_minmax(0,1.35fr)_minmax(0,0.8fr)_minmax(0,0.7fr)_auto] gap-1 sm:hidden text-[9px] uppercase tracking-wider text-neutral-500 font-mono px-0.5">
+                          <span className="text-center">Set</span><span>Weight</span><span>Reps</span><span>RPE</span><span className="text-center">Rest</span>
                         </div>
 
                         <div className="space-y-1.5">
                           {setEntries.map((setRow, sIdx) => {
                             const prevForThisSet = prevWeekData?.setEntries[sIdx];
                             const setUnit: WeightUnit = setRow.unit || planUnit;
+                            const setTimerKey = `${plan.id}__w${selectedWeek}__${ex.id}__s${sIdx}`;
+                            const isThisTimer = setRestTimer?.timerKey === setTimerKey;
+                            const isTimerRunning = isThisTimer && !!setRestTimer?.running;
+                            const isTimerDone = isThisTimer && !!setRestTimer?.finished;
+
                             return (
                               <div
                                 key={sIdx}
-                                className="grid grid-cols-[34px_minmax(0,1.4fr)_minmax(0,1fr)] sm:grid-cols-[68px_170px_135px_auto] items-center gap-2"
+                                className="grid grid-cols-[26px_minmax(0,1.35fr)_minmax(0,0.8fr)_minmax(0,0.7fr)_auto] sm:grid-cols-[64px_150px_115px_96px_auto] items-center gap-1 sm:gap-2"
                               >
                                 <span
                                   className={`h-11 sm:h-auto flex items-center justify-center text-[11px] font-mono font-bold border rounded-lg sm:py-1.5 ${
@@ -2025,9 +4068,15 @@ export const GymApp: React.FC<GymAppProps> = ({
                                     value={setRow.weight}
                                     onChange={(e) => updateSetField(plan, selectedWeek, ex, sIdx, 'weight', e.target.value)}
                                     onBlur={() => saveExerciseSets(plan, selectedWeek, ex)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') {
+                                        e.preventDefault();
+                                        (e.currentTarget as HTMLInputElement).blur();
+                                      }
+                                    }}
                                     placeholder={prevForThisSet?.weight || '0'}
                                     aria-label={`Set ${sIdx + 1} Weight (${setUnit})`}
-                                    className="w-full min-w-0 h-11 sm:h-auto bg-neutral-900 border border-white/15 focus:border-red-500/70 rounded-lg pl-3 pr-12 sm:pl-8 sm:pr-11 sm:py-1.5 text-base sm:text-xs text-white font-mono outline-none"
+                                    className="w-full min-w-0 h-11 sm:h-auto bg-neutral-900 border border-white/15 focus:border-red-500/70 rounded-lg pl-2 pr-10 sm:pl-8 sm:pr-11 sm:py-1.5 text-base sm:text-xs text-white font-mono outline-none"
                                   />
                                   <button
                                     type="button"
@@ -2041,29 +4090,173 @@ export const GymApp: React.FC<GymAppProps> = ({
 
                                 {/* Reps */}
                                 <label className="relative flex items-center min-w-0">
-                                  <span className="hidden sm:block absolute left-2.5 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">Reps</span>
+                                  <span className="hidden sm:block absolute left-2 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">Reps</span>
                                   <input
                                     type="text"
                                     inputMode="numeric"
                                     value={setRow.reps}
                                     onChange={(e) => updateSetField(plan, selectedWeek, ex, sIdx, 'reps', e.target.value)}
                                     onBlur={() => saveExerciseSets(plan, selectedWeek, ex)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') {
+                                        e.preventDefault();
+                                        (e.currentTarget as HTMLInputElement).blur();
+                                      }
+                                    }}
                                     placeholder={prevForThisSet?.reps || '0'}
                                     aria-label={`Set ${sIdx + 1} Reps`}
-                                    className="w-full min-w-0 h-11 sm:h-auto bg-neutral-900 border border-white/15 focus:border-red-500/70 rounded-lg px-3 sm:pl-10 sm:pr-2.5 sm:py-1.5 text-base sm:text-xs text-white font-mono outline-none"
+                                    className="w-full min-w-0 h-11 sm:h-auto bg-neutral-900 border border-white/15 focus:border-red-500/70 rounded-lg px-2 sm:pl-9 sm:pr-2 sm:py-1.5 text-base sm:text-xs text-white font-mono outline-none"
                                   />
                                 </label>
 
-                                {prevForThisSet && (prevForThisSet.weight || prevForThisSet.reps) && (
-                                  <span className="hidden sm:inline text-[10px] font-mono text-indigo-300/80 truncate">
-                                    Prev: {prevForThisSet.weight ? `${prevForThisSet.weight} ${prevForThisSet.unit || planUnit}` : '—'} × {prevForThisSet.reps || '—'}
-                                  </span>
-                                )}
+                                {/* RPE */}
+                                <label className="relative flex items-center min-w-0">
+                                  <span className="hidden sm:block absolute left-2 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">RPE</span>
+                                  <input
+                                    type="text"
+                                    inputMode="decimal"
+                                    value={setRow.rpe || ''}
+                                    onChange={(e) => updateSetField(plan, selectedWeek, ex, sIdx, 'rpe', e.target.value)}
+                                    onBlur={() => saveExerciseSets(plan, selectedWeek, ex)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') {
+                                        e.preventDefault();
+                                        (e.currentTarget as HTMLInputElement).blur();
+                                      }
+                                    }}
+                                    placeholder={ex.targetRpe || prevForThisSet?.rpe || 'RPE'}
+                                    aria-label={`Set ${sIdx + 1} RPE`}
+                                    className="w-full min-w-0 h-11 sm:h-auto bg-neutral-900 border border-white/15 focus:border-amber-500/70 rounded-lg px-1.5 sm:pl-8 sm:pr-2 sm:py-1.5 text-base sm:text-xs text-amber-200 font-mono outline-none"
+                                  />
+                                </label>
+
+                                {/* User-Controlled Per-Set Rest Timer */}
+                                <div className="flex items-center gap-1 justify-end shrink-0">
+                                  <button
+                                    type="button"
+                                    onClick={() => startOrToggleSetRestTimer(setTimerKey, ex, sIdx + 1)}
+                                    aria-label={
+                                      isThisTimer
+                                        ? isTimerRunning
+                                          ? `Pause rest timer (${formatTimerClock(setRestTimer.remainingSec)})`
+                                          : isTimerDone
+                                          ? `Restart ${defaultRestSeconds}s rest timer`
+                                          : `Resume rest timer`
+                                        : `Start ${defaultRestSeconds}s rest timer for Set ${sIdx + 1}`
+                                    }
+                                    title={
+                                      isThisTimer
+                                        ? isTimerRunning
+                                          ? 'Pause rest timer'
+                                          : 'Resume / Restart rest timer'
+                                        : `Start ${defaultRestSeconds}s rest timer`
+                                    }
+                                    className={`h-11 sm:h-auto sm:py-1.5 px-2 sm:px-2.5 rounded-lg border text-[11px] font-mono tabular-nums font-bold inline-flex items-center justify-center gap-1 transition-all cursor-pointer whitespace-nowrap ${
+                                      isTimerDone
+                                        ? 'bg-emerald-500/20 border-emerald-400/60 text-emerald-200'
+                                        : isTimerRunning
+                                        ? 'bg-amber-500/25 border-amber-400/60 text-amber-200'
+                                        : isThisTimer
+                                        ? 'bg-amber-500/15 border-amber-500/35 text-amber-300'
+                                        : 'bg-white/5 hover:bg-amber-500/15 border-white/10 hover:border-amber-400/40 text-neutral-300 hover:text-amber-200'
+                                    }`}
+                                  >
+                                    {isTimerRunning ? (
+                                      <Pause className="w-3 h-3 shrink-0" />
+                                    ) : isThisTimer && !isTimerDone ? (
+                                      <Play className="w-3 h-3 shrink-0" />
+                                    ) : (
+                                      <Timer className="w-3.5 h-3.5 shrink-0" />
+                                    )}
+                                    {isThisTimer ? (
+                                      <span>{isTimerDone ? 'Done!' : formatTimerClock(setRestTimer.remainingSec)}</span>
+                                    ) : (
+                                      <>
+                                        <span className="hidden sm:inline">Rest {defaultRestSeconds}s</span>
+                                        <span className="sm:hidden text-[10px]">{defaultRestSeconds}s</span>
+                                      </>
+                                    )}
+                                  </button>
+
+                                  {isThisTimer && (
+                                    <button
+                                      type="button"
+                                      onClick={stopSetRestTimer}
+                                      aria-label={`Reset Set ${sIdx + 1} rest timer`}
+                                      title="Reset / Stop rest timer"
+                                      className="h-11 sm:h-7 w-7 inline-flex items-center justify-center rounded-lg bg-white/5 hover:bg-red-500/20 border border-white/10 text-neutral-400 hover:text-red-300 cursor-pointer shrink-0"
+                                    >
+                                      <RotateCcw className="w-3 h-3" />
+                                    </button>
+                                  )}
+                                </div>
                               </div>
                             );
                           })}
                         </div>
                       </div>
+
+                      {/* PER-EXERCISE WEEK NOTE CHECKITEM (DISABLED BY DEFAULT UNTIL ENABLED) */}
+                      {(() => {
+                        const noteEnabled = isExerciseNoteEnabled(plan, selectedWeek, ex.id);
+                        const exNoteVal = getCurrentExerciseWeekNote(plan, selectedWeek, ex.id);
+                        const savedExNote = (plan.exerciseLogs?.[weekKey(selectedWeek - 1)]?.[ex.id]?.notes || '').trim();
+                        const hasUnsavedExNote =
+                          draftKey(plan.id, selectedWeek, ex.id) in exerciseNoteDrafts &&
+                          exNoteVal.trim() !== savedExNote;
+                        const isExNoteSaved = savedNoticeId === `exnote_${ex.id}`;
+
+                        return (
+                          <div className="-ml-9 sm:ml-0 rounded-xl border border-white/10 bg-neutral-950/50 px-3 py-2 space-y-2">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <label className="inline-flex items-center gap-2 cursor-pointer select-none">
+                                <input
+                                  type="checkbox"
+                                  checked={noteEnabled}
+                                  onChange={(e) => toggleExerciseWeekNote(plan, selectedWeek, ex, e.target.checked)}
+                                  className="w-4 h-4 rounded accent-red-500 cursor-pointer"
+                                />
+                                <span className="text-xs font-semibold text-neutral-300">
+                                  Note (Week {selectedWeek})
+                                </span>
+                              </label>
+
+                              {noteEnabled && (
+                                <div className="flex items-center gap-2">
+                                  {isExNoteSaved && (
+                                    <span className="text-[10px] font-mono text-emerald-300 inline-flex items-center gap-1">
+                                      <Check className="w-3 h-3" /> Saved
+                                    </span>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={() => saveExerciseWeekNote(plan, selectedWeek, ex)}
+                                    className={`h-7 px-2.5 rounded-lg text-[11px] font-semibold border inline-flex items-center gap-1 cursor-pointer ${
+                                      hasUnsavedExNote
+                                        ? 'bg-red-600/80 hover:bg-red-500 border-red-400 text-white'
+                                        : 'bg-white/5 hover:bg-white/10 border-white/15 text-neutral-200'
+                                    }`}
+                                  >
+                                    <Check className="w-3 h-3" /> Save Note
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+
+                            {noteEnabled && (
+                              <textarea
+                                rows={2}
+                                value={exNoteVal}
+                                onChange={(e) => updateExerciseWeekNoteDraft(plan, selectedWeek, ex.id, e.target.value)}
+                                onBlur={() => saveExerciseWeekNote(plan, selectedWeek, ex)}
+                                placeholder={`Write a Week ${selectedWeek} note for ${ex.name} (tempo, soreness, form cue, weight adjustment)...`}
+                                aria-label={`${ex.name} Week ${selectedWeek} Note`}
+                                className="w-full bg-neutral-900 border border-white/15 focus:border-red-500/60 rounded-lg px-3 py-2 text-xs text-white placeholder:text-neutral-500 outline-none resize-y leading-relaxed"
+                              />
+                            )}
+                          </div>
+                        );
+                      })()}
 
                       {/* WEEKLY HISTORY */}
                       {weeklyHistory.length > 0 && (
@@ -2076,20 +4269,28 @@ export const GymApp: React.FC<GymAppProps> = ({
                             {weeklyHistory.map((rec, rIdx) => (
                               <div
                                 key={`${rec.weekLabel}-${rIdx}`}
-                                className="flex flex-wrap items-center gap-2 text-[11px] bg-black/30 border border-white/5 rounded-lg px-2.5 py-1.5"
+                                className="flex flex-col gap-1 text-[11px] bg-black/30 border border-white/5 rounded-lg px-2.5 py-1.5"
                               >
-                                <span className="font-bold text-indigo-200 min-w-[68px]">{rec.weekLabel}</span>
-                                <div className="flex flex-wrap gap-1.5 flex-1">
-                                  {rec.setEntries.map((s) => (
-                                    <span
-                                      key={s.setNumber}
-                                      className="font-mono text-[10px] px-2 py-0.5 rounded bg-neutral-900 border border-white/10 text-neutral-200"
-                                    >
-                                      <span className="text-red-300 font-semibold">S{s.setNumber}:</span>{' '}
-                                      {s.weight ? `${s.weight} ${s.unit || planUnit}` : '—'} × {s.reps || '—'}
-                                    </span>
-                                  ))}
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="font-bold text-indigo-200 min-w-[68px]">{rec.weekLabel}</span>
+                                  <div className="flex flex-wrap gap-1.5 flex-1">
+                                    {rec.setEntries.map((s) => (
+                                      <span
+                                        key={s.setNumber}
+                                        className="font-mono text-[10px] px-2 py-0.5 rounded bg-neutral-900 border border-white/10 text-neutral-200"
+                                      >
+                                        <span className="text-red-300 font-semibold">S{s.setNumber}:</span>{' '}
+                                        {s.weight ? `${s.weight} ${s.unit || planUnit}` : '—'} × {s.reps || '—'}
+                                        {s.rpe ? <span className="text-amber-300"> · RPE {s.rpe}</span> : null}
+                                      </span>
+                                    ))}
+                                  </div>
                                 </div>
+                                {rec.note && (
+                                  <p className="text-[11px] text-neutral-300 pl-[76px] italic">
+                                    Note: {rec.note}
+                                  </p>
+                                )}
                               </div>
                             ))}
                           </div>
@@ -2241,6 +4442,91 @@ export const GymApp: React.FC<GymAppProps> = ({
           {visibleExercises.length === 0 && (
             <p className="text-sm text-neutral-500 text-center py-6">No exercises in this filter yet.</p>
           )}
+
+          {/* SESSION NOTES (CHECKITEM DISABLED BY DEFAULT UNTIL ENABLED, SAVED UNDER plan.exerciseLogs FOR CURRENT WEEK & DAY) */}
+          {(() => {
+            const wKey = weekKey(selectedWeek - 1);
+            const noteKey = getSessionNoteKey(selectedDayFilter);
+            const sessionNoteValue = getCurrentSessionNote(plan, selectedWeek, selectedDayFilter);
+            const savedEntry = plan.exerciseLogs?.[wKey]?.[noteKey];
+            const savedBadgeKey = `session_note_${plan.id}_${wKey}_${noteKey}`;
+            const isNoteSavedRecently = savedNoticeId === savedBadgeKey;
+            const sessionEnabled = isSessionNoteEnabled(plan, selectedWeek, selectedDayFilter);
+            const scopeLabel =
+              selectedDayFilter === 'ALL'
+                ? activePlanDays.length > 1
+                  ? 'All Days'
+                  : activePlanDays[0] || 'Full Session'
+                : selectedDayFilter;
+            const hasUnsavedChanges =
+              sessionNoteDraftKey(plan.id, selectedWeek, selectedDayFilter) in sessionNoteDrafts &&
+              sessionNoteValue.trim() !== (savedEntry?.notes || '').trim();
+
+            return (
+              <div className="rounded-2xl border border-white/10 bg-neutral-900/70 p-4 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <label className="flex items-center gap-2.5 min-w-0 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={sessionEnabled}
+                      onChange={(e) => toggleSessionNoteEnabled(plan, selectedWeek, selectedDayFilter, e.target.checked)}
+                      className="w-4 h-4 rounded accent-red-500 cursor-pointer shrink-0"
+                    />
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <FileText className="w-4 h-4 text-red-500 shrink-0" />
+                        <h3 className="text-sm font-bold text-white">Session Notes</h3>
+                      </div>
+                      <p className="text-xs text-neutral-400 mt-0.5">
+                        Week {selectedWeek} <span aria-hidden="true">·</span> {scopeLabel}
+                        {savedEntry?.updatedAt && (
+                          <>
+                            {' '}
+                            <span aria-hidden="true">·</span> Updated{' '}
+                            {new Date(savedEntry.updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </>
+                        )}
+                      </p>
+                    </div>
+                  </label>
+
+                  {sessionEnabled && (
+                    <div className="flex items-center gap-2 shrink-0">
+                      {isNoteSavedRecently && (
+                        <span className="text-[11px] font-mono text-emerald-300 inline-flex items-center gap-1">
+                          <Check className="w-3.5 h-3.5" /> Saved
+                        </span>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => saveSessionNotes(plan, selectedWeek, selectedDayFilter)}
+                        className={`h-9 px-3.5 rounded-xl text-xs font-bold border inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
+                          hasUnsavedChanges
+                            ? 'bg-red-600 hover:bg-red-500 border-red-400 text-white shadow-sm'
+                            : 'bg-white/5 hover:bg-white/10 border-white/15 text-neutral-200'
+                        }`}
+                      >
+                        <Check className="w-3.5 h-3.5" />
+                        Save Notes
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {sessionEnabled && (
+                  <textarea
+                    rows={3}
+                    value={sessionNoteValue}
+                    onChange={(e) => updateSessionNoteDraft(plan, selectedWeek, selectedDayFilter, e.target.value)}
+                    onBlur={() => saveSessionNotes(plan, selectedWeek, selectedDayFilter)}
+                    placeholder={`How did your Week ${selectedWeek} (${scopeLabel}) workout feel? Note energy levels, PRs, fatigue, or adjustments for next week...`}
+                    aria-label={`Session Notes for Week ${selectedWeek} ${scopeLabel}`}
+                    className="w-full bg-neutral-950 border border-white/15 focus:border-red-500/60 rounded-xl px-3.5 py-2.5 text-sm text-white placeholder:text-neutral-500 outline-none resize-y leading-relaxed"
+                  />
+                )}
+              </div>
+            );
+          })()}
         </div>
       </div>
     );
@@ -2248,9 +4534,11 @@ export const GymApp: React.FC<GymAppProps> = ({
 
   const renderDashboard = () => (
     <div className="space-y-5">
-      <div className="rounded-2xl border border-red-500/20 bg-gradient-to-r from-red-950/50 via-neutral-900 to-neutral-900 p-5 sm:p-6 relative overflow-hidden">
-        <div className="absolute -right-8 -top-8 w-40 h-40 bg-red-600/20 rounded-full blur-3xl pointer-events-none" />
-        <div className="relative flex flex-wrap items-center justify-between gap-3">
+      <div className="rounded-2xl border border-red-500/20 bg-gradient-to-r from-red-950/50 via-neutral-900 to-neutral-900 p-5 sm:p-6 relative z-20">
+        <div className="absolute inset-0 rounded-2xl overflow-hidden pointer-events-none">
+          <div className="absolute -right-8 -top-8 w-40 h-40 bg-red-600/20 rounded-full blur-3xl" />
+        </div>
+        <div className="relative z-10 flex flex-wrap items-center justify-between gap-3">
           <div>
             <span className="text-[11px] uppercase tracking-[0.2em] text-red-400 font-bold">Training Dashboard</span>
             <h1 className="text-2xl sm:text-3xl font-black text-white mt-1 flex items-center gap-2">
@@ -2277,20 +4565,138 @@ export const GymApp: React.FC<GymAppProps> = ({
             {activePlan && (
               <div className="flex flex-wrap items-center gap-2">
                 {exportNotice && (
-                  <span className="text-[11px] font-mono text-emerald-300 bg-emerald-500/15 border border-emerald-500/30 rounded-lg px-2.5 py-1 inline-flex items-center gap-1">
-                    <Check className="w-3 h-3" /> {exportNotice}
+                  <span className="text-[11px] font-mono text-emerald-300 inline-flex items-center gap-1">
+                    <Check className="w-3.5 h-3.5" /> {exportNotice}
                   </span>
                 )}
-                <button
-                  type="button"
-                  onClick={() => handleExportPlanPdf(activePlan)}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-gradient-to-r from-red-600 to-red-500 hover:from-red-500 hover:to-red-400 text-white text-xs font-bold shadow-lg shadow-red-950/50 transition-all cursor-pointer"
-                  title={`Export ${activePlan.title} PDF summary with progress & weekly history`}
-                >
-                  <Download className="w-3.5 h-3.5" /> Export PDF
-                </button>
+                {renderExportControl(activePlan, 'dashboard', 'hero')}
               </div>
             )}
+          </div>
+        </div>
+      </div>
+
+      {/* WORKOUT HYDRATION / WATER INTAKE TRACKER + TELEGRAM WATER ALERTS */}
+      <div className="rounded-2xl border border-white/10 bg-neutral-900/70 p-4 sm:p-5 space-y-3">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="flex items-start gap-3 min-w-0">
+            <div className="p-2.5 rounded-xl bg-sky-500/15 border border-sky-500/25 text-sky-400 shrink-0">
+              <Droplets className="w-5 h-5" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h2 className="text-sm font-bold text-white">Water Intake</h2>
+                <span className="text-xs text-neutral-400">
+                  Today <span aria-hidden="true">·</span> {waterGlasses >= WATER_DAILY_GOAL ? 'Daily goal reached' : `Goal: ${WATER_DAILY_GOAL} glasses`}
+                </span>
+              </div>
+              <div className="mt-2 flex items-center gap-3">
+                <div className="h-2 w-40 sm:w-56 rounded-full bg-neutral-800 overflow-hidden">
+                  <div
+                    className={`h-full transition-all duration-200 ${
+                      waterGlasses >= WATER_DAILY_GOAL ? 'bg-emerald-500' : 'bg-sky-500'
+                    }`}
+                    style={{ width: `${Math.min(100, Math.round((waterGlasses / WATER_DAILY_GOAL) * 100))}%` }}
+                  />
+                </div>
+                <span className="text-xs font-mono tabular-nums text-sky-300 font-semibold">
+                  {waterGlasses} / {WATER_DAILY_GOAL} glasses
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2.5 self-start sm:self-center shrink-0">
+            <button
+              type="button"
+              onClick={() => adjustWaterGlasses(-1)}
+              disabled={waterGlasses <= 0}
+              aria-label="Decrease water glasses"
+              className="h-10 w-10 inline-flex items-center justify-center rounded-xl bg-neutral-950 hover:bg-neutral-800 disabled:opacity-35 border border-white/15 text-neutral-200 cursor-pointer transition-colors"
+            >
+              <Minus className="w-4 h-4" />
+            </button>
+
+            <div
+              className="min-w-[74px] h-10 px-3 rounded-xl bg-neutral-950 border border-sky-500/30 flex items-center justify-center gap-1.5 font-mono tabular-nums"
+              aria-live="polite"
+            >
+              <span className="text-lg font-black text-white">{waterGlasses}</span>
+              <span className="text-[11px] text-neutral-400">{waterGlasses === 1 ? 'glass' : 'glasses'}</span>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => adjustWaterGlasses(1)}
+              disabled={waterGlasses >= 40}
+              aria-label="Increase water glasses"
+              className="h-10 w-10 inline-flex items-center justify-center rounded-xl bg-sky-600 hover:bg-sky-500 disabled:opacity-35 border border-sky-400/50 text-white cursor-pointer transition-colors shadow"
+            >
+              <Plus className="w-4 h-4" />
+            </button>
+
+            {waterGlasses > 0 && (
+              <button
+                type="button"
+                onClick={resetWaterGlasses}
+                aria-label="Reset water intake counter"
+                title="Reset today's water count"
+                className="h-10 px-2.5 inline-flex items-center justify-center gap-1 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-semibold text-neutral-400 hover:text-white cursor-pointer transition-colors"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Reset</span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Telegram Water Intake Alert Controls */}
+        <div className="pt-2.5 border-t border-white/10 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => saveWaterReminderPrefs(!waterReminderEnabled, waterReminderIntervalMinutes)}
+              className={`h-8 px-2.5 rounded-lg border text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors ${
+                waterReminderEnabled
+                  ? 'bg-sky-500/20 border-sky-400/50 text-sky-200'
+                  : 'bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300'
+              }`}
+            >
+              <Bell className="w-3.5 h-3.5 text-sky-400" />
+              <span>Bot Water Reminder: {waterReminderEnabled ? 'ON' : 'OFF'}</span>
+            </button>
+
+            {waterReminderEnabled && (
+              <select
+                value={waterReminderIntervalMinutes}
+                onChange={(e) => saveWaterReminderPrefs(true, Number(e.target.value))}
+                aria-label="Water intake Telegram reminder interval"
+                className="h-8 rounded-lg bg-neutral-950 border border-white/15 px-2 text-xs font-mono text-sky-200 outline-none cursor-pointer"
+              >
+                <option value={30}>Every 30m</option>
+                <option value={45}>Every 45m</option>
+                <option value={60}>Every 60m</option>
+                <option value={90}>Every 90m</option>
+              </select>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2">
+            {waterAlertNotice && (
+              <span className={`text-[11px] font-mono ${waterAlertNotice.type === 'success' ? 'text-emerald-300' : 'text-rose-300'}`}>
+                {waterAlertNotice.text}
+              </span>
+            )}
+            <button
+              type="button"
+              disabled={isSendingWaterAlert}
+              onClick={() => dispatchWaterTelegramAlert(true)}
+              className="h-8 px-3 rounded-lg bg-sky-600/20 hover:bg-sky-600/35 disabled:opacity-50 border border-sky-500/35 text-sky-200 text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+              title="Send your water intake progress & hydration reminder to your Telegram bot chat"
+            >
+              {isSendingWaterAlert ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+              <span>Send Alert to Bot</span>
+            </button>
           </div>
         </div>
       </div>
@@ -2382,15 +4788,7 @@ export const GymApp: React.FC<GymAppProps> = ({
               </div>
             </div>
             <div className="flex items-center gap-2">
-              {activePlan && (
-                <button
-                  type="button"
-                  onClick={() => handleExportPlanPdf(activePlan)}
-                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-semibold text-neutral-200 cursor-pointer"
-                >
-                  <Download className="w-3.5 h-3.5 text-red-400" /> Export Active PDF
-                </button>
-              )}
+              {activePlan && renderExportControl(activePlan, 'profile', 'profile')}
               <button
                 type="button"
                 onClick={onLogout}
@@ -2610,13 +5008,34 @@ export const GymApp: React.FC<GymAppProps> = ({
                 </div>
               </div>
               <span className={`text-[10px] font-mono px-2 py-0.5 rounded-full border ${
-                isBotTokenReady
+                memberWhitelistStatus === 'active'
                   ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
-                  : 'bg-neutral-800 border-white/10 text-neutral-400'
+                  : memberWhitelistStatus === 'paused'
+                    ? 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+                    : 'bg-amber-500/10 border-amber-500/30 text-amber-300'
               }`}>
-                {isBotTokenReady ? 'Bot Online' : 'Bot Unconfigured'}
+                {memberWhitelistStatus === 'active'
+                  ? 'Whitelisted 🟢'
+                  : memberWhitelistStatus === 'paused'
+                    ? 'Paused by Admin ⏸️'
+                    : 'Awaiting Admin Whitelist 🔒'}
               </span>
             </div>
+
+            {memberWhitelistStatus !== 'active' && (
+              <div className={`p-3 rounded-xl text-[11px] flex items-start gap-2 border ${
+                memberWhitelistStatus === 'paused'
+                  ? 'bg-rose-500/10 border-rose-500/25 text-rose-200'
+                  : 'bg-amber-500/10 border-amber-500/25 text-amber-200'
+              }`}>
+                <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>
+                  {memberWhitelistStatus === 'paused'
+                    ? 'Your Telegram bot access is currently paused by the Admin. Contact your Coach/Admin to re-enable bot access.'
+                    : 'Only users added to the Admin Panel Telegram Whitelist can query workout data from the Telegram bot. Save your @username here and ask your Admin to approve it.'}
+                </span>
+              </div>
+            )}
 
             {telegramFeedback && (
               <div className={`p-3 rounded-xl text-xs flex items-center gap-2 border ${
@@ -2769,7 +5188,7 @@ export const GymApp: React.FC<GymAppProps> = ({
               <Dumbbell className="w-4 h-4 sm:w-5 sm:h-5" />
             </div>
             <div className="flex flex-col leading-tight text-left">
-              <span className="font-black text-sm sm:text-base tracking-tight text-white">IRON HOUSE</span>
+              <span className="font-black text-sm sm:text-base tracking-tight text-white">GYM WORKOUT</span>
               <span className="text-[8px] sm:text-[9px] uppercase tracking-[0.25em] text-red-500 font-bold">Train Hard</span>
             </div>
           </button>
@@ -2846,6 +5265,7 @@ export const GymApp: React.FC<GymAppProps> = ({
                   mode="user"
                   currentUser={currentUser}
                   existingPlans={myPlans}
+                  activePlanId={activePlan?.id || ''}
                   onSaved={(_, firstPlanId) => {
                     if (firstPlanId) openPlan(firstPlanId);
                     setActiveTab('dashboard');
@@ -2997,6 +5417,61 @@ export const GymApp: React.FC<GymAppProps> = ({
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Rest Timer Finished In-App Alert Banner */}
+      {restAlertBanner && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed bottom-[calc(4.75rem+env(safe-area-inset-bottom))] sm:bottom-5 right-3 sm:right-5 left-3 sm:left-auto sm:w-96 z-[9990] rounded-2xl border border-emerald-400/50 bg-neutral-950/95 backdrop-blur-xl shadow-2xl shadow-black/75 p-3.5 flex items-start gap-3 animate-motivation-slide"
+        >
+          <div className="p-2 rounded-xl bg-emerald-500/20 border border-emerald-400/40 text-emerald-300 shrink-0">
+            <Volume2 className="w-4 h-4" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="text-xs font-extrabold text-emerald-300 uppercase tracking-wider">
+              Rest Complete ({restAlertBanner.totalSec}s)
+            </div>
+            <p className="text-xs text-white font-semibold truncate mt-0.5">
+              {restAlertBanner.exerciseName} — Set {restAlertBanner.setNumber}
+            </p>
+            <p className="text-[11px] text-neutral-400 mt-0.5">
+              Ready for your next set. Stay focused!
+            </p>
+            <div className="flex items-center gap-2 mt-2">
+              <button
+                type="button"
+                onClick={() => {
+                  startOrToggleSetRestTimer(
+                    restAlertBanner.timerKey,
+                    { id: restAlertBanner.exerciseId, name: restAlertBanner.exerciseName } as WorkoutExercise,
+                    restAlertBanner.setNumber,
+                    defaultRestSeconds
+                  );
+                }}
+                className="px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/35 border border-amber-400/40 text-amber-200 text-[11px] font-bold cursor-pointer inline-flex items-center gap-1"
+              >
+                <RotateCcw className="w-3 h-3" /> Restart {defaultRestSeconds}s
+              </button>
+              <button
+                type="button"
+                onClick={() => setRestAlertBanner(null)}
+                className="px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/15 text-neutral-200 text-[11px] font-semibold cursor-pointer"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setRestAlertBanner(null)}
+            aria-label="Close rest complete alert"
+            className="p-1 rounded-lg text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer shrink-0"
+          >
+            <X className="w-4 h-4" />
+          </button>
         </div>
       )}
 

@@ -114,4 +114,51 @@ button, a, select { -webkit-tap-highlight-color: transparent; touch-action: mani
 .no-scrollbar::-webkit-scrollbar { display: none; }
 .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
 
+/* One-shot motivational exercise completion animations (compositor properties only) */
+@keyframes exercise-complete-settle {
+  0% { transform: scale(0.985); }
+  45% { transform: scale(1.015); }
+  100% { transform: scale(1); }
+}
+
+@keyframes check-pop {
+  0% { transform: scale(0.65); opacity: 0.4; }
+  55% { transform: scale(1.22); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+@keyframes motivation-slide {
+  0% { transform: translateY(-6px) scale(0.96); opacity: 0; }
+  100% { transform: translateY(0) scale(1); opacity: 1; }
+}
+
+@keyframes check-ring-burst {
+  0% { transform: scale(0.75); opacity: 0.75; }
+  100% { transform: scale(1.85); opacity: 0; }
+}
+
+.animate-exercise-complete {
+  animation: exercise-complete-settle 0.45s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.animate-check-pop {
+  animation: check-pop 0.4s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.animate-motivation-slide {
+  animation: motivation-slide 0.28s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.animate-check-ring {
+  animation: check-ring-burst 0.55s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-exercise-complete,
+  .animate-check-pop,
+  .animate-motivation-slide,
+  .animate-check-ring {
+    animation: none !important;
+  }
+}
 

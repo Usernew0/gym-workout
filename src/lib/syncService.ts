@@ -1,5 +1,5 @@
 /**
- * Iron House - Hybrid Architecture Sync Service
+ * Gym Workout - Hybrid Architecture Sync Service
  * Strategy A: Functional Data Partitioning
  *
  * - Structured App Data & Settings -> Supabase PostgreSQL (supabaseService.ts)
@@ -33,9 +33,12 @@ import {
   TableDiagnosticStatus,
   mapToDb,
   mapFromDb,
-  safeUpsert
+  safeUpsert,
+  ensureSupabaseConfigured,
+  supabaseSelect,
+  supabaseInsert
 } from './supabaseService';
-import { isSupabaseConfigured, supabase } from './supabase';
+import { isSupabaseConfigured, isAnySupabaseConfigured } from './supabase';
 import {
   UserAccount,
   AdminSetting,
@@ -76,7 +79,7 @@ export async function checkDatabaseStatuses(): Promise<DatabaseConnectionStatus>
 export function useDatabaseStatus(intervalMs = 30000) {
   const [status, setStatus] = useState<DatabaseConnectionStatus>({
     firebase: { online: true, latencyMs: 0, details: 'Checking...' },
-    supabase: { online: isSupabaseConfigured, configured: isSupabaseConfigured, latencyMs: 0, details: 'Checking...' },
+    supabase: { online: isAnySupabaseConfigured(), configured: isAnySupabaseConfigured(), latencyMs: 0, details: 'Checking...' },
     lastChecked: 'Initializing...'
   });
   const [isChecking, setIsChecking] = useState<boolean>(false);
@@ -170,12 +173,14 @@ export async function migrateAndDeduplicateFirestoreToSupabase(): Promise<Migrat
     result.logsProcessed = fsLogs.length;
     result.settingsProcessed = fsSettings.length;
 
+    const hasSupabase = await ensureSupabaseConfigured(true);
+
     // 2. Process Activity Logs Migration & Deduplication
     if (fsLogs.length > 0) {
-      let existingSupabaseLogIds = new Set<string>();
-      if (isSupabaseConfigured && supabase) {
+      const existingSupabaseLogIds = new Set<string>();
+      if (hasSupabase) {
         try {
-          const { data, error } = await supabase.from('activity_logs').select('id');
+          const { data, error } = await supabaseSelect('activity_logs', { select: 'id' });
           if (!error && data) {
             data.forEach((row: any) => existingSupabaseLogIds.add(row.id));
           }
@@ -189,7 +194,7 @@ export async function migrateAndDeduplicateFirestoreToSupabase(): Promise<Migrat
 
         // If log is not yet in Supabase, insert it
         if (!existingSupabaseLogIds.has(log.id)) {
-          if (isSupabaseConfigured && supabase) {
+          if (hasSupabase) {
             try {
               const snakeLog = {
                 id: log.id,
@@ -198,12 +203,12 @@ export async function migrateAndDeduplicateFirestoreToSupabase(): Promise<Migrat
                 details: log.details,
                 timestamp: log.timestamp
               };
-              const { error } = await supabase.from('activity_logs').insert(snakeLog);
-              if (!error) {
+              const res = await supabaseInsert('activity_logs', snakeLog);
+              if (res.success) {
                 migratedSuccessfully = true;
                 result.logsMigrated++;
               } else {
-                result.errors.push(`Log ${log.id} insert info: ${error.message}`);
+                result.errors.push(`Log ${log.id} insert info: ${res.error || 'Unknown error'}`);
               }
             } catch (err: any) {
               result.errors.push(`Log ${log.id} exception: ${err?.message || String(err)}`);
@@ -282,7 +287,7 @@ export async function syncSingleTableFirestoreToSupabase(tableKey: SyncTableKey)
     errors: []
   };
 
-  if (!isSupabaseConfigured || !supabase) {
+  if (!(await ensureSupabaseConfigured(true))) {
     result.errors.push('Supabase is not configured or offline.');
     return result;
   }
@@ -354,7 +359,7 @@ export async function syncSingleTableSupabaseToFirestore(tableKey: SyncTableKey)
     errors: []
   };
 
-  if (!isSupabaseConfigured || !supabase) {
+  if (!(await ensureSupabaseConfigured(true))) {
     result.errors.push('Supabase is not configured or offline.');
     return result;
   }
@@ -363,9 +368,9 @@ export async function syncSingleTableSupabaseToFirestore(tableKey: SyncTableKey)
     const meta = SYNC_TABLES_LIST.find(t => t.key === tableKey);
     const tableName = meta ? meta.supabaseTable : tableKey;
 
-    const { data, error } = await supabase.from(tableName).select('*');
+    const { data, error } = await supabaseSelect(tableName);
     if (error) {
-      result.errors.push(`Supabase query ${tableName} error: ${error.message}`);
+      result.errors.push(`Supabase query ${tableName} error: ${error}`);
       return result;
     }
 

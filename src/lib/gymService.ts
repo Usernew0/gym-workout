@@ -7,8 +7,12 @@
 import { collection, doc, onSnapshot, setDoc, deleteDoc } from 'firebase/firestore';
 import { db } from './firebase';
 import { sanitizeForFirestore } from './firebaseService';
-import { supabase, isSupabaseConfigured } from './supabase';
-import { mapToDb, safeUpsert } from './supabaseService';
+import {
+  mapToDb,
+  safeUpsert,
+  ensureSupabaseConfigured,
+  supabaseDelete,
+} from './supabaseService';
 import { WorkoutPlan, WorkoutExercise, ExerciseLogEntry, SetLogEntry, WeightUnit } from '../types';
 import { ParsedExerciseRow, parseSetsCount } from './sheetParser';
 
@@ -49,24 +53,24 @@ export async function saveWorkoutPlanDoc(plan: WorkoutPlan): Promise<void> {
 
   await setDoc(doc(db, 'workoutPlans', stamped.id), stamped);
 
-  if (isSupabaseConfigured && supabase) {
-    try {
+  try {
+    if (await ensureSupabaseConfigured()) {
       await safeUpsert('workout_plans', mapToDb(stamped), 'id');
-    } catch (err) {
-      console.warn('Optional Supabase workout_plans mirror warning:', err);
     }
+  } catch (err) {
+    console.warn('Optional Supabase workout_plans mirror warning:', err);
   }
 }
 
 export async function deleteWorkoutPlanDoc(id: string): Promise<void> {
   await deleteDoc(doc(db, 'workoutPlans', id));
 
-  if (isSupabaseConfigured && supabase) {
-    try {
-      await supabase.from('workout_plans').delete().eq('id', id);
-    } catch (err) {
-      console.warn('Optional Supabase workout_plans delete mirror warning:', err);
+  try {
+    if (await ensureSupabaseConfigured()) {
+      await supabaseDelete('workout_plans', 'id', id);
     }
+  } catch (err) {
+    console.warn('Optional Supabase workout_plans delete mirror warning:', err);
   }
 }
 
@@ -86,10 +90,11 @@ export interface NewWorkoutPlanInput {
 }
 
 function buildEntryFromSheetEntries(
-  rawEntries: Array<{ setNumber: number; weight: string; unit?: WeightUnit; reps: string }>,
+  rawEntries: Array<{ setNumber: number; weight: string; unit?: WeightUnit; reps: string; rpe?: string }>,
   targetSetCount: number,
   fallbackUnit: WeightUnit,
-  nowIso: string
+  nowIso: string,
+  weekNote?: string
 ): ExerciseLogEntry {
   const count = Math.max(targetSetCount, rawEntries.length, 1);
   const setEntries: SetLogEntry[] = Array.from({ length: count }, (_, idx) => {
@@ -99,23 +104,26 @@ function buildEntryFromSheetEntries(
       weight: (src?.weight || '').trim(),
       unit: src?.unit || fallbackUnit,
       reps: (src?.reps || '').trim(),
+      ...(src?.rpe?.trim() ? { rpe: src.rpe.trim() } : {}),
     };
   });
-  const firstPopulated = setEntries.find(s => s.weight || s.reps);
+  const firstPopulated = setEntries.find(s => s.weight || s.reps || s.rpe);
+  const cleanNote = (weekNote || '').trim();
   return {
     sets: String(setEntries.length),
     weight: firstPopulated?.weight || '',
     unit: firstPopulated?.unit || fallbackUnit,
     reps: firstPopulated?.reps || '',
     setEntries,
+    ...(cleanNote ? { notes: cleanNote, noteEnabled: true } : {}),
     updatedAt: nowIso,
   };
 }
 
 function entryHasData(entry?: ExerciseLogEntry): boolean {
   if (!entry) return false;
-  if (entry.setEntries?.some(s => (s.weight || '').trim() !== '' || (s.reps || '').trim() !== '')) return true;
-  return Boolean(entry.weight?.trim() || entry.reps?.trim());
+  if (entry.setEntries?.some(s => (s.weight || '').trim() !== '' || (s.reps || '').trim() !== '' || (s.rpe || '').trim() !== '')) return true;
+  return Boolean(entry.weight?.trim() || entry.reps?.trim() || entry.notes?.trim());
 }
 
 function applyParsedSheetDataForExercise(
@@ -136,11 +144,14 @@ function applyParsedSheetDataForExercise(
     for (const [k, weekData] of Object.entries(row.weeklyLogs)) {
       const wk = Number(k);
       const wkUnit: WeightUnit = weekData.unit || rowUnit;
-      const populated = (weekData.entries || []).filter(e => e.weight.trim() !== '' || e.reps.trim() !== '');
+      const populated = (weekData.entries || []).filter(
+        e => e.weight.trim() !== '' || e.reps.trim() !== '' || (e.rpe || '').trim() !== ''
+      );
+      const hasWeekNote = Boolean(weekData.weekNote?.trim());
 
       if (wk === 0) {
-        if (populated.length > 0 && (overwriteExisting || !entryHasData(previousLogs[exId]))) {
-          previousLogs[exId] = buildEntryFromSheetEntries(weekData.entries, targetCount, wkUnit, nowIso);
+        if ((populated.length > 0 || hasWeekNote) && (overwriteExisting || !entryHasData(previousLogs[exId]))) {
+          previousLogs[exId] = buildEntryFromSheetEntries(weekData.entries, targetCount, wkUnit, nowIso, weekData.weekNote);
         }
         continue;
       }
@@ -149,8 +160,8 @@ function applyParsedSheetDataForExercise(
         highestWeek = Math.max(highestWeek, wk);
         const wKey = `w${wk}`;
         if (!exerciseLogs[wKey]) exerciseLogs[wKey] = {};
-        if (populated.length > 0 && (overwriteExisting || !entryHasData(exerciseLogs[wKey][exId]))) {
-          exerciseLogs[wKey][exId] = buildEntryFromSheetEntries(weekData.entries, targetCount, wkUnit, nowIso);
+        if ((populated.length > 0 || hasWeekNote) && (overwriteExisting || !entryHasData(exerciseLogs[wKey][exId]))) {
+          exerciseLogs[wKey][exId] = buildEntryFromSheetEntries(weekData.entries, targetCount, wkUnit, nowIso, weekData.weekNote);
         }
         if (weekData.completed) {
           const list = progress[wKey] || [];
@@ -193,7 +204,7 @@ export function buildWorkoutPlan(input: NewWorkoutPlanInput): WorkoutPlan {
   let maxSheetWeek = 1;
 
   const exercises: WorkoutExercise[] = input.exercises
-    .filter((e) => e.name || e.sets || e.reps || e.notes || e.video || e.loggedWeight || e.weeklyLogs)
+    .filter((e) => e.name || e.sets || e.reps || e.rpe || e.notes || e.video || e.loggedWeight || e.weeklyLogs)
     .map((e) => {
       const id = newId('ex');
       if (shouldImportData) {
@@ -210,12 +221,14 @@ export function buildWorkoutPlan(input: NewWorkoutPlanInput): WorkoutPlan {
         if (wk > maxSheetWeek) maxSheetWeek = wk;
       }
 
+      const resolvedTargetRpe = (e.rpe || '').trim();
       return {
         id,
         name: e.name || 'Exercise',
         ...(e.day?.trim() ? { day: e.day.trim() } : {}),
         sets: e.sets,
         reps: e.reps,
+        ...(resolvedTargetRpe ? { targetRpe: resolvedTargetRpe } : {}),
         notes: e.notes,
         videoUrl: e.video,
         ...(e.isSuperset ? { isSuperset: true } : {}),
@@ -288,7 +301,7 @@ export function mergeUpdatedWorksheetIntoPlan(
   let maxSheetWeek = 1;
 
   const mergedExercises: WorkoutExercise[] = updates.exercises
-    .filter((e) => e.name || e.sets || e.reps || e.notes || e.videoUrl || e.video || e.loggedWeight || e.weeklyLogs)
+    .filter((e) => e.name || e.sets || e.reps || e.targetRpe || e.rpe || e.notes || e.videoUrl || e.video || e.loggedWeight || e.weeklyLogs)
     .map((e) => {
       const normName = (e.name || '').trim().toLowerCase();
       const normDay = (e.day || '').trim().toLowerCase();
@@ -335,6 +348,7 @@ export function mergeUpdatedWorksheetIntoPlan(
       }
 
       const resolvedVideo = (e.videoUrl ?? e.video ?? '').trim();
+      const resolvedTargetRpe = (e.targetRpe ?? e.rpe ?? '').trim();
 
       return {
         id: resolvedId,
@@ -342,6 +356,7 @@ export function mergeUpdatedWorksheetIntoPlan(
         ...(e.day?.trim() ? { day: e.day.trim() } : {}),
         ...(e.sets?.trim() ? { sets: e.sets.trim() } : {}),
         ...(e.reps?.trim() ? { reps: e.reps.trim() } : {}),
+        ...(resolvedTargetRpe ? { targetRpe: resolvedTargetRpe } : {}),
         ...(e.notes?.trim() ? { notes: e.notes.trim() } : {}),
         ...(resolvedVideo ? { videoUrl: resolvedVideo } : {}),
         ...(e.isSuperset ? { isSuperset: true } : {}),
@@ -363,7 +378,9 @@ export function mergeUpdatedWorksheetIntoPlan(
     ),
     sourceFileName: updates.sourceFileName || existing.sourceFileName,
     exercises: mergedExercises,
-    // Strictly preserve all saved workout data & history + merge new prefilled slots
+    // Strictly preserve all saved workout data, warmups, & history + merge new prefilled slots
+    warmupExercises: existing.warmupExercises || [],
+    warmupLogs: existing.warmupLogs || {},
     progress: nextProgress,
     exerciseLogs: nextExerciseLogs,
     previousLogs: nextPreviousLogs,

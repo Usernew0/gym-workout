@@ -5,12 +5,19 @@ import {
   getFirestoreUserAccounts,
   getFirestoreAdminSettings
 } from '../lib/syncService';
+import { getFirestoreWorkoutPlans } from '../lib/firebaseService';
 import { generateTOTPSecret, generateTOTP, verifyTOTP, generateBackupCodes } from '../lib/totp';
 
 export interface TestCaseResult {
   id: string;
   name: string;
-  category: 'Storage & Local State' | 'Database & Cloud Services' | 'Data Schema & Integrity' | 'Browser & Runtime APIs' | 'Component & Navigation' | 'Responsiveness & Layout' | 'Notification System & Aggregation';
+  category:
+    | 'Database & Cloud Services'
+    | 'Data Schema & Integrity'
+    | 'Workout & Telegram Engine'
+    | 'Browser & Runtime APIs'
+    | 'Component & Navigation'
+    | 'Responsiveness & Layout';
   status: 'passed' | 'warning' | 'failed';
   message: string;
   durationMs: number;
@@ -30,7 +37,7 @@ export interface FullTestReport {
 }
 
 /**
- * Auto-tests the entire website and returns a comprehensive diagnostic report.
+ * Auto-tests the Gym Workout website and returns a comprehensive diagnostic report.
  */
 export async function runAutomatedWebsiteTests(): Promise<FullTestReport> {
   const startTime = performance.now();
@@ -81,15 +88,15 @@ export async function runAutomatedWebsiteTests(): Promise<FullTestReport> {
     async () => {
       const fireRes = await verifyFirestoreConnection();
       if (fireRes.online) {
-        return { 
-          status: 'passed', 
+        return {
+          status: 'passed',
           message: `Firestore connected successfully with ${fireRes.latencyMs}ms response latency.`,
-          details: fireRes.details 
+          details: fireRes.details
         };
       }
-      return { 
-        status: 'warning', 
-        message: `Firestore backend offline or unreachable (${fireRes.latencyMs}ms latency).`, 
+      return {
+        status: 'warning',
+        message: `Firestore backend offline or unreachable (${fireRes.latencyMs}ms latency).`,
         details: fireRes.details,
         remedy: 'Verify Firebase configuration in firebase-applet-config.json and network connectivity.'
       };
@@ -103,22 +110,22 @@ export async function runAutomatedWebsiteTests(): Promise<FullTestReport> {
     async () => {
       const supaRes = await verifySupabaseConnection();
       if (supaRes.online) {
-        return { 
-          status: 'passed', 
+        return {
+          status: 'passed',
           message: `Supabase database active & online (${supaRes.latencyMs}ms latency).`,
-          details: supaRes.details 
+          details: supaRes.details
         };
       }
       if (!supaRes.configured) {
-        return { 
-          status: 'warning', 
-          message: `Supabase URL or Key not set. Operating in high-speed Local Storage fallback mode.`,
+        return {
+          status: 'warning',
+          message: 'Supabase private server variables (SUPABASE_URL / SUPABASE_ANON_KEY) not detected yet. Running on Firebase Firestore.',
           details: supaRes.details,
-          remedy: 'If cloud PostgreSQL sync is desired, configure VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.'
+          remedy: 'Set SUPABASE_URL and SUPABASE_ANON_KEY (or SUPABASE_SERVICE_ROLE_KEY) in server environment variables and restart the server.'
         };
       }
-      return { 
-        status: 'warning', 
+      return {
+        status: 'warning',
         message: `Supabase database unreachable (${supaRes.latencyMs}ms latency).`,
         details: supaRes.details,
         remedy: 'Check database URL credentials and RLS access policies.'
@@ -128,28 +135,28 @@ export async function runAutomatedWebsiteTests(): Promise<FullTestReport> {
 
   await runTest(
     'db_table_diagnostics',
-    'Supabase Database Schema & Tables Check',
+    'Supabase Gym Schema & Tables Check',
     'Database & Cloud Services',
     async () => {
       const diag = await checkSupabaseTablesStatus();
       if (!diag.configured) {
-        return { 
-          status: 'passed', 
-          message: 'Supabase not configured; all database tables automatically defaulting to Local Fallback.' 
+        return {
+          status: 'passed',
+          message: 'Supabase not configured; Gym Workout runs cleanly on Firebase Firestore.'
         };
       }
       if (diag.allCriticalTablesExist) {
-        return { 
-          status: 'passed', 
-          message: `All ${diag.tables.length} critical database tables exist and are fully synchronized.` 
+        return {
+          status: 'passed',
+          message: `All ${diag.tables.length} Gym Workout Supabase tables exist and are synchronized.`
         };
       }
       const missing = diag.tables.filter(t => t.status === 'missing' || t.status === 'error');
-      return { 
-        status: 'warning', 
-        message: `${missing.length} database table(s) missing or inaccessible: ${missing.map(m => m.tableName).join(', ')}`,
+      return {
+        status: 'warning',
+        message: `${missing.length} Supabase table(s) missing or inaccessible: ${missing.map(m => m.tableName).join(', ')}`,
         details: missing.map(m => `${m.tableName}: ${m.message}`).join(' | '),
-        remedy: 'Run SQL Setup Script in Admin Panel Database Diagnostics to provision missing tables.'
+        remedy: 'Open Admin Panel → Fix DB / SQL Script and execute the SQL setup script in Supabase SQL Editor.'
       };
     }
   );
@@ -159,68 +166,115 @@ export async function runAutomatedWebsiteTests(): Promise<FullTestReport> {
   // ----------------------------------------------------
   await runTest(
     'integrity_user_accounts',
-    'User Accounts Schema & Security Check',
+    'Gym Member Accounts Schema & Security Check',
     'Data Schema & Integrity',
     async () => {
       const users = await getFirestoreUserAccounts();
       if (!Array.isArray(users) || users.length === 0) {
-        return { status: 'warning', message: 'No registered user accounts found in system.', remedy: 'Create user accounts in Admin Panel -> User Accounts.' };
+        return {
+          status: 'warning',
+          message: 'No registered member accounts found in system.',
+          remedy: 'Create member accounts in Admin Panel -> Website User Accounts.'
+        };
       }
       const brokenUser = users.find(u => !u.username || !u.password || !u.id);
       if (brokenUser) {
-        return { status: 'failed', message: `Found user account missing required username, password, or ID field (${brokenUser.id}).` };
+        return {
+          status: 'failed',
+          message: `Found member account missing required username, password, or ID field (${brokenUser.id}).`
+        };
       }
-      return { status: 'passed', message: `Verified ${users.length} registered user account(s) schema integrity.` };
-    }
-  );
-
-  // ----------------------------------------------------
-  // 3. BROWSER & RUNTIME API TESTS
-  // ----------------------------------------------------
-  await runTest(
-    'api_canvas_rendering',
-    'HTML5 Canvas 2D Rendering Engine',
-    'Browser & Runtime APIs',
-    async () => {
-      try {
-        const canvas = document.createElement('canvas');
-        canvas.width = 100;
-        canvas.height = 100;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          return { status: 'failed', message: 'Canvas 2D context creation returned null.', remedy: 'Enable hardware acceleration in browser settings.' };
-        }
-        ctx.fillStyle = '#ff0000';
-        ctx.fillRect(0, 0, 50, 50);
-        return { status: 'passed', message: 'HTML5 Canvas 2D engine operational for heart animations and fireworks particles.' };
-      } catch (err: any) {
-        return { status: 'failed', message: `Canvas rendering error: ${err?.message}` };
-      }
+      return {
+        status: 'passed',
+        message: `Verified ${users.length} registered gym member account(s) schema integrity.`
+      };
     }
   );
 
   await runTest(
-    'api_web_audio',
-    'Web Audio API Sound Engine',
-    'Browser & Runtime APIs',
+    'integrity_workout_plans',
+    'Workout Plans & Exercise Sheets Integrity',
+    'Workout & Telegram Engine',
     async () => {
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) {
-        return { status: 'warning', message: 'Web Audio API is not supported in this browser environment. Ambient sounds will be disabled.' };
+      const plans = await getFirestoreWorkoutPlans();
+      if (!Array.isArray(plans) || plans.length === 0) {
+        return {
+          status: 'warning',
+          message: 'No workout plans uploaded yet.',
+          remedy: 'Upload an .xlsx/.csv/.pdf training sheet in Admin Panel -> Workout Plans & Sheet Assignment.'
+        };
       }
-      return { status: 'passed', message: 'Web Audio API supported for ambient piano synth audio.' };
+      const brokenPlan = plans.find(p => !p.id || !p.ownerUsername || !p.title || !Array.isArray(p.exercises));
+      if (brokenPlan) {
+        return {
+          status: 'failed',
+          message: `Workout plan "${brokenPlan.title || brokenPlan.id}" is missing ownerUsername, title, or exercises array.`
+        };
+      }
+      const totalExercises = plans.reduce((sum, p) => sum + (p.exercises?.length || 0), 0);
+      const uniqueOwners = new Set(plans.map(p => p.ownerUsername.toLowerCase().trim())).size;
+      return {
+        status: 'passed',
+        message: `Verified ${plans.length} workout plan(s) (${totalExercises} exercise(s)) isolated across ${uniqueOwners} member(s).`,
+        details: plans.slice(0, 6).map(p => `• ${p.title} (@${p.ownerUsername}): ${p.exercises.length} exercises, ${p.weeks}w`).join('\n')
+      };
     }
   );
 
+  // ----------------------------------------------------
+  // 3. TELEGRAM WHITELIST & SECURITY AUDIT
+  // ----------------------------------------------------
+  await runTest(
+    'telegram_whitelist_security',
+    'Telegram Bot & Strict Whitelist Isolation Audit',
+    'Workout & Telegram Engine',
+    async () => {
+      const settings = await getFirestoreAdminSettings();
+      const tgDoc = settings.find(s => s.id === 'telegramConfig');
+      const tg = tgDoc?.telegramConfig;
+      if (!tg || !tg.botToken?.trim()) {
+        return {
+          status: 'warning',
+          message: 'Telegram Bot Token is not configured yet.',
+          remedy: 'Configure your Bot Token in Admin Panel -> Telegram & Security Hub.'
+        };
+      }
+      if (tg.autoSyncProfiles === true) {
+        return {
+          status: 'warning',
+          message: 'Auto-Sync Profiles is enabled on Telegram Whitelist; profile handles auto-receive bot access.',
+          remedy: 'Disable "Auto-Sync Profiles" in Telegram & Security Hub for strict manual admin-only whitelisting.'
+        };
+      }
+      const activeUsers = (tg.authorizedUsers || []).filter(u => u.isActive !== false);
+      const whitelistHandles = tg.whitelistedUsernames || [];
+      return {
+        status: 'passed',
+        message: `Strict whitelist enforced (${activeUsers.length} active authorized user(s), ${whitelistHandles.length} whitelisted handle(s), Auto-Sync OFF).`,
+        details: `Bot Enabled: ${tg.enabled ? 'Yes' : 'No'} | Webhook Enabled: ${tg.webhookEnabled ? 'Yes' : 'Polling Mode'}`
+      };
+    }
+  );
+
+  // ----------------------------------------------------
+  // 4. BROWSER & RUNTIME API TESTS
+  // ----------------------------------------------------
   await runTest(
     'api_file_reader',
-    'File Reader & Blob Upload API',
+    'Worksheet Upload & PDF Export APIs (FileReader / Blob)',
     'Browser & Runtime APIs',
     async () => {
       if (typeof FileReader === 'undefined' || typeof Blob === 'undefined') {
-        return { status: 'failed', message: 'FileReader or Blob API missing from browser runtime.', remedy: 'Upgrade browser version.' };
+        return {
+          status: 'failed',
+          message: 'FileReader or Blob API missing from browser runtime.',
+          remedy: 'Upgrade browser version to support Excel/CSV/PDF worksheet import and PDF summary export.'
+        };
       }
-      return { status: 'passed', message: 'FileReader and Blob APIs available for photo/video upload encoding.' };
+      return {
+        status: 'passed',
+        message: 'FileReader and Blob APIs ready for .xlsx/.csv/.pdf workout sheet uploads and PDF summary exports.'
+      };
     }
   );
 
@@ -234,7 +288,11 @@ export async function runAutomatedWebsiteTests(): Promise<FullTestReport> {
       }
       const perm = Notification.permission;
       if (perm === 'denied') {
-        return { status: 'warning', message: 'Desktop notification permission is currently DENIED by user.', remedy: 'Click browser lock icon in address bar to enable notifications.' };
+        return {
+          status: 'warning',
+          message: 'Desktop notification permission is currently DENIED by user.',
+          remedy: 'Click browser lock icon in address bar to enable notifications.'
+        };
       }
       return { status: 'passed', message: `Desktop Notifications API supported (Permission status: ${perm}).` };
     }
@@ -242,18 +300,18 @@ export async function runAutomatedWebsiteTests(): Promise<FullTestReport> {
 
   await runTest(
     'api_fetch',
-    'Network Fetch & Request Pipeline',
+    'Network Fetch & API Proxy Pipeline',
     'Browser & Runtime APIs',
     async () => {
       if (typeof window.fetch !== 'function') {
         return { status: 'failed', message: 'window.fetch is not available.' };
       }
-      return { status: 'passed', message: 'Native Fetch pipeline available.' };
+      return { status: 'passed', message: 'Native Fetch pipeline available for Telegram & cloud sync routes.' };
     }
   );
 
   // ----------------------------------------------------
-  // 4. COMPONENT & NAVIGATION INTEGRITY
+  // 5. COMPONENT & SECURITY CREDENTIALS
   // ----------------------------------------------------
   await runTest(
     'comp_admin_credentials',
@@ -292,9 +350,9 @@ export async function runAutomatedWebsiteTests(): Promise<FullTestReport> {
         if (backupCodes.length !== 6 || !backupCodes.every(c => c.length === 9 && c.includes('-'))) {
           return { status: 'failed', message: 'Backup codes generator produced invalid format (expected 6 XXXX-XXXX codes).' };
         }
-        return { 
-          status: 'passed', 
-          message: `RFC 6238 HMAC-SHA1 TOTP verification and emergency single-use recovery code engines verified operational.`,
+        return {
+          status: 'passed',
+          message: 'RFC 6238 HMAC-SHA1 TOTP verification and emergency single-use recovery code engines verified operational.',
           details: `Generated sample code: ${testCode} | Secret length: ${testSecret.length} chars | Sample recovery code: ${backupCodes[0]}`
         };
       } catch (err: any) {
@@ -304,7 +362,7 @@ export async function runAutomatedWebsiteTests(): Promise<FullTestReport> {
   );
 
   // ----------------------------------------------------
-  // 5. RESPONSIVENESS & LAYOUT AUTO-FIT TESTS
+  // 6. RESPONSIVENESS & LAYOUT CHECKS
   // ----------------------------------------------------
   await runTest(
     'responsive_no_horizontal_overflow',
@@ -323,20 +381,7 @@ export async function runAutomatedWebsiteTests(): Promise<FullTestReport> {
       }
       return {
         status: 'passed',
-        message: `Viewport layout is perfectly contained without horizontal overflow (${winWidth}px width).`
-      };
-    }
-  );
-
-  await runTest(
-    'responsive_viewport_preset_simulations',
-    'Multi-Device Viewport Breakpoint Compatibility',
-    'Responsiveness & Layout',
-    async () => {
-      const presets = [320, 360, 375, 390, 414, 768, 1024, 1280, 1440, 1920];
-      return {
-        status: 'passed',
-        message: `Verified responsive breakpoint rules across all 10 standard device viewports (${presets.join('px, ')}px).`
+        message: `Viewport layout is contained without horizontal overflow (${winWidth}px width).`
       };
     }
   );
@@ -351,28 +396,12 @@ export async function runAutomatedWebsiteTests(): Promise<FullTestReport> {
         return {
           status: 'warning',
           message: 'Navigation header element not found in DOM snapshot.',
-          remedy: 'Verify <header> is rendered at the root app level in App.tsx.'
+          remedy: 'Verify <header> is rendered in the active Gym Workout view.'
         };
       }
       return {
         status: 'passed',
-        message: 'Fixed sticky navigation header is active and pinned at top (sticky top-0 z-50) across active tabs.'
-      };
-    }
-  );
-
-  // ----------------------------------------------------
-  // 6. NOTIFICATION SYSTEM & AGGREGATION TESTS
-  // ----------------------------------------------------
-  await runTest(
-    'notification_filter_tabs_autofit',
-    'Notification Dialog Category Tabs Auto-Fit Test',
-    'Notification System & Aggregation',
-    async () => {
-      const modalEl = document.querySelector('[role="dialog"]');
-      return {
-        status: 'passed',
-        message: 'Notification modal category filter tabs configured to responsive 5-column grid auto-fit (grid-cols-5).'
+        message: 'Fixed sticky navigation header is active and visible.'
       };
     }
   );

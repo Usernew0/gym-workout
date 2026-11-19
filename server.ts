@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
@@ -10,7 +11,9 @@ import {
   isBotConfirmationCommand,
   registerTelegramCommandsMenu,
   replyToTelegramMessage,
+  sendTelegramDocument,
 } from './server/telegramBotEngine';
+import { handleSupabaseProxyAction } from './server/supabaseProxy';
 
 const app = express();
 const PORT = 3000;
@@ -36,6 +39,25 @@ async function startServer() {
   // API health check
   app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  });
+
+  // Private server-side Supabase proxy routes (reads SUPABASE_URL & SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY without VITE_ exposure)
+  app.get('/api/supabase', async (req, res) => {
+    try {
+      const result = await handleSupabaseProxyAction({ action: 'status' });
+      return res.status(result.status).json(result.json);
+    } catch (err: any) {
+      return res.status(500).json({ online: false, configured: false, error: err?.message || String(err) });
+    }
+  });
+
+  app.post('/api/supabase', async (req, res) => {
+    try {
+      const result = await handleSupabaseProxyAction(req.body || {});
+      return res.status(result.status).json(result.json);
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err?.message || String(err) });
+    }
   });
 
   // AI Date Night Itinerary Generator Endpoint (Pro Feature)
@@ -415,6 +437,40 @@ Return a structured JSON object containing:
     }
   });
 
+  // Telegram Bot Document Dispatch Endpoint (.pdf / .xlsx)
+  app.post('/api/telegram/send-document', async (req, res) => {
+    try {
+      const { botToken, chatId, fileBase64, filename, mimeType = 'application/octet-stream', caption } = req.body || {};
+      const token = await resolveEffectiveBotToken(botToken);
+      const chat = (chatId || process.env.TELEGRAM_CHAT_ID || '').trim();
+
+      if (!token || !chat) {
+        return res.status(400).json({
+          success: false,
+          error: 'Missing botToken or chatId. Configure your Telegram Bot credentials in Admin Panel.'
+        });
+      }
+
+      if (!fileBase64 || !filename) {
+        return res.status(400).json({ success: false, error: 'File payload and filename are required.' });
+      }
+
+      const buffer = Buffer.from(String(fileBase64), 'base64');
+      const sent = await sendTelegramDocument(token, chat, buffer, String(filename), String(mimeType), caption);
+      if (!sent.ok) {
+        return res.status(400).json({
+          success: false,
+          error: sent.error || 'Telegram API rejected document upload'
+        });
+      }
+
+      return res.json({ success: true, messageId: sent.messageId });
+    } catch (err: any) {
+      console.error('Telegram send-document error:', err);
+      return res.status(500).json({ success: false, error: err.message || 'Internal server error dispatching document' });
+    }
+  });
+
   // Telegram Bot Connection Test Endpoint
   app.post('/api/telegram/test', async (req, res) => {
     try {
@@ -432,9 +488,9 @@ Return a structured JSON object containing:
       // Ensure '/' command menu is registered during connection test
       void registerTelegramCommandsMenu(token);
 
-      const testMessage = `🏋️ <b>Iron House Telegram Alert Test</b>\n\n` +
-        `Your Telegram bot is successfully connected to <b>Iron House — Gym Training</b>! 💪\n` +
-        `You can receive workout plan alerts, coach updates, security notices, and use interactive bot commands (/workouts, /progress, /status, /id, /help).\n\n` +
+      const testMessage = `🏋️ <b>Gym Workout Telegram Alert Test</b>\n\n` +
+        `Your Telegram bot is successfully connected to <b>Gym Workout</b>! 💪\n` +
+        `You can receive workout plan alerts, water intake reminders, security notices, and download your sheets anytime using bot commands (/workouts, /pdf, /excel, /water, /progress, /status, /id, /help).\n\n` +
         `<i>Time: ${new Date().toLocaleString()}</i>`;
 
       const telegramUrl = `https://api.telegram.org/bot${token}/sendMessage`;
@@ -719,7 +775,7 @@ Return a structured JSON object containing:
         trackProcessedUpdate(update.update_id);
       }
 
-      // Respond automatically via unified Iron House command engine
+      // Respond automatically via unified Gym Workout command engine
       const token = await resolveEffectiveBotToken(req.query.token as string);
       if (token) {
         await replyToTelegramMessage(token, message).catch(err =>

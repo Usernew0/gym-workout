@@ -15,8 +15,8 @@ export default async function handler(req: any, res: any) {
       });
     }
 
-    const testMessage = `🏋️ <b>Iron House Telegram Alert Test</b>\n\n` +
-      `Your Telegram bot is successfully connected to <b>Iron House — Gym Training</b>! 💪\n` +
+    const testMessage = `🏋️ <b>Gym Workout Telegram Alert Test</b>\n\n` +
+      `Your Telegram bot is successfully connected to <b>Gym Workout</b>! 💪\n` +
       `You can receive workout plan alerts, coach updates, security notices, and use interactive bot commands (/workouts, /progress, /status, /id, /help).\n\n` +
       `<i>Time: ${new Date().toLocaleString()}</i>`;
 

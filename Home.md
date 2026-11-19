@@ -898,3 +898,153 @@ Expanded and fixed the event trigger architecture to ensure 100% of security eve
    - **Webhook Mode (`/api/telegram/webhook`)**: Handles incoming Telegram updates immediately with Iron House Gym Training replies.
    - **Direct Polling Mode (`pollTelegramCommandsOnce`, `/api/telegram/poll`, `/api/telegram/updates`)**: Automatically polls `getUpdates` with tracked `lastProcessedUpdateId` / `processedUpdateIds` (preventing duplicate replies and backing off gracefully whenever a webhook returns 409) so bot commands work even before a public webhook is activated.
    - **Command Sync Endpoint (`/api/telegram/commands/sync`, `syncTelegramBotCommands` in `src/lib/telegramService.ts`, `AdminPanel.tsx`)**: Registers the `/` command menu, inspects active webhook vs polling mode, answers pending messages, and exposes a **Sync Bot / Menu** button + supported commands directory in the Admin Panel.
+
+---
+
+## 🔒 27. Gym Workout Rebrand, Strict Telegram Whitelist & Per-User Data Isolation
+
+1. **Global Rebrand to `Gym Workout`**:
+   - Renamed visible titles, headers, PDF export banners/footers, login branding, Telegram bot messages, and admin console labels from `Iron House` / `IronHouseBot` to `Gym Workout` / `GymWorkoutBot` (`index.html`, `src/App.tsx`, `src/components/Login.tsx`, `src/components/AdminPanel.tsx`, `src/components/gym/GymApp.tsx`, `src/lib/workoutPdfExport.ts`, `src/lib/syncService.ts`, `src/lib/telegramService.ts`, `server.ts`, `server/telegramBotEngine.ts`, `api/telegram/test.ts`).
+
+2. **Strict Telegram Bot Whitelist Gate & Anti-Impersonation (`server/telegramBotEngine.ts`, `src/lib/telegramService.ts`, `src/types.ts`)**:
+   - **No Unwhitelisted Data Exposure (`resolveTelegramAccess`)**: Removed `/start <username>` impersonation arguments, removed substring/firstName/blind-fallback heuristics, and changed `DEFAULT_TELEGRAM_CONFIG.autoSyncProfiles` from `true` to `false` (checked via `=== true` in `AdminPanel.tsx`).
+   - **Two-Gate Access Enforcement**:
+     - *Gate 1 (Whitelist)*: Only senders matching an active entry in Admin `authorizedUsers` (`isActive !== false`), `whitelistedUsernames`, the primary Admin `chatId`, or (only when explicitly opted in by Admin) `userAccounts` are permitted. Admin-paused accounts (`isActive === false`) receive a clean paused-access denial.
+     - *Gate 2 (1-to-1 Account Isolation)*: Binds each whitelisted Telegram sender strictly to their single Linked App Profile (`appUsername`, unique `telegramChatId`, or unique `@telegramUsername`). Ambiguous multi-account overlaps fail closed with `ambiguous_account` rather than exposing another member's data.
+   - **Zero Leak on Restricted Commands**: Non-whitelisted or paused senders attempting `/start`, `/confirm`, `/status`, `/workouts`, `/progress`, or `/help` receive an access-restricted response with zero profile names, link status, or workout data (`/id` returns only the sender's own numeric Chat ID).
+   - **No Self-Whitelisting (`GymApp.tsx`)**: Removed `addAuthorizedTelegramUser` from member Profile saves; members can update their own Chat ID only when already whitelisted by an Admin, and the Profile UI displays live `Whitelisted & Active` / `Access Paused` / `Not Whitelisted` badges.
+
+3. **Admin Whitelist & Member UI Hardening (`AdminPanel.tsx`, `GymApp.tsx`)**:
+   - Updated `handleQuickLinkSender` and the Detected Senders selector (`account:${acc.username}`) so Admin 1-click linking binds exact `appUsername` values and keeps `whitelistedUsernames` + `authorizedUsers` synchronized.
+   - Enforced `isOwnPlan(plan)` ownership checks across member workout mutations, inline edits, worksheet merges, plan deletions, and PDF exports in `GymApp.tsx`.
+
+---
+
+## 🧹 28. Admin Panel Cleanup, Supabase Sync Retention & Gym Diagnostics Refactor
+
+1. **Removed Unused Couples Template Features & Copy (`src/components/AdminPanel.tsx`, `src/types.ts`, `src/components/TwoFactorSetupModal.tsx`)**:
+   - Removed the 5 unused Telegram broadcast toggles (`notifyMilestones`, `notifyDates`, `notifyLetters`, `notifyChat`, `notifyCards`) from `TelegramConfig` and the **Telegram & Security Hub** UI, retaining the active `🛡️ Security & Login Alerts` (`notifySecurity`) trigger.
+   - Replaced all leftover `"Our Home"` / couples / partner copy across the Admin Panel and 2FA modal:
+     - Individual user Telegram ping (`handleTestIndividualUser`) now references **Gym Workout** (`/workouts`, `/progress`, `/status`, and security alerts).
+     - Telegram role dropdown and directory badge display **`Member 🏋️`** / `member` (keeping internal `'partner'` compatibility).
+     - Replaced the default Heart icon in the Website Favicon preview and top Admin header with red `<Dumbbell />` Gym icons.
+     - Updated SQL Fix Modal copy from legacy tables (`celebration_cards`, `letters`, `memories`, `date_plans`) to active Gym Workout tables (`user_accounts`, `profiles`, `activity_logs`, `admin_settings`, `workout_plans`).
+     - Rebranded 2FA QR issuer and backup recovery code exports in `TwoFactorSetupModal.tsx` to **`Gym Workout`** (`GymWorkout_2FA_Backup_Codes_*.txt`).
+
+2. **Refactored Automated Gym Workout Test Report (`src/utils/autoTester.ts`, `src/components/AdminPanel.tsx`)**:
+   - Removed leftover non-gym test checks (heart/fireworks canvas particles, ambient piano Web Audio synth, and 5-column notification modal tabs).
+   - Replaced with **Gym Workout** full-stack diagnostics: Firebase Firestore latency, Supabase PostgreSQL connection & 5-table schema check, Member Accounts integrity, **Workout Plans & Exercise Sheets Integrity** (`integrity_workout_plans`), **Telegram Bot & Strict Whitelist Isolation Audit** (`telegram_whitelist_security`), Worksheet Upload & PDF Export FileReader/Blob APIs, Admin Credentials, TOTP 2FA Crypto Engine, and responsive overflow/header checks.
+   - Updated downloaded diagnostic report header (`GYM WORKOUT AUTOMATED TEST REPORT`) and filename (`GymWorkout_TestReport_*.txt`).
+   - Kept Supabase diagnostics/sync cards, minor account fields (Gender, Favicon uploader, Section Index navigation), and all core Gym Workout sections.
+
+---
+
+## 🔐 29. Private Server-Side Supabase Proxy (`/api/supabase`, No `VITE_` Prefix Required)
+
+1. **Server Proxy Engine (`server/supabaseProxy.ts`, `api/supabase.ts`, `server.ts`)**:
+   - Added `/api/supabase` (`GET` health check + `POST` actions: `status`, `check_tables`, `select`, `upsert`, `insert`, `delete`) supporting Express dev/prod (`server.ts` with `dotenv/config`) and Vercel serverless (`api/supabase.ts`).
+   - Reads private server-only environment variables without requiring `VITE_` (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_SECRET_KEY`, `SUPABASE_ANON_KEY`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_KEY`, plus optional `VITE_*` / `NEXT_PUBLIC_*` fallbacks) so credentials are never bundled into browser JavaScript.
+   - Enforces a strict table allowlist (`user_accounts`, `profiles`, `activity_logs`, `admin_settings`, `workout_plans`) and includes server-side schema-cache / foreign-key retry handling (`serverSafeUpsert`).
+
+2. **Transparent Client Proxy Routing (`src/lib/supabase.ts`, `src/lib/supabaseService.ts`, `src/lib/syncService.ts`, `src/lib/gymService.ts`, `src/components/AdminPanel.tsx`, `.env.example`)**:
+   - Updated `verifySupabaseConnection`, `checkSupabaseTablesStatus`, `safeUpsert`, `supabaseSelect`, `supabaseInsert`, `supabaseDelete`, `syncAllDataToSupabase`, `migrateAndDeduplicateFirestoreToSupabase`, `saveWorkoutPlanDoc`, `deleteWorkoutPlanDoc`, and `AdminPanel.tsx` (`canUseSupabase`) to detect and route through `/api/supabase` automatically whenever private server-side Supabase env vars are configured.
+
+
+---
+
+## 30. Session Notes, Dashboard Water Intake Tracker & Dual PDF / Excel Export
+
+### A. Weekly & Daily Session Notes (`GymApp.tsx`, `src/types.ts`)
+- Added an interactive **Session Notes** card with textarea at the bottom of the Exercises List inside `src/components/gym/GymApp.tsx` (visible on both Dashboard and My Workouts views).
+- Scopes feedback automatically to the active week (`w1`, `w2`, etc.) and selected day filter (`Day 1 - Push`, `All Days`, etc.), storing notes directly inside `plan.exerciseLogs[weekKey][__session_note__<day>]` with `{ notes, day, updatedAt }` (added optional `day?: string` on `ExerciseLogEntry` in `src/types.ts`).
+- Auto-saves on blur and provides an explicit **Save Notes** action with `"Saved"` confirmation and timestamp.
+
+### B. Dashboard Water Intake Tracker (`GymApp.tsx`)
+- Added a **Water Intake** tracker card on the Dashboard (`renderDashboard()` in `src/components/gym/GymApp.tsx`) with simple **Minus (`-`)** and **Plus (`+`)** glass counter buttons, a **Reset** action, and an 8-glass daily progress bar.
+- Persists daily glass counts per user and calendar date (`YYYY-MM-DD`) in `localStorage` (`gymworkout_water_<username>_<date>`).
+
+### C. Dual PDF (.pdf) & Excel (.xlsx) Export (`src/lib/workoutExcelExport.ts`, `src/lib/workoutPdfExport.ts`, `GymApp.tsx`)
+- Created `src/lib/workoutExcelExport.ts` using `xlsx` (`exportWorkoutPlanToExcel`) to export multi-sheet `.xlsx` workbooks containing:
+  1. `Workout Plan` (Row 1 headers compatible with re-import, targets, video links, notes, and per-week completion/logs)
+  2. `Set-by-Set History` (granular set weights, units, reps, and timestamps)
+  3. `Session Notes` (weekly & daily session feedback from `exerciseLogs`)
+  4. `Summary & Progress` (overall progress %, per-week breakdown, instructions, and today's water intake)
+- Updated `src/lib/workoutPdfExport.ts` (`buildWorkoutPlanPdfDocument`) to include **Session Notes & Performance Feedback** and optional daily **Water Intake** in the exported PDF summary.
+- Upgraded **Export** buttons across Dashboard hero header, Active Workout toolbar, and Profile header in `src/components/gym/GymApp.tsx` into a dropdown menu offering **Export as PDF (.pdf)** or **Export as Excel (.xlsx)**.
+
+---
+
+## 31. Per-Set RPE, Top-of-Plan Warm-ups, Default-Disabled Note Checkitems, Clarified Excel Export & Smart Sheet Auto-Update
+
+### A. Per-Set RPE Logging & Reporting (`GymApp.tsx`, `src/types.ts`, `src/lib/sheetParser.ts`, `src/lib/gymService.ts`)
+- Added optional `rpe?: string` on `SetLogEntry` in `src/types.ts` and an **RPE** numeric/decimal input alongside Weight (`kg`/`lbs`) and Reps for every set row inside `GymApp.tsx` (preserving mobile 375px responsiveness without horizontal overflow).
+- Updated `normalizeSetEntries`, `entryHasLoggedData`, `saveExerciseSets`, `findPreviousWeekSets`, and `buildWeeklyHistory` to save per-set RPE under `plan.exerciseLogs[weekKey][ex.id].setEntries`, display `@ RPE X` in previous-session hints and **History by Weeks**, and preserve exercise week notes when saving sets.
+- Updated `sheetParser.ts` (`parseLoggedCellEntries`, `classifyExtraDataHeader`, `rowsToExercisesWithMeta`) and `gymService.ts` to extract and round-trip `Week N RPE`, `Set N RPE`, and trailing `(RPE X)` tokens.
+
+### B. Dedicated Warm-up Section & Separate Set Tracking (`GymApp.tsx`, `src/types.ts`, `src/lib/gymService.ts`)
+- Added `WarmupExercise`, `WarmupLogEntry`, `warmupExercises`, and `warmupLogs` to `WorkoutPlan` in `src/types.ts`.
+- Added a collapsible **Warm-up** card at the top of each workout plan above the main Exercises List in `GymApp.tsx`, enabling members to add/remove warm-up movements (`name`, optional `target`, optional cue notes), check off weekly completion, and log dedicated **Warm-up Sets** (Weight `kg`/`lbs`, Reps, RPE) isolated under `plan.warmupLogs[weekKey][warmupId]`.
+- Updated `mergeUpdatedWorksheetIntoPlan` in `src/lib/gymService.ts` so worksheet updates and re-uploads strictly preserve existing `warmupExercises` and `warmupLogs`.
+
+### C. Default-Disabled Week & Exercise Note Checkitems (`GymApp.tsx`, `src/types.ts`)
+- Added `noteEnabled?: boolean` to `ExerciseLogEntry` in `src/types.ts`.
+- Added a **Note (Week N)** checkitem per exercise inside `GymApp.tsx` that defaults to **disabled (unchecked)** for each exercise and week unless explicitly checked or a saved note exists; toggling it ON reveals the exercise- & week-specific `<textarea>` with blur auto-save and displays saved week notes inside **History by Weeks**.
+- Applied the same default-disabled checkitem toggle pattern to the bottom **Session Notes** section (`Enable Session Notes`).
+
+### D. Clarified 5-Sheet Excel Workbook, Updated PDF Export & Auto-Update Upload (`src/lib/workoutExcelExport.ts`, `src/lib/workoutPdfExport.ts`, `src/components/gym/SheetUploader.tsx`)
+- Re-enhanced `src/lib/workoutExcelExport.ts` into a 5-sheet `.xlsx` report:
+  1. `Workout Plan`: Clean separated columns per week (`Week N Done`, `Week N Weight`, `Week N Reps`, `Week N RPE`, `Week N Set Breakdown`, `Week N Notes`) compatible with spreadsheet re-import.
+  2. `Set-by-Set History`: Flat table across both **Warm-up** and **Main Workout** categories including `RPE` and automatic `Volume (Wt x Reps)`.
+  3. `Warm-up Tracker`: Dedicated warm-up movements, targets, and weekly warm-up set logs.
+  4. `Notes & Feedback`: Combined Exercise Week Notes and Day/Week Session Feedback.
+  5. `Summary & Progress`: Metadata, total logged volume, daily water intake, instructions, and weekly completion rates.
+- Updated `src/lib/workoutPdfExport.ts` to include per-set RPE (`(RPE X)`), a styled **Warm-up Protocol** section with weekly warm-up logs, and per-exercise weekly notes.
+- Enhanced `src/components/gym/SheetUploader.tsx` (wired with `activePlanId={activePlan?.id}` from `GymApp.tsx`) with **Auto-Match Uploaded Sheet**, **Update Current Workout**, and **Create as New Plan** modes plus filename/title/exercise overlap auto-matching and a live merge diff preview banner (`matched`, `with saved logs preserved`, `+new`, `-removed`, `warm-ups kept`).
+
+---
+
+## 32. Telegram Bot Hydration Alerts & Sheet Exports, Enhanced Warm-up Minutes & Target Sets, and Auto-Check Exercise Celebration
+
+### A. Telegram Bot Water Intake Alerts & PDF/Excel Sheet Delivery (`server/telegramBotEngine.ts`, `server.ts`, `api/telegram/send-document.ts`, `src/lib/telegramService.ts`, `src/components/AdminPanel.tsx`, `src/components/gym/GymApp.tsx`, `src/types.ts`)
+- **Daily Water Intake Persistence & Reminder Scheduler**:
+  - Extended `UserAccount` with `waterIntake` (`date`, `glasses`, `updatedAt`, `reminderEnabled`, `reminderIntervalMinutes`) and `TelegramConfig` with `notifyWater` and `waterReminderMinutes` in `src/types.ts`.
+  - Added a **💧 Water Intake Alerts** toggle in `src/components/AdminPanel.tsx` alongside Security Alerts.
+  - Added Dashboard controls in `src/components/gym/GymApp.tsx` to sync daily glasses to the user's account profile, enable recurring in-session Telegram hydration reminders (`30m` / `45m` / `60m` / `90m`), and trigger an immediate **Send Alert to Bot** notification formatted via `formatWaterIntakeTelegramMessage`.
+- **Telegram Bot `/water`, `/pdf`, and `/excel` Commands & Direct Export Menu**:
+  - Added `/water`, `/pdf`, and `/excel` (plus `/xlsx` / `/sheet` aliases) to `TELEGRAM_BOT_COMMANDS` and `TELEGRAM_COMMAND_DEFINITIONS`, strictly gated by `resolveTelegramAccess` and 1-to-1 `isOwnPlan` isolation in `server/telegramBotEngine.ts`.
+  - Added `exportWorkoutPlanToPdfBuffer` (`src/lib/workoutPdfExport.ts`) and `exportWorkoutPlanToExcelBuffer` (`src/lib/workoutExcelExport.ts`) generating portable `Uint8Array` buffers usable in both browser and Node.js.
+  - Added `sendTelegramDocument` (`server/telegramBotEngine.ts`), `POST /api/telegram/send-document` (`server.ts` & `api/telegram/send-document.ts`), and `sendTelegramDocumentFile` (`src/lib/telegramService.ts`), plus **Send PDF to Telegram Bot** and **Send Excel to Telegram Bot** actions inside the `GymApp.tsx` Export dropdown menu.
+
+### B. Enhanced Warm-up Minutes, Countdown Timer & Target Sets (`src/types.ts`, `src/components/gym/GymApp.tsx`, `src/lib/workoutPdfExport.ts`, `src/lib/workoutExcelExport.ts`)
+- Extended `WarmupExercise` with structured `minutes` and `targetSets`, and `WarmupLogEntry` with `minutesCompleted`.
+- Enhanced the Warm-up UI in `src/components/gym/GymApp.tsx` with quick duration presets (`3m`, `5m`, `10m`), a live per-warmup `MM:SS` countdown timer (Start/Pause/Reset), a `Target Sets` `-`/`+` stepper that automatically sizes warm-up set rows, and inline **Edit** support for existing warm-up movements.
+- Updated `src/lib/workoutPdfExport.ts` and `src/lib/workoutExcelExport.ts` (`Warm-up Tracker` `Duration (Min)` & `Target Sets` columns) to reflect structured warm-up minutes and target sets.
+
+### C. Auto-Check Exercise Done on Completing Sets & Reps + Motivational Animation (`src/components/gym/GymApp.tsx`, `src/index.css`)
+- Updated `saveExerciseSets`, `updateSetField`, and `toggleExercise` in `src/components/gym/GymApp.tsx` to automatically mark an exercise complete in `plan.progress[weekKey]` once all active sets contain non-empty reps (with an 800ms debounce while typing and Enter-to-blur trigger), while respecting manual uncheck overrides via `manuallyUncheckedRef`.
+- Added compositor-only (`transform`, `opacity`) one-shot celebration animations (`exercise-complete-settle`, `check-pop`, `motivation-slide`, `check-ring-burst`) in `src/index.css` (honoring `prefers-reduced-motion: reduce`), paired with rotating motivational banners and a subtle `canvas-confetti` burst in `GymApp.tsx`.
+
+---
+
+## 33. Per-Set Rest Timer, Sheet RPE Extraction & Preview, Day-Combined PDF/Excel Export Redesign & Portaled Dashboard Export Menu
+
+### A. User-Controlled Per-Set Rest Timer (`src/components/gym/GymApp.tsx`)
+- Added a configurable **Rest Timer** bar at the top of the Exercises List with quick presets (`45s`, `60s`, `90s`, `120s`, `180s`) and custom duration input (`10–600s`), persisted per user in `localStorage` (`gymworkout_rest_sec_<username>`).
+- Added a dedicated **Rest Timer** button (`Timer` / `Pause` / `Play` + live `MM:SS` tabular countdown + inline reset action) inside every exercise set row across mobile and desktop viewports.
+- Added a gentle Web Audio API harmonic chime (`playRestFinishedChime`), device vibration when supported, and a dismissible floating in-app **Rest Complete** banner (`restAlertBanner`) with quick `+15s` / **Restart** controls.
+
+### B. Sheet RPE Extraction, Target Preview & Cleanup (`src/types.ts`, `src/lib/sheetParser.ts`, `src/lib/gymService.ts`, `src/components/gym/SheetUploader.tsx`, `src/components/gym/GymApp.tsx`)
+- Added `targetRpe?: string` to `WorkoutExercise` (`src/types.ts`) and `rpe?: string` to `ParsedExerciseRow` (`src/lib/sheetParser.ts`).
+- Extended `buildMergedDualHeaderRow`, `classifyExtraDataHeader`, `isHeaderRowMatch`, and `parseLoggedCellEntries` in `src/lib/sheetParser.ts` to extract `Target RPE`, `RPE`, dual-row `Week N -> RPE` headers, `Week N RPE`, `Set N RPE`, and inline `@ RPE X` / `[RPE X]` annotations.
+- Added an editable **RPE** column and weekly RPE summary badges inside `src/components/gym/SheetUploader.tsx`, wired persistence through `buildWorkoutPlan` and `mergeUpdatedWorksheetIntoPlan` (`src/lib/gymService.ts`), and rendered **Target RPE** badges, inline editing, worksheet table editing, and Set RPE placeholders inside `GymApp.tsx`.
+- Removed the redundant top `(Previous ...)` reference bar and trailing inline `Prev:` labels from individual exercise cards in `GymApp.tsx` so athletes reference clean weekly history directly from **History by Weeks** at the bottom of each exercise card.
+
+### C. Redesigned Day-Combined PDF & 5-Sheet Excel Exports (`src/lib/workoutPdfExport.ts`, `src/lib/workoutExcelExport.ts`)
+- **PDF Report (`src/lib/workoutPdfExport.ts`)**: Rebuilt with an executive header banner, 4-box KPI strip, **Program Split Summary (By Training Day)** table, **Warm-up Protocol** table, and **Combined Day Sections** grouping each day's exercises, `Target RPE`, aligned weekly `Set / RPE Avg / Volume` tables, and day-paired Session Feedback.
+- **Excel Workbook (`src/lib/workoutExcelExport.ts`)**: Rebuilt the 5-sheet `.xlsx` report (`Workout Sheet`, `Daily Analytics`, `Set-by-Set Log`, `Warm-up & Hydration`, `Notes & Instructions`) with title/KPI banners, merged 2-row Week super-headers, Day group divider rows, AutoFilters, custom row heights/column widths, `Target RPE` & `Avg RPE` analytics, and full round-trip compatibility with `sheetParser.ts`.
+
+### D. Portaled Dashboard Export Dropdown Fix (`src/components/gym/GymApp.tsx`)
+- Refactored `renderExportControl` to render its dropdown menu via `createPortal(..., document.body)` with `position: fixed` (`z-[9999]`), viewport-clamped alignment, automatic upward flipping near the viewport bottom, and dynamic scroll/resize repositioning.
+- Isolated `overflow-hidden` inside the Training Dashboard hero card glow wrapper so the Export dropdown never clips or hides underneath adjacent cards.
+
+
