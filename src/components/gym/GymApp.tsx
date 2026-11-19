@@ -1796,6 +1796,15 @@ export const GymApp: React.FC<GymAppProps> = ({
                             Target: {[setsDisplay && `${setsDisplay} sets`, repsDisplay && `${repsDisplay} reps`].filter(Boolean).join(' × ')}
                           </span>
                         )}
+                        {videoInfo && (
+                          <button
+                            type="button"
+                            onClick={() => setInlineVideoExId(prev => (prev === ex.id ? null : ex.id))}
+                            className="sm:hidden text-[11px] font-bold text-red-200 bg-red-600/25 border border-red-500/40 px-2.5 py-0.5 rounded-full inline-flex items-center gap-1 cursor-pointer"
+                          >
+                            {inlineVideoExId === ex.id ? <X className="w-3 h-3" /> : <Play className="w-3 h-3 fill-current" />} Demo
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={() => (isEditingThis ? setEditingExerciseId(null) : startEditExercise(ex))}
@@ -2091,7 +2100,7 @@ export const GymApp: React.FC<GymAppProps> = ({
 
                   {/* Right: VIDEO THUMBNAIL CARD (Opens inline WebView player directly on page) */}
                   {videoInfo && (
-                    <div className="w-full sm:w-44 shrink-0 space-y-1.5">
+                    <div className="hidden sm:block w-44 shrink-0 space-y-1.5">
                       <button
                         type="button"
                         onClick={() => setInlineVideoExId(prev => (prev === ex.id ? null : ex.id))}
