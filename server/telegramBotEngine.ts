@@ -34,6 +34,7 @@ export interface FirestoreUserRecord {
     date?: string;
     glasses?: number;
     updatedAt?: string;
+    timezoneOffsetMinutes?: number;
     reminderEnabled?: boolean;
     reminderIntervalMinutes?: number;
   };
@@ -48,6 +49,8 @@ export interface FirestoreWorkoutPlanRecord {
   sheetName?: string;
   defaultWeightUnit?: 'kg' | 'lbs';
   weeks: number;
+  hasRpeColumn?: boolean;
+  hasRirColumn?: boolean;
   warmupExercises?: any[];
   warmupLogs?: Record<string, Record<string, any>>;
   exercises: Array<{
@@ -56,6 +59,8 @@ export interface FirestoreWorkoutPlanRecord {
     name?: string;
     sets?: string;
     reps?: string;
+    targetRpe?: string;
+    targetRir?: string;
     notes?: string;
     videoUrl?: string;
     isSuperset?: boolean;
@@ -217,7 +222,7 @@ export function isBotConfirmationCommand(rawText: string): boolean {
   );
 }
 
-function escapeHtml(str: string): string {
+export function escapeHtml(str: string): string {
   return String(str || '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -272,17 +277,138 @@ function computePlanStats(plan: FirestoreWorkoutPlanRecord): {
   };
 }
 
-function getTodayDateKey(): string {
+export interface ServerWaterIntakeSnapshot {
+  date: string;
+  glasses: number;
+  updatedAt: string;
+  timezoneOffsetMinutes?: number;
+  reminderEnabled?: boolean;
+  reminderIntervalMinutes?: number;
+}
+
+const serverWaterIntakeOverrides = new Map<string, ServerWaterIntakeSnapshot>();
+
+export function hydrateServerWaterIntakeOverrides(
+  mapObj?: Record<string, ServerWaterIntakeSnapshot> | null
+) {
+  if (!mapObj || typeof mapObj !== 'object') return;
+  for (const [k, v] of Object.entries(mapObj)) {
+    if (!v || typeof v !== 'object') continue;
+    const key = k.trim().toLowerCase();
+    if (!key) continue;
+    const prev = serverWaterIntakeOverrides.get(key);
+    const prevTs = prev?.updatedAt ? (Date.parse(prev.updatedAt) || 0) : 0;
+    const nextTs = v.updatedAt ? (Date.parse(v.updatedAt) || 0) : 0;
+    if (!prev || nextTs >= prevTs) {
+      serverWaterIntakeOverrides.set(key, v);
+    }
+  }
+}
+
+export function upsertServerWaterIntakeOverride(
+  username: string,
+  snapshot: ServerWaterIntakeSnapshot
+) {
+  const key = (username || '').trim().toLowerCase();
+  if (!key) return;
+  const prev = serverWaterIntakeOverrides.get(key);
+  const prevTs = prev?.updatedAt ? (Date.parse(prev.updatedAt) || 0) : 0;
+  const nextTs = snapshot.updatedAt ? (Date.parse(snapshot.updatedAt) || 0) : Date.now();
+  if (!prev || nextTs >= prevTs) {
+    serverWaterIntakeOverrides.set(key, snapshot);
+  }
+}
+
+export function exportServerWaterIntakeOverrides(): Record<string, ServerWaterIntakeSnapshot> {
+  const out: Record<string, ServerWaterIntakeSnapshot> = {};
+  for (const [k, v] of serverWaterIntakeOverrides.entries()) {
+    out[k] = v;
+  }
+  return out;
+}
+
+export function resolveEffectiveUserWaterIntake(
+  user: FirestoreUserRecord | null
+): FirestoreUserRecord['waterIntake'] | undefined {
+  if (!user) return undefined;
+  const key = (user.username || '').trim().toLowerCase();
+  const dbWater = user.waterIntake;
+  const memWater = key ? serverWaterIntakeOverrides.get(key) : undefined;
+  if (!dbWater && !memWater) return undefined;
+  if (!dbWater) return memWater;
+  if (!memWater) return dbWater;
+  const dbTs = dbWater.updatedAt ? (Date.parse(dbWater.updatedAt) || 0) : 0;
+  const memTs = memWater.updatedAt ? (Date.parse(memWater.updatedAt) || 0) : 0;
+  return memTs >= dbTs ? { ...dbWater, ...memWater } : dbWater;
+}
+
+function formatDateKeyInOffset(nowMs: number, offsetMinutes: number): string {
+  const shifted = new Date(nowMs + offsetMinutes * 60_000);
+  return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, '0')}-${String(shifted.getUTCDate()).padStart(2, '0')}`;
+}
+
+function getTodayDateKey(offsetMinutes?: number): string {
+  if (typeof offsetMinutes === 'number' && Number.isFinite(offsetMinutes)) {
+    return formatDateKeyInOffset(Date.now(), offsetMinutes);
+  }
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-function getUserTodayWaterGlasses(user: FirestoreUserRecord | null): number | undefined {
-  if (!user?.waterIntake) return undefined;
-  const dateStr = (user.waterIntake.date || '').trim();
-  if (dateStr && dateStr !== getTodayDateKey()) return 0;
-  const n = Number(user.waterIntake.glasses);
+export function getUserTodayWaterGlasses(user: FirestoreUserRecord | null): number | undefined {
+  const water = resolveEffectiveUserWaterIntake(user);
+  if (!water) return undefined;
+  const dateStr = (water.date || '').trim();
+  if (dateStr) {
+    if (typeof water.timezoneOffsetMinutes === 'number' && Number.isFinite(water.timezoneOffsetMinutes)) {
+      const userToday = getTodayDateKey(water.timezoneOffsetMinutes);
+      if (dateStr !== userToday) return 0;
+    } else {
+      const serverToday = getTodayDateKey();
+      const utcToday = formatDateKeyInOffset(Date.now(), 0);
+      const updatedMs = water.updatedAt ? (Date.parse(water.updatedAt) || 0) : 0;
+      const recentlyUpdated = updatedMs > 0 && Date.now() - updatedMs < 14 * 3600_000;
+      if (dateStr !== serverToday && dateStr !== utcToday && !recentlyUpdated) {
+        return 0;
+      }
+    }
+  }
+  const n = Number(water.glasses);
   return Number.isFinite(n) && n >= 0 ? Math.min(40, Math.floor(n)) : undefined;
+}
+
+export function formatWaterIntakeTelegramMessageHtml(
+  memberName: string,
+  glassesToday: number,
+  goalGlasses = 8,
+  note?: string,
+  timezoneOffsetMinutes?: number
+): string {
+  const remaining = Math.max(0, goalGlasses - glassesToday);
+  const pct = Math.min(100, Math.round((glassesToday / Math.max(1, goalGlasses)) * 100));
+  const bar = buildProgressBar(pct);
+
+  let timeLabel = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  if (typeof timezoneOffsetMinutes === 'number' && Number.isFinite(timezoneOffsetMinutes)) {
+    const shifted = new Date(Date.now() + timezoneOffsetMinutes * 60_000);
+    const hrs24 = shifted.getUTCHours();
+    const mins = shifted.getUTCMinutes();
+    const ampm = hrs24 >= 12 ? 'PM' : 'AM';
+    const hrs12 = hrs24 % 12 || 12;
+    timeLabel = `${String(hrs12).padStart(2, '0')}:${String(mins).padStart(2, '0')} ${ampm}`;
+  }
+
+  return (
+    `💧 <b>Gym Workout — Water Intake Reminder</b>\n\n` +
+    `Athlete: <b>${escapeHtml(memberName)}</b>\n` +
+    `Today's Intake: <b>${glassesToday} / ${goalGlasses}</b> glasses\n` +
+    `Progress: <code>${bar}</code>\n` +
+    (remaining > 0
+      ? `Remaining: <b>${remaining} glass${remaining === 1 ? '' : 'es'}</b> left for today's hydration target.\n`
+      : `Daily hydration target reached! 🎉\n`) +
+    (note ? `\n<i>${escapeHtml(note)}</i>\n` : '') +
+    `\nTime: <i>${escapeHtml(timeLabel)}</i>`
+  );
 }
 
 function toFullWorkoutPlan(rec: FirestoreWorkoutPlanRecord): WorkoutPlan {
@@ -295,6 +421,8 @@ function toFullWorkoutPlan(rec: FirestoreWorkoutPlanRecord): WorkoutPlan {
     sheetName: rec.sheetName,
     defaultWeightUnit: rec.defaultWeightUnit === 'lbs' ? 'lbs' : 'kg',
     weeks: Math.max(1, Number(rec.weeks) || 1),
+    ...(typeof rec.hasRpeColumn === 'boolean' ? { hasRpeColumn: rec.hasRpeColumn } : {}),
+    ...(typeof rec.hasRirColumn === 'boolean' ? { hasRirColumn: rec.hasRirColumn } : {}),
     warmupExercises: Array.isArray(rec.warmupExercises) ? rec.warmupExercises : [],
     warmupLogs: rec.warmupLogs || {},
     exercises: (Array.isArray(rec.exercises) ? rec.exercises : []).map((ex, idx) => ({
@@ -303,6 +431,8 @@ function toFullWorkoutPlan(rec: FirestoreWorkoutPlanRecord): WorkoutPlan {
       ...(ex?.day ? { day: ex.day } : {}),
       ...(ex?.sets ? { sets: ex.sets } : {}),
       ...(ex?.reps ? { reps: ex.reps } : {}),
+      ...(ex?.targetRpe ? { targetRpe: ex.targetRpe } : {}),
+      ...(ex?.targetRir ? { targetRir: ex.targetRir } : {}),
       ...(ex?.notes ? { notes: ex.notes } : {}),
       ...(ex?.videoUrl ? { videoUrl: ex.videoUrl } : {}),
       ...(ex?.isSuperset ? { isSuperset: true } : {}),
@@ -628,19 +758,19 @@ export async function buildTelegramCommandReply(params: {
       );
     }
 
+    const effectiveWater = resolveEffectiveUserWaterIntake(linkedAccount);
     const todayGlasses = getUserTodayWaterGlasses(linkedAccount) ?? 0;
     const goal = 8;
-    const pct = Math.min(100, Math.round((todayGlasses / goal) * 100));
-    const remaining = Math.max(0, goal - todayGlasses);
-
-    return (
-      `💧 <b>Water Intake Reminder — ${memberLabel}</b>\n\n` +
-      `• <b>Today's Intake:</b> <b>${todayGlasses} / ${goal}</b> glasses\n` +
-      `• <b>Daily Goal:</b> <code>${buildProgressBar(pct)}</code>\n` +
-      (remaining > 0
-        ? `• <b>Remaining:</b> ${remaining} more glass${remaining === 1 ? '' : 'es'} to hit today's goal! 🥤\n\n` +
-          `<i>Time for a water break — grab a glass now and tap <b>+</b> on your Dashboard!</i>`
-        : `• <b>Status:</b> Daily hydration target reached! 🎉 Great discipline!`)
+    const note =
+      todayGlasses >= goal
+        ? 'Great work staying hydrated!'
+        : 'Time for a water break — grab a glass now and tap + on your Dashboard!';
+    return formatWaterIntakeTelegramMessageHtml(
+      linkedAccount.displayName?.trim() || linkedAccount.username,
+      todayGlasses,
+      goal,
+      note,
+      effectiveWater?.timezoneOffsetMinutes
     );
   }
 
@@ -888,7 +1018,7 @@ export async function replyToTelegramMessage(
         const { filename, buffer } = await exportWorkoutPlanToExcelBuffer(fullPlan, { ownerName, waterGlasses });
         const caption =
           `📊 <b>${escapeHtml(fullPlan.title)}</b> (Excel .xlsx)\n` +
-          `Includes Workout Plan, Set-by-Set History (RPE & Volume), Warm-up Tracker, Notes & Summary.` +
+          `Includes Workout Plan, Daily Analytics, Set-by-Set History, Warm-up Tracker &amp; Notes.` +
           planHint;
         const sent = await sendTelegramDocument(
           token,

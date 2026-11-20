@@ -1,5 +1,6 @@
 import { jsPDF } from 'jspdf';
 import { ExerciseLogEntry, SetLogEntry, WeightUnit, WorkoutExercise, WorkoutPlan } from '../types';
+import { planHasRirColumn, planHasRpeColumn } from './gymService';
 import { parseSetsCount, splitSetsAndReps } from './sheetParser';
 
 const weekKey = (weekIdx: number) => `w${weekIdx + 1}`;
@@ -34,15 +35,21 @@ function getTargetText(ex: WorkoutExercise): { setsDisplay: string; repsDisplay:
 }
 
 function getPopulatedSetList(
-  ex: WorkoutExercise,
+  _ex: WorkoutExercise,
   entry: ExerciseLogEntry | undefined,
   fallbackUnit: WeightUnit
 ): SetLogEntry[] {
   if (!entry) return [];
   if (entry.setEntries && entry.setEntries.length > 0) {
     return entry.setEntries
-      .filter(s => (s.weight || '').trim() !== '' || (s.reps || '').trim() !== '' || (s.rpe || '').trim() !== '')
-      .map(s => ({ ...s, unit: s.unit || entry.unit || fallbackUnit }));
+      .filter(
+        (s) =>
+          (s.weight || '').trim() !== '' ||
+          (s.reps || '').trim() !== '' ||
+          (s.rpe || '').trim() !== '' ||
+          (s.rir || '').trim() !== ''
+      )
+      .map((s) => ({ ...s, unit: s.unit || entry.unit || fallbackUnit }));
   }
   if (entry.weight?.trim() || entry.reps?.trim()) {
     return [
@@ -57,33 +64,30 @@ function getPopulatedSetList(
   return [];
 }
 
-function formatCompactSet(s: SetLogEntry, fallbackUnit: WeightUnit): string {
+function formatCompactSet(
+  s: SetLogEntry,
+  fallbackUnit: WeightUnit,
+  showRpe: boolean,
+  showRir: boolean
+): string {
   const wt = (s.weight || '').trim();
   const rp = (s.reps || '').trim();
-  const rpe = (s.rpe || '').trim();
+  const rpe = showRpe ? (s.rpe || '').trim() : '';
+  const rir = showRir ? (s.rir || '').trim() : '';
   const unit = s.unit || fallbackUnit;
   const wtPart = wt ? (wt.toUpperCase() === 'BW' ? 'BW' : `${wt}${unit}`) : '-';
   const rpPart = rp || '-';
-  const rpePart = rpe ? ` @${rpe}` : '';
-  return `S${s.setNumber}: ${wtPart} x ${rpPart}${rpePart}`;
+  const tags: string[] = [];
+  if (rpe) tags.push(`RPE ${rpe}`);
+  if (rir) tags.push(`RIR ${rir}`);
+  const extraPart = tags.length > 0 ? ` (${tags.join(' ')})` : '';
+  return `S${s.setNumber}: ${wtPart} x ${rpPart}${extraPart}`;
 }
 
-function calcEntryVolume(sets: SetLogEntry[]): number {
-  let vol = 0;
-  for (const s of sets) {
-    const w = parseFloat((s.weight || '').trim());
-    const r = parseFloat((s.reps || '').trim());
-    if (Number.isFinite(w) && Number.isFinite(r) && w > 0 && r > 0) {
-      vol += w * r;
-    }
-  }
-  return vol;
-}
-
-function calcAvgRpe(sets: SetLogEntry[]): string {
+function calcAvgMetric(sets: SetLogEntry[], field: 'rpe' | 'rir'): string {
   const vals = sets
-    .map(s => parseFloat((s.rpe || '').trim()))
-    .filter(n => Number.isFinite(n));
+    .map((s) => parseFloat((s[field] || '').trim()))
+    .filter((n) => Number.isFinite(n));
   if (vals.length === 0) return '-';
   const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
   return avg.toFixed(1).replace(/\.0$/, '');
@@ -121,6 +125,8 @@ export function buildWorkoutPlanPdfDocument(
   const weeks = Math.max(1, Number(plan.weeks) || 1);
   const exercises = plan.exercises || [];
   const warmupExercises = plan.warmupExercises || [];
+  const showRpe = planHasRpeColumn(plan);
+  const showRir = planHasRirColumn(plan);
 
   // Discover all week numbers present across plan & logs
   const weekNumsSet = new Set<number>();
@@ -135,7 +141,7 @@ export function buildWorkoutPlanPdfDocument(
   });
   const sortedWeekNums = Array.from(weekNumsSet).sort((a, b) => a - b);
 
-  // Aggregate completions & total volume
+  // Aggregate completions & total sets logged
   let totalDone = 0;
   const totalPossible = exercises.length * weeks;
   for (let w = 0; w < weeks; w++) {
@@ -143,17 +149,12 @@ export function buildWorkoutPlanPdfDocument(
   }
   const overallPct = totalPossible > 0 ? Math.round((totalDone / totalPossible) * 100) : 0;
 
-  let grandTotalVolume = 0;
-  const weeklyVolumes: Record<number, number> = {};
+  let totalSetsLogged = 0;
   sortedWeekNums.forEach((w) => {
     const wk = weekKey(w - 1);
-    let wkVol = 0;
     exercises.forEach((ex) => {
-      const sets = getPopulatedSetList(ex, plan.exerciseLogs?.[wk]?.[ex.id], planUnit);
-      wkVol += calcEntryVolume(sets);
+      totalSetsLogged += getPopulatedSetList(ex, plan.exerciseLogs?.[wk]?.[ex.id], planUnit).length;
     });
-    weeklyVolumes[w] = Math.round(wkVol);
-    grandTotalVolume += wkVol;
   });
 
   // Group exercises into ordered Days
@@ -248,7 +249,7 @@ export function buildWorkoutPlanPdfDocument(
   const kpiW = (contentWidth - kpiGap * 3) / 4;
   const kpis = [
     { label: 'OVERALL COMPLETION', value: `${overallPct}% (${totalDone}/${totalPossible})` },
-    { label: 'LOGGED VOLUME', value: grandTotalVolume > 0 ? `${Math.round(grandTotalVolume).toLocaleString()} ${planUnit}` : `0 ${planUnit}` },
+    { label: 'SETS LOGGED', value: `${totalSetsLogged} Set${totalSetsLogged === 1 ? '' : 's'}` },
     { label: 'PROGRAM SPLIT', value: `${dayOrder.length} Day${dayOrder.length === 1 ? '' : 's'} / ${exercises.length} Ex` },
     { label: 'HYDRATION TODAY', value: typeof options.waterGlasses === 'number' ? `${options.waterGlasses} / 8 Glasses` : `${weeks} Week Plan` },
   ];
@@ -292,8 +293,8 @@ export function buildWorkoutPlanPdfDocument(
     doc.text('Program Split Summary (By Training Day)', margin, y);
     y += 4;
 
-    const colWidths = [contentWidth * 0.36, contentWidth * 0.14, contentWidth * 0.15, contentWidth * 0.17, contentWidth * 0.18];
-    const headers = ['Training Day', 'Exercises', 'Target Sets', 'Total Volume', 'Completion'];
+    const colWidths = [contentWidth * 0.44, contentWidth * 0.16, contentWidth * 0.18, contentWidth * 0.22];
+    const headers = ['Training Day', 'Exercises', 'Target Sets', 'Completion'];
 
     // Header row
     doc.setFillColor(30, 41, 59);
@@ -312,7 +313,6 @@ export function buildWorkoutPlanPdfDocument(
       ensureSpace(rowH + 2);
       const list = dayExercisesMap.get(dayName) || [];
       const dayTargetSets = list.reduce((acc, item) => acc + parseSetsCount(item.ex.sets), 0);
-      let dayVol = 0;
       let dayDoneCount = 0;
       const dayPossible = list.length * weeks;
       sortedWeekNums.forEach((w) => {
@@ -320,7 +320,6 @@ export function buildWorkoutPlanPdfDocument(
         const doneSet = new Set(plan.progress?.[wk] || []);
         list.forEach(({ ex }) => {
           if (w <= weeks && doneSet.has(ex.id)) dayDoneCount++;
-          dayVol += calcEntryVolume(getPopulatedSetList(ex, plan.exerciseLogs?.[wk]?.[ex.id], planUnit));
         });
       });
       const dayPct = dayPossible > 0 ? Math.round((dayDoneCount / dayPossible) * 100) : 0;
@@ -342,8 +341,6 @@ export function buildWorkoutPlanPdfDocument(
       rx += colWidths[1];
       doc.text(String(dayTargetSets), rx + 2.5, y + 4.3);
       rx += colWidths[2];
-      doc.text(dayVol > 0 ? `${Math.round(dayVol).toLocaleString()} ${planUnit}` : '-', rx + 2.5, y + 4.3);
-      rx += colWidths[3];
       doc.setFont('helvetica', 'bold');
       doc.setTextColor(dayPct === 100 ? 22 : 185, dayPct === 100 ? 163 : 28, dayPct === 100 ? 74 : 28);
       doc.text(`${dayPct}% (${dayDoneCount}/${dayPossible})`, rx + 2.5, y + 4.3);
@@ -409,11 +406,15 @@ export function buildWorkoutPlanPdfDocument(
         const wEntry = plan.warmupLogs?.[weekKey(w - 1)]?.[wu.id];
         if (!wEntry) return;
         const popSets = (wEntry.setEntries || []).filter(
-          s => (s.weight || '').trim() !== '' || (s.reps || '').trim() !== '' || (s.rpe || '').trim() !== ''
+          (s) =>
+            (s.weight || '').trim() !== '' ||
+            (s.reps || '').trim() !== '' ||
+            (s.rpe || '').trim() !== '' ||
+            (s.rir || '').trim() !== ''
         );
         const parts: string[] = [];
         if (wEntry.completed) parts.push('[Done]');
-        if (popSets.length > 0) parts.push(popSets.map(s => formatCompactSet(s, planUnit)).join(', '));
+        if (popSets.length > 0) parts.push(popSets.map((s) => formatCompactSet(s, planUnit, showRpe, showRir)).join(', '));
         if (wEntry.notes?.trim()) parts.push(pdfSafeText(wEntry.notes));
         if (parts.length > 0) logBits.push(`W${w}: ${parts.join(' ')}`);
       });
@@ -456,14 +457,6 @@ export function buildWorkoutPlanPdfDocument(
     const dayNotes = (daySessionNotes.get(dayName) || []).sort((a, b) => a.weekNum - b.weekNum);
     const dayTargetSets = dayItems.reduce((acc, item) => acc + parseSetsCount(item.ex.sets), 0);
 
-    let dayVolTotal = 0;
-    sortedWeekNums.forEach((w) => {
-      const wk = weekKey(w - 1);
-      dayItems.forEach(({ ex }) => {
-        dayVolTotal += calcEntryVolume(getPopulatedSetList(ex, plan.exerciseLogs?.[wk]?.[ex.id], planUnit));
-      });
-    });
-
     ensureSpace(26);
     // Bold Day Group Banner
     doc.setFillColor(24, 24, 32);
@@ -483,7 +476,7 @@ export function buildWorkoutPlanPdfDocument(
     doc.setFont('helvetica', 'normal');
     doc.setFontSize(8);
     doc.setTextColor(203, 213, 225);
-    const rightMeta = `${dayItems.length} Exercises  |  ${dayTargetSets} Target Sets${dayVolTotal > 0 ? `  |  ${Math.round(dayVolTotal).toLocaleString()} ${planUnit} Volume` : ''}`;
+    const rightMeta = `${dayItems.length} Exercises  |  ${dayTargetSets} Target Sets`;
     doc.text(rightMeta, pageWidth - margin - 3, y + 6.2, { align: 'right' });
     y += 12.5;
 
@@ -496,13 +489,13 @@ export function buildWorkoutPlanPdfDocument(
         }
       }
 
-      // Build structured weekly log rows for this exercise
+      // Build structured weekly log rows for this exercise (No Volume; conditional RPE & RIR)
       const weekTableRows: Array<{
         wkLabel: string;
         status: string;
         setsText: string;
         avgRpe: string;
-        volume: string;
+        avgRir: string;
         note: string;
       }> = [];
 
@@ -514,13 +507,12 @@ export function buildWorkoutPlanPdfDocument(
         const wkNote = pdfSafeText(entry?.notes);
         if (popSets.length === 0 && !wkNote && !isDone) return;
 
-        const wkVol = Math.round(calcEntryVolume(popSets));
         weekTableRows.push({
           wkLabel: `W${w}`,
           status: isDone ? 'Done' : '-',
-          setsText: popSets.length > 0 ? popSets.map(s => formatCompactSet(s, planUnit)).join('  |  ') : '-',
-          avgRpe: popSets.length > 0 ? calcAvgRpe(popSets) : '-',
-          volume: wkVol > 0 ? `${wkVol} ${planUnit}` : '-',
+          setsText: popSets.length > 0 ? popSets.map((s) => formatCompactSet(s, planUnit, showRpe, showRir)).join('  |  ') : '-',
+          avgRpe: showRpe && popSets.length > 0 ? calcAvgMetric(popSets, 'rpe') : '-',
+          avgRir: showRir && popSets.length > 0 ? calcAvgMetric(popSets, 'rir') : '-',
           note: wkNote || '',
         });
       });
@@ -536,8 +528,11 @@ export function buildWorkoutPlanPdfDocument(
       if (setsDisplay || repsDisplay) {
         metaBadges.push(`Target: ${[setsDisplay && `${setsDisplay} sets`, repsDisplay && `${repsDisplay} reps`].filter(Boolean).join(' x ')}`);
       }
-      if (ex.targetRpe?.trim()) {
+      if (showRpe && ex.targetRpe?.trim()) {
         metaBadges.push(`Target RPE: ${pdfSafeText(ex.targetRpe)}`);
+      }
+      if (showRir && ex.targetRir?.trim()) {
+        metaBadges.push(`Target RIR: ${pdfSafeText(ex.targetRir)}`);
       }
       if (completedWeeks.length > 0) {
         metaBadges.push(`Done: ${completedWeeks.join(', ')}`);
@@ -545,11 +540,11 @@ export function buildWorkoutPlanPdfDocument(
 
       const coachNotesLines = ex.notes ? doc.splitTextToSize(`Coach Note: ${pdfSafeText(ex.notes)}`, contentWidth - 10) : [];
 
-      // Pre-compute table height
-      const tblCols = [13, 13, contentWidth - 62, 16, 20];
+      const extraColW = (showRpe ? 16 : 0) + (showRir ? 16 : 0);
+      const setsColW = contentWidth - 6 - 26 - extraColW;
       const wrappedRows = weekTableRows.map((r) => {
         const combinedDetail = r.note ? `${r.setsText}\nNote: ${r.note}` : r.setsText;
-        const lines = doc.splitTextToSize(pdfSafeText(combinedDetail), tblCols[2] - 4);
+        const lines = doc.splitTextToSize(pdfSafeText(combinedDetail), setsColW - 4);
         const rh = Math.max(5.5, lines.length * 3.7 + 2);
         return { ...r, lines, rh };
       });
@@ -616,9 +611,22 @@ export function buildWorkoutPlanPdfDocument(
         doc.setFont('helvetica', 'bold');
         doc.setFontSize(7.2);
         doc.setTextColor(51, 65, 85);
-        const innerCols = [13, 13, contentWidth - 6 - 62, 16, 20];
+
+        const metricSuffix = [showRpe ? 'RPE' : '', showRir ? 'RIR' : ''].filter(Boolean).join('/');
+        const setsHeaderLabel = metricSuffix ? `Logged Sets (Wt x Reps · ${metricSuffix})` : 'Logged Sets (Weight x Reps)';
+        const tblHeaders: string[] = ['Week', 'Done', setsHeaderLabel];
+        const innerCols: number[] = [13, 13, setsColW];
+        if (showRpe) {
+          tblHeaders.push('RPE Avg');
+          innerCols.push(16);
+        }
+        if (showRir) {
+          tblHeaders.push('RIR Avg');
+          innerCols.push(16);
+        }
+
         let tx = margin + 3;
-        ['Week', 'Done', 'Logged Sets (Weight x Reps @ RPE)', 'RPE Avg', 'Volume'].forEach((hdr, i) => {
+        tblHeaders.forEach((hdr, i) => {
           doc.text(hdr, tx + 1.8, cy + 3.9);
           tx += innerCols[i];
         });
@@ -651,15 +659,21 @@ export function buildWorkoutPlanPdfDocument(
           doc.text(wr.lines, rx + 1.8, cy + 3.8);
           rx += innerCols[2];
 
-          doc.setFont('helvetica', 'bold');
-          doc.setFontSize(7.5);
-          doc.setTextColor(180, 83, 9);
-          doc.text(wr.avgRpe, rx + 1.8, cy + 3.8);
-          rx += innerCols[3];
-
-          doc.setFont('helvetica', 'normal');
-          doc.setTextColor(51, 65, 85);
-          doc.text(wr.volume, rx + 1.8, cy + 3.8);
+          let extraColIdx = 3;
+          if (showRpe) {
+            doc.setFont('helvetica', 'bold');
+            doc.setFontSize(7.5);
+            doc.setTextColor(180, 83, 9);
+            doc.text(wr.avgRpe, rx + 1.8, cy + 3.8);
+            rx += innerCols[extraColIdx];
+            extraColIdx++;
+          }
+          if (showRir) {
+            doc.setFont('helvetica', 'bold');
+            doc.setFontSize(7.5);
+            doc.setTextColor(3, 105, 161);
+            doc.text(wr.avgRir, rx + 1.8, cy + 3.8);
+          }
 
           cy += wr.rh;
         });

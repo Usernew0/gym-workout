@@ -7,11 +7,20 @@ import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   TELEGRAM_BOT_COMMANDS,
+  escapeHtml,
+  exportServerWaterIntakeOverrides,
   fetchFirestoreTelegramConfig,
+  fetchFirestoreUserAccounts,
+  formatWaterIntakeTelegramMessageHtml,
+  getUserTodayWaterGlasses,
+  hydrateServerWaterIntakeOverrides,
   isBotConfirmationCommand,
   registerTelegramCommandsMenu,
   replyToTelegramMessage,
+  resolveEffectiveUserWaterIntake,
+  resolveTelegramAccess,
   sendTelegramDocument,
+  upsertServerWaterIntakeOverride,
 } from './server/telegramBotEngine';
 import { handleSupabaseProxyAction } from './server/supabaseProxy';
 
@@ -180,6 +189,7 @@ Return a structured JSON object containing:
   let pollingPausedDueToWebhook = false;
   let isPollingInFlight = false;
   let commandsRegisteredForToken = '';
+  let lastWaterReminderSentAt: Record<string, number> = {};
 
   const botStatePath = path.join(projectRoot, 'tmp', 'telegram_bot_state.json');
   try {
@@ -190,6 +200,12 @@ Return a structured JSON object containing:
       }
       if (typeof savedState?.lastProcessedUpdateId === 'number') {
         lastProcessedUpdateId = savedState.lastProcessedUpdateId;
+      }
+      if (savedState?.lastWaterReminderSentAt && typeof savedState.lastWaterReminderSentAt === 'object') {
+        lastWaterReminderSentAt = savedState.lastWaterReminderSentAt;
+      }
+      if (savedState?.waterIntakeOverrides && typeof savedState.waterIntakeOverrides === 'object') {
+        hydrateServerWaterIntakeOverrides(savedState.waterIntakeOverrides);
       }
     }
   } catch {
@@ -205,6 +221,8 @@ Return a structured JSON object containing:
         JSON.stringify({
           botToken: lastKnownBotToken,
           lastProcessedUpdateId,
+          lastWaterReminderSentAt,
+          waterIntakeOverrides: exportServerWaterIntakeOverrides(),
           updatedAt: new Date().toISOString(),
         }, null, 2)
       );
@@ -389,6 +407,252 @@ Return a structured JSON object containing:
   setTimeout(() => {
     void pollTelegramCommandsOnce();
   }, 2500);
+
+  // Resolve a single whitelisted user's target Telegram Chat ID for server-initiated notifications
+  function resolveMemberChatId(
+    user: { username: string; telegramChatId?: string; telegramUsername?: string; telegramNotificationsEnabled?: boolean },
+    accounts: any[],
+    tgConfig: any
+  ): string | null {
+    if (!tgConfig?.enabled || user.telegramNotificationsEnabled === false) return null;
+    const unameLower = (user.username || '').trim().toLowerCase();
+    const uHandleBare = (user.telegramUsername || '').trim().replace(/^@/, '').toLowerCase();
+    const directChat = (user.telegramChatId || '').trim();
+
+    const authEntry = (tgConfig.authorizedUsers || []).find((a: any) => {
+      if (a.isActive === false) return false;
+      const appMatch = (a.appUsername || '').trim().toLowerCase() === unameLower;
+      const chatMatch = directChat && (a.chatId || '').trim() === directChat;
+      const handleMatch = uHandleBare && (a.telegramUsername || '').trim().replace(/^@/, '').toLowerCase() === uHandleBare;
+      return appMatch || chatMatch || handleMatch;
+    });
+
+    const candidateChat = (directChat || authEntry?.chatId || '').trim();
+    if (!candidateChat) return null;
+
+    const access = resolveTelegramAccess(accounts, tgConfig, candidateChat, user.telegramUsername || '');
+    if (!access.authorized) return null;
+    if (access.linkedAccount && access.linkedAccount.username.trim().toLowerCase() !== unameLower) {
+      return null;
+    }
+    return candidateChat;
+  }
+
+  // Background Scheduled Water Intake Reminder Loop (continues running even when website is closed)
+  let isWaterPassRunning = false;
+  async function runScheduledWaterRemindersPass() {
+    if (isWaterPassRunning) return;
+    isWaterPassRunning = true;
+    try {
+      const [tgConfig, accounts] = await Promise.all([
+        fetchFirestoreTelegramConfig().catch(() => null),
+        fetchFirestoreUserAccounts().catch(() => []),
+      ]);
+      if (!tgConfig?.enabled || tgConfig?.notifyWater === false) return;
+      const token = await resolveEffectiveBotToken(tgConfig.botToken);
+      if (!token) return;
+
+      const now = Date.now();
+      let stateDirty = false;
+
+      for (const user of accounts) {
+        const effectiveWater = resolveEffectiveUserWaterIntake(user);
+        if (effectiveWater?.reminderEnabled !== true) continue;
+        const targetChatId = resolveMemberChatId(user, accounts, tgConfig);
+        if (!targetChatId) continue;
+
+        const intervalMin = Math.max(
+          1,
+          Math.min(1440, Math.round(Number(effectiveWater?.reminderIntervalMinutes || (tgConfig as any)?.waterReminderMinutes || 60)))
+        );
+        const userKey = user.username.trim().toLowerCase();
+        const updatedMs = effectiveWater?.updatedAt ? Date.parse(effectiveWater.updatedAt) : 0;
+        const lastSentMs = lastWaterReminderSentAt[userKey] || 0;
+        const anchorMs = Math.max(lastSentMs, Number.isFinite(updatedMs) ? updatedMs : 0);
+
+        if (now - anchorMs < intervalMin * 60_000) continue;
+
+        const mergedUser = { ...user, waterIntake: effectiveWater };
+        const glasses = getUserTodayWaterGlasses(mergedUser) ?? 0;
+        const goal = 8;
+        const memberName = user.displayName?.trim() || user.username;
+        const note =
+          glasses >= goal
+            ? 'Great work staying hydrated!'
+            : 'Time for another glass of water to fuel your recovery!';
+        const msgHtml = formatWaterIntakeTelegramMessageHtml(
+          memberName,
+          glasses,
+          goal,
+          note,
+          effectiveWater?.timezoneOffsetMinutes
+        );
+
+        try {
+          const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: targetChatId,
+              text: msgHtml,
+              parse_mode: 'HTML',
+              disable_web_page_preview: true,
+            }),
+          });
+          const data: any = await resp.json().catch(() => null);
+          if (resp.ok && data?.ok) {
+            lastWaterReminderSentAt[userKey] = now;
+            stateDirty = true;
+          }
+        } catch {
+          // ignore transient network failures
+        }
+      }
+
+      if (stateDirty) {
+        saveBotState();
+      }
+    } finally {
+      isWaterPassRunning = false;
+    }
+  }
+
+  setInterval(() => {
+    void runScheduledWaterRemindersPass();
+  }, 60_000);
+  setTimeout(() => {
+    void runScheduledWaterRemindersPass();
+  }, 15_000);
+
+  // Live Water Intake Sync & Alert Coordination Endpoints
+  app.post('/api/water-intake/sync', (req, res) => {
+    try {
+      const {
+        username,
+        date,
+        glasses,
+        updatedAt,
+        timezoneOffsetMinutes,
+        reminderEnabled,
+        reminderIntervalMinutes,
+      } = req.body || {};
+      const uname = String(username || '').trim();
+      if (!uname || !date) {
+        return res.status(400).json({ success: false, error: 'Missing username or date' });
+      }
+      const cleanGlasses = Math.max(0, Math.min(40, Math.floor(Number(glasses) || 0)));
+      upsertServerWaterIntakeOverride(uname, {
+        date: String(date),
+        glasses: cleanGlasses,
+        updatedAt: typeof updatedAt === 'string' && updatedAt ? updatedAt : new Date().toISOString(),
+        ...(typeof timezoneOffsetMinutes === 'number' && Number.isFinite(timezoneOffsetMinutes)
+          ? { timezoneOffsetMinutes }
+          : {}),
+        ...(typeof reminderEnabled === 'boolean' ? { reminderEnabled } : {}),
+        ...(typeof reminderIntervalMinutes === 'number' && Number.isFinite(reminderIntervalMinutes)
+          ? { reminderIntervalMinutes: Math.min(1440, Math.max(1, Math.round(reminderIntervalMinutes))) }
+          : {}),
+      });
+      saveBotState();
+      return res.json({ success: true, glasses: cleanGlasses });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to sync water intake' });
+    }
+  });
+
+  app.post('/api/water-intake/mark-sent', (req, res) => {
+    try {
+      const { username, sentAtMs } = req.body || {};
+      const userKey = String(username || '').trim().toLowerCase();
+      if (!userKey) {
+        return res.status(400).json({ success: false, error: 'Missing username' });
+      }
+      const ts = Number(sentAtMs);
+      lastWaterReminderSentAt[userKey] = Number.isFinite(ts) && ts > 0 ? ts : Date.now();
+      saveBotState();
+      return res.json({ success: true });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to record water alert timestamp' });
+    }
+  });
+
+  // Server-Side Rest Timer Schedule / Cancel (ensures Telegram push fires even if website is closed)
+  const scheduledRestTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  app.post('/api/rest-timer/schedule', (req, res) => {
+    try {
+      const { timerKey, username, exerciseName, setNumber, endAtMs, totalSec } = req.body || {};
+      const key = String(timerKey || '').trim();
+      const targetUsername = String(username || '').trim();
+      const endMs = Number(endAtMs);
+      if (!key || !targetUsername || !Number.isFinite(endMs)) {
+        return res.status(400).json({ success: false, error: 'Missing timerKey, username, or endAtMs.' });
+      }
+
+      const prev = scheduledRestTimers.get(key);
+      if (prev) clearTimeout(prev);
+
+      // Add a tiny 1.5s buffer so an open browser tab finishes first and cancels to prevent duplicate alerts
+      const delayMs = Math.max(500, endMs - Date.now() + 1500);
+      const timeoutHandle = setTimeout(async () => {
+        scheduledRestTimers.delete(key);
+        try {
+          const [tgConfig, accounts] = await Promise.all([
+            fetchFirestoreTelegramConfig().catch(() => null),
+            fetchFirestoreUserAccounts().catch(() => []),
+          ]);
+          const user = accounts.find(
+            (u) => u.username.trim().toLowerCase() === targetUsername.toLowerCase()
+          );
+          if (!user || !tgConfig?.enabled) return;
+          const chatId = resolveMemberChatId(user, accounts, tgConfig);
+          const token = await resolveEffectiveBotToken(tgConfig.botToken);
+          if (!chatId || !token) return;
+
+          const exLabel = escapeHtml(String(exerciseName || 'Exercise'));
+          const setLabel = Number(setNumber) > 0 ? `Set #${Number(setNumber)}` : 'Rest';
+          const secLabel = Number(totalSec) > 0 ? ` (${Number(totalSec)}s)` : '';
+          const msg =
+            `⏱️ <b>Rest Timer Complete!</b> 🔔\n\n` +
+            `• <b>Exercise:</b> ${exLabel}\n` +
+            `• <b>Completed:</b> ${setLabel}${secLabel}\n\n` +
+            `Time for your next set — let's crush it! 💪`;
+
+          await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              text: msg,
+              parse_mode: 'HTML',
+              disable_web_page_preview: true,
+            }),
+          });
+        } catch {
+          // ignore dispatch error
+        }
+      }, delayMs);
+
+      scheduledRestTimers.set(key, timeoutHandle);
+      return res.json({ success: true, timerKey: key, scheduledInMs: delayMs });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to schedule timer' });
+    }
+  });
+
+  app.post('/api/rest-timer/cancel', (req, res) => {
+    try {
+      const { timerKey } = req.body || {};
+      const key = String(timerKey || '').trim();
+      if (key && scheduledRestTimers.has(key)) {
+        clearTimeout(scheduledRestTimers.get(key)!);
+        scheduledRestTimers.delete(key);
+      }
+      return res.json({ success: true });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to cancel timer' });
+    }
+  });
 
   // Telegram Bot Dispatch Endpoint
   app.post('/api/telegram/send', async (req, res) => {

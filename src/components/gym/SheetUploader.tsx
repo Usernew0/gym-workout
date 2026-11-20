@@ -128,6 +128,8 @@ interface SheetEntry {
   detectedDataWeeks: number;
   detectedWeightUnit?: WeightUnit;
   prefilledRowCount: number;
+  hasRpeColumn: boolean;
+  hasRirColumn: boolean;
 }
 
 const ACCEPTED = '.xlsx,.xls,.csv,.tsv,.txt,.pdf';
@@ -169,6 +171,8 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
   );
   const [autoMatchReason, setAutoMatchReason] = useState<string | null>(null);
   const [importSheetData, setImportSheetData] = useState(true);
+  const [manualShowRpe, setManualShowRpe] = useState(false);
+  const [manualShowRir, setManualShowRir] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [savedMsg, setSavedMsg] = useState<string | null>(null);
 
@@ -285,6 +289,8 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
         detectedDataWeeks: s.detectedDataWeeks || 0,
         detectedWeightUnit: s.detectedWeightUnit,
         prefilledRowCount: s.prefilledRowCount || 0,
+        hasRpeColumn: Boolean(s.hasRpeColumn),
+        hasRirColumn: Boolean(s.hasRirColumn),
       }));
 
       setSheets(entries);
@@ -571,6 +577,8 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
         title: string;
         sheetName: string;
         exercises: ParsedExerciseRow[];
+        hasRpeColumn: boolean;
+        hasRirColumn: boolean;
       }> = [];
 
       for (const ws of selectedWorkouts) {
@@ -589,6 +597,15 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
           return;
         }
 
+        const sheetHasRpe = Boolean(
+          ws.hasRpeColumn ||
+            filtered.some(ex => Boolean(ex.rpe?.trim()) || Object.values(ex.weeklyLogs || {}).some(w => w.entries?.some(e => Boolean(e.rpe?.trim()))))
+        );
+        const sheetHasRir = Boolean(
+          ws.hasRirColumn ||
+            filtered.some(ex => Boolean(ex.rir?.trim()) || Object.values(ex.weeklyLogs || {}).some(w => w.entries?.some(e => Boolean(e.rir?.trim()))))
+        );
+
         if (ws.splitByDay && ws.selectedDays.length > 1) {
           for (const dayName of ws.selectedDays) {
             const dayExercises = filtered.filter(ex => ex.day === dayName);
@@ -597,6 +614,8 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
                 title: dayName,
                 sheetName: `${ws.name} · ${dayName}`,
                 exercises: dayExercises,
+                hasRpeColumn: sheetHasRpe,
+                hasRirColumn: sheetHasRir,
               });
             }
           }
@@ -607,6 +626,8 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
               title: ws.customTitle.trim(),
               sheetName: ws.name,
               exercises: untagged,
+              hasRpeColumn: sheetHasRpe,
+              hasRirColumn: sheetHasRir,
             });
           }
         } else {
@@ -617,6 +638,8 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
             title: singleDaySuffix,
             sheetName: ws.name,
             exercises: filtered,
+            hasRpeColumn: sheetHasRpe,
+            hasRirColumn: sheetHasRir,
           });
         }
       }
@@ -655,6 +678,8 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
               sheetName: item.sheetName,
               defaultWeightUnit: weightUnit,
               weeks,
+              hasRpeColumn: item.hasRpeColumn,
+              hasRirColumn: item.hasRirColumn,
               exercises: item.exercises,
               importSheetData,
               sourceFileName: fileName || existingMatch.sourceFileName,
@@ -671,6 +696,8 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
               sheetName: item.sheetName,
               defaultWeightUnit: weightUnit,
               weeks,
+              hasRpeColumn: item.hasRpeColumn,
+              hasRirColumn: item.hasRirColumn,
               exercises: item.exercises,
               importSheetData,
               sourceFileName: fileName || undefined,
@@ -725,6 +752,9 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
         ? candidateExistingPlans.find(p => p.id === targetPlanIdToUpdate)
         : undefined;
 
+      const manualHasRpe = Boolean(manualShowRpe || manualRows.some(r => Boolean(r.rpe?.trim())));
+      const manualHasRir = Boolean(manualShowRir || manualRows.some(r => Boolean(r.rir?.trim())));
+
       const plan = existingMatch
         ? mergeUpdatedWorksheetIntoPlan(existingMatch, {
             title: manualTitle.trim(),
@@ -732,6 +762,8 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
             instructions: instructions.trim() !== '' ? instructions : existingMatch.instructions,
             defaultWeightUnit: weightUnit,
             weeks,
+            hasRpeColumn: manualHasRpe,
+            hasRirColumn: manualHasRir,
             exercises: manualRows,
             importSheetData,
             sourceFileName: fileName || existingMatch.sourceFileName,
@@ -743,6 +775,8 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
             instructions,
             defaultWeightUnit: weightUnit,
             weeks,
+            hasRpeColumn: manualHasRpe,
+            hasRirColumn: manualHasRir,
             exercises: manualRows,
             importSheetData,
             sourceFileName: fileName || undefined,
@@ -1378,21 +1412,72 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
       )}
 
       {/* Preview / editor */}
-      {displayedRows.length > 0 && (
+      {displayedRows.length > 0 && (() => {
+        const showRpeCol = isMultiSheetMode
+          ? Boolean(
+              activeSheet?.hasRpeColumn ||
+                displayedRows.some(
+                  r =>
+                    Boolean(r.rpe?.trim()) ||
+                    Object.values(r.weeklyLogs || {}).some(w => w.entries?.some(e => Boolean(e.rpe?.trim())))
+                )
+            )
+          : Boolean(manualShowRpe || displayedRows.some(r => Boolean(r.rpe?.trim())));
+
+        const showRirCol = isMultiSheetMode
+          ? Boolean(
+              activeSheet?.hasRirColumn ||
+                displayedRows.some(
+                  r =>
+                    Boolean(r.rir?.trim()) ||
+                    Object.values(r.weeklyLogs || {}).some(w => w.entries?.some(e => Boolean(e.rir?.trim())))
+                )
+            )
+          : Boolean(manualShowRir || displayedRows.some(r => Boolean(r.rir?.trim())));
+
+        return (
         <div className="rounded-2xl border border-white/10 bg-neutral-950/60 overflow-hidden">
-          <div className="flex items-center justify-between px-3 py-2.5 border-b border-white/10">
+          <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5 border-b border-white/10">
             <span className="text-xs font-bold text-white flex items-center gap-2">
               <Dumbbell className="w-4 h-4 text-red-500" />
               {activeSheet ? `${activeSheet.name}: ` : ''}
               {displayedRows.length} exercise{displayedRows.length === 1 ? '' : 's'} detected
             </span>
-            <button
-              type="button"
-              onClick={addRow}
-              className="text-[11px] font-semibold text-red-300 hover:text-red-200 inline-flex items-center gap-1 cursor-pointer"
-            >
-              <Plus className="w-3.5 h-3.5" /> Add row
-            </button>
+            <div className="flex items-center gap-2">
+              {!isMultiSheetMode && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setManualShowRpe(v => !v)}
+                    className={`text-[10px] font-semibold px-2 py-0.5 rounded-lg border cursor-pointer ${
+                      showRpeCol
+                        ? 'bg-amber-500/20 border-amber-400/50 text-amber-200'
+                        : 'bg-neutral-900 border-white/10 text-neutral-400 hover:text-white'
+                    }`}
+                  >
+                    {showRpeCol ? '✓ RPE Col' : '+ RPE Col'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setManualShowRir(v => !v)}
+                    className={`text-[10px] font-semibold px-2 py-0.5 rounded-lg border cursor-pointer ${
+                      showRirCol
+                        ? 'bg-sky-500/20 border-sky-400/50 text-sky-200'
+                        : 'bg-neutral-900 border-white/10 text-neutral-400 hover:text-white'
+                    }`}
+                  >
+                    {showRirCol ? '✓ RIR Col' : '+ RIR Col'}
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                onClick={addRow}
+                className="text-[11px] font-semibold text-red-300 hover:text-red-200 inline-flex items-center gap-1 cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5" /> Add row
+              </button>
+            </div>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse min-w-[940px]">
@@ -1403,7 +1488,8 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
                   <th className="px-2 py-2 font-semibold">Exercise</th>
                   <th className="px-2 py-2 font-semibold w-24">Sets (Auto)</th>
                   <th className="px-2 py-2 font-semibold w-24">Reps Range</th>
-                  <th className="px-2 py-2 font-semibold w-20 text-amber-300">RPE</th>
+                  {showRpeCol && <th className="px-2 py-2 font-semibold w-20 text-amber-300">RPE</th>}
+                  {showRirCol && <th className="px-2 py-2 font-semibold w-20 text-sky-300">RIR</th>}
                   {displayedRows.some(r => r.weeklyLogs || r.loggedWeight || r.loggedReps || r.completed) && (
                     <th className="px-2 py-2 font-semibold w-52 text-indigo-300">Prefilled Sheet Data</th>
                   )}
@@ -1508,16 +1594,31 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
                         />
                       </td>
 
-                      {/* Sheet RPE */}
-                      <td className="px-1 py-1">
-                        <input
-                          value={row.rpe || ''}
-                          onChange={(e) => updateRow(idx, 'rpe', e.target.value)}
-                          placeholder="—"
-                          aria-label={`Target RPE for ${row.name || `row ${idx + 1}`}`}
-                          className="w-full bg-transparent focus:bg-neutral-900 border border-transparent focus:border-amber-500/50 rounded-lg px-2 py-1.5 text-[12px] text-amber-200 font-mono outline-none"
-                        />
-                      </td>
+                      {/* Sheet RPE (Conditional) */}
+                      {showRpeCol && (
+                        <td className="px-1 py-1">
+                          <input
+                            value={row.rpe || ''}
+                            onChange={(e) => updateRow(idx, 'rpe', e.target.value)}
+                            placeholder="—"
+                            aria-label={`Target RPE for ${row.name || `row ${idx + 1}`}`}
+                            className="w-full bg-transparent focus:bg-neutral-900 border border-transparent focus:border-amber-500/50 rounded-lg px-2 py-1.5 text-[12px] text-amber-200 font-mono outline-none"
+                          />
+                        </td>
+                      )}
+
+                      {/* Sheet RIR (Conditional) */}
+                      {showRirCol && (
+                        <td className="px-1 py-1">
+                          <input
+                            value={row.rir || ''}
+                            onChange={(e) => updateRow(idx, 'rir', e.target.value)}
+                            placeholder="—"
+                            aria-label={`Target RIR for ${row.name || `row ${idx + 1}`}`}
+                            className="w-full bg-transparent focus:bg-neutral-900 border border-transparent focus:border-sky-500/50 rounded-lg px-2 py-1.5 text-[12px] text-sky-200 font-mono outline-none"
+                          />
+                        </td>
+                      )}
 
                       {/* Prefilled Sheet Data Chips */}
                       {displayedRows.some(r => r.weeklyLogs || r.loggedWeight || r.loggedReps || r.completed) && (
@@ -1527,13 +1628,17 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
                               Object.entries(row.weeklyLogs)
                                 .sort(([a], [b]) => Number(a) - Number(b))
                                 .map(([wkKey, wData]) => {
-                                  const first = wData.entries.find(e => e.weight || e.reps || e.rpe);
+                                  const first = wData.entries.find(e => e.weight || e.reps || e.rpe || e.rir);
                                   const wkLabel = Number(wkKey) === 0 ? 'Prev' : `W${wkKey}`;
                                   const unitLbl = first?.unit || wData.unit || weightUnit;
                                   const rpes = Array.from(
                                     new Set(wData.entries.map(e => (e.rpe || '').trim()).filter(Boolean))
                                   );
+                                  const rirs = Array.from(
+                                    new Set(wData.entries.map(e => (e.rir || '').trim()).filter(Boolean))
+                                  );
                                   const rpePart = rpes.length > 0 ? ` RPE ${rpes.join('/')}` : '';
+                                  const rirPart = rirs.length > 0 ? ` RIR ${rirs.join('/')}` : '';
                                   return (
                                     <span
                                       key={wkKey}
@@ -1541,16 +1646,16 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
                                     >
                                       {wkLabel}:{' '}
                                       {first
-                                        ? `${first.weight || '—'}${first.weight && first.weight !== 'BW' ? unitLbl : ''}×${first.reps || '—'}${rpePart}`
+                                        ? `${first.weight || '—'}${first.weight && first.weight !== 'BW' ? unitLbl : ''}×${first.reps || '—'}${rpePart}${rirPart}`
                                         : wData.completed
                                         ? 'Done ✓'
                                         : 'Logged'}
                                     </span>
                                   );
                                 })
-                            ) : row.loggedWeight || row.loggedReps || row.rpe ? (
+                            ) : row.loggedWeight || row.loggedReps || row.rpe || row.rir ? (
                               <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-indigo-500/15 border border-indigo-400/30 text-indigo-200">
-                                {row.loggedWeight || '—'}{row.loggedWeight ? (row.loggedUnit || weightUnit) : ''}×{row.loggedReps || '—'}{row.rpe ? ` RPE ${row.rpe}` : ''}
+                                {row.loggedWeight || '—'}{row.loggedWeight ? (row.loggedUnit || weightUnit) : ''}×{row.loggedReps || '—'}{row.rpe ? ` RPE ${row.rpe}` : ''}{row.rir ? ` RIR ${row.rir}` : ''}
                               </span>
                             ) : row.completed ? (
                               <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-400/30 text-emerald-200">
@@ -1629,7 +1734,8 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
             <span>Each Set row (Set 1..N) is auto-generated from the Sets column with Weight & Reps inputs.</span>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {displayedRows.length === 0 && !isParsing && (
         <button

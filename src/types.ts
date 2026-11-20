@@ -1,3 +1,12 @@
+export interface BodyWeightEntry {
+  id: string;
+  date: string;       // YYYY-MM-DD
+  weight: number;
+  unit: WeightUnit;
+  note?: string;
+  updatedAt?: string;
+}
+
 export interface UserAccount {
   id: string;
   username: string;
@@ -17,8 +26,14 @@ export interface UserAccount {
     date: string;
     glasses: number;
     updatedAt?: string;
+    timezoneOffsetMinutes?: number;
     reminderEnabled?: boolean;
     reminderIntervalMinutes?: number;
+  };
+  bodyWeightHistory?: BodyWeightEntry[];
+  restTimerPrefs?: {
+    seconds?: number;
+    sound?: string;
   };
 }
 
@@ -163,6 +178,7 @@ export interface WorkoutExercise {
   sets?: string;          // Number of sets (e.g. "4")
   reps?: string;          // Repetitions (e.g. "5-12")
   targetRpe?: string;     // Target / prescribed RPE from uploaded sheet or coach (e.g. "8", "7-8")
+  targetRir?: string;     // Target / prescribed RIR (Reps In Reserve) from uploaded sheet or coach (e.g. "2", "1-2")
   notes?: string;         // Coach notes / form cues
   videoUrl?: string;      // Demo video link
   isSuperset?: boolean;   // Highlighted as superset exercise
@@ -177,6 +193,7 @@ export interface SetLogEntry {
   unit?: WeightUnit; // Weight unit ("kg" or "lbs")
   reps: string;      // Reps completed (e.g. "10")
   rpe?: string;      // Rate of Perceived Exertion (e.g. "8", "8.5")
+  rir?: string;      // Reps In Reserve (RIR / RIP, e.g. "2")
 }
 
 export interface ExerciseLogEntry {
@@ -184,7 +201,7 @@ export interface ExerciseLogEntry {
   reps?: string;
   weight?: string;
   unit?: WeightUnit;
-  setEntries?: SetLogEntry[]; // Per-set weight (with unit), reps & RPE log
+  setEntries?: SetLogEntry[]; // Per-set weight (with unit), reps, RPE & RIR log
   notes?: string;
   noteEnabled?: boolean;      // Checkbox toggle state for this exercise + week note
   day?: string;
@@ -217,6 +234,8 @@ export interface WorkoutPlan {
   sheetName?: string;            // Original Excel sheet tab name
   defaultWeightUnit?: WeightUnit;// Preferred default weight unit ('kg' or 'lbs')
   weeks: number;                 // Optional repeatable duration in weeks (>= 1)
+  hasRpeColumn?: boolean;        // Whether the uploaded/created plan includes an RPE column
+  hasRirColumn?: boolean;        // Whether the uploaded/created plan includes an RIR (RIP) column
   warmupExercises?: WarmupExercise[]; // Dedicated warm-up exercises at the top of the plan
   warmupLogs?: { [weekKey: string]: { [warmupId: string]: WarmupLogEntry } }; // Separate warm-up set logs per week
   exercises: WorkoutExercise[];
@@ -224,7 +243,7 @@ export interface WorkoutPlan {
   createdBy: string;             // Username that created/uploaded the plan
   assignedByAdmin?: boolean;     // true when an admin uploaded & assigned the plan
   progress?: { [weekKey: string]: string[] }; // weekKey (e.g. "w1") -> completed exercise IDs
-  exerciseLogs?: { [weekKey: string]: { [exerciseId: string]: ExerciseLogEntry } }; // Logged sets, weights (kg/lbs), reps, RPE & notes per week/exercise
+  exerciseLogs?: { [weekKey: string]: { [exerciseId: string]: ExerciseLogEntry } }; // Logged sets, weights (kg/lbs), reps, RPE, RIR & notes per week/exercise
   previousLogs?: { [exerciseId: string]: ExerciseLogEntry }; // Last recorded performance snapshot before current edit
   createdAt: string;
   updatedAt?: string;

@@ -8,17 +8,22 @@ import {
   ChevronDown, ChevronUp, Plus, Minus, Zap, Pencil,
   FileSpreadsheet, Maximize2, ShieldCheck, Loader2, Download,
   User, KeyRound, Eye, EyeOff, Send, ShieldAlert, AlertCircle, Bell,
-  Droplets, RotateCcw, Clock, Timer, Volume2
+  Droplets, RotateCcw, Clock, Timer, Volume2, Scale
 } from 'lucide-react';
 import {
+  ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip
+} from 'recharts';
+import {
   WorkoutPlan, WorkoutExercise, ExerciseLogEntry, SetLogEntry, WeightUnit,
-  UserAccount, AdminSetting, WarmupExercise, WarmupLogEntry
+  UserAccount, AdminSetting, WarmupExercise, WarmupLogEntry, BodyWeightEntry
 } from '../../types';
 import {
   subscribeToWorkoutPlans,
   saveWorkoutPlanDoc,
   deleteWorkoutPlanDoc,
   mergeUpdatedWorksheetIntoPlan,
+  planHasRpeColumn,
+  planHasRirColumn,
 } from '../../lib/gymService';
 import { saveUserAccountDoc, saveAdminSettingDoc, logActivity } from '../../lib/syncService';
 import { hashPassword, verifyPassword } from '../../utils/crypto';
@@ -51,11 +56,12 @@ interface GymAppProps {
   onLogout: () => void;
 }
 
-type GymTab = 'dashboard' | 'workouts' | 'upload' | 'progress' | 'profile';
+type GymTab = 'dashboard' | 'workouts' | 'weight' | 'upload' | 'progress' | 'profile';
 
 const GYM_TABS: { id: GymTab; label: string;  short: string; icon: React.ComponentType<{ className?: string }>; }[] = [
   { id: 'dashboard', label: 'Dashboard',    short: 'Home',     icon: LayoutDashboard },
   { id: 'workouts',  label: 'My Workouts',  short: 'Workouts', icon: ListChecks },
+  { id: 'weight',    label: 'Body Weight',  short: 'Weight',   icon: Scale },
   { id: 'upload',    label: 'Upload Sheet', short: 'Upload',   icon: Upload },
   { id: 'progress',  label: 'Progress',     short: 'Progress', icon: TrendingUp },
   { id: 'profile',   label: 'Profile',      short: 'Profile',  icon: User },
@@ -64,12 +70,36 @@ const GYM_TABS: { id: GymTab; label: string;  short: string; icon: React.Compone
 const weekKey = (weekIdx: number) => `w${weekIdx + 1}`;
 const SESSION_NOTE_KEY_PREFIX = '__session_note__';
 const WATER_DAILY_GOAL = 8;
+const WATER_REMINDER_PRESETS = [5, 10, 15, 30, 45, 60, 90] as const;
 const EXERCISE_MOTIVATIONS = [
   'All sets crushed — great discipline!',
   'Target locked in — strong finish!',
   'Full set volume logged — keep pushing!',
   'Exercise complete — unstoppable momentum!',
 ];
+
+type RestSoundType = 'chime' | 'bell' | 'beep' | 'gong' | 'fanfare' | 'silent';
+
+const REST_SOUND_OPTIONS: { id: RestSoundType; label: string }[] = [
+  { id: 'chime', label: 'Harmonic Chime' },
+  { id: 'bell', label: 'Boxing Bell' },
+  { id: 'beep', label: 'Digital Beep' },
+  { id: 'gong', label: 'Zen Gong' },
+  { id: 'fanfare', label: 'Power Fanfare' },
+  { id: 'silent', label: 'Silent (Visual/Vibrate)' },
+];
+
+interface ActiveRestTimerState {
+  timerKey: string;
+  exerciseId: string;
+  exerciseName: string;
+  setNumber: number;
+  remainingSec: number;
+  totalSec: number;
+  endAtMs?: number;
+  running: boolean;
+  finished?: boolean;
+}
 
 function getSessionNoteKey(dayFilter: string): string {
   if (!dayFilter || dayFilter === 'ALL') return `${SESSION_NOTE_KEY_PREFIX}ALL`;
@@ -89,18 +119,73 @@ function getWaterReminderStorageKey(username: string): string {
   return `gymworkout_water_reminder_${(username || 'member').toLowerCase().trim()}`;
 }
 
-function readStoredWaterReminder(username: string): { enabled: boolean; intervalMinutes: number } {
+function readStoredWaterReminder(username: string): { enabled: boolean; intervalMinutes: number; updatedAt: number } {
   try {
     const raw = localStorage.getItem(getWaterReminderStorageKey(username));
-    if (!raw) return { enabled: false, intervalMinutes: 60 };
+    if (!raw) return { enabled: false, intervalMinutes: 30, updatedAt: 0 };
     const parsed = JSON.parse(raw);
-    const interval = Number(parsed?.intervalMinutes);
+    const interval = Math.round(Number(parsed?.intervalMinutes));
+    const updatedAt = Number(parsed?.updatedAt) || 0;
     return {
       enabled: Boolean(parsed?.enabled),
-      intervalMinutes: [30, 45, 60, 90].includes(interval) ? interval : 60,
+      intervalMinutes: Number.isFinite(interval) && interval >= 1 && interval <= 1440 ? interval : 30,
+      updatedAt,
     };
   } catch {
-    return { enabled: false, intervalMinutes: 60 };
+    return { enabled: false, intervalMinutes: 30, updatedAt: 0 };
+  }
+}
+
+function saveStoredWaterReminder(username: string, enabled: boolean, intervalMinutes: number) {
+  try {
+    const clamped = Math.min(1440, Math.max(1, Math.round(intervalMinutes || 30)));
+    localStorage.setItem(
+      getWaterReminderStorageKey(username),
+      JSON.stringify({ enabled, intervalMinutes: clamped, updatedAt: Date.now() })
+    );
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function getBodyWeightStorageKey(username: string): string {
+  return `gymworkout_body_weight_${(username || 'member').toLowerCase().trim()}`;
+}
+
+function readStoredBodyWeight(username: string): { updatedAt: number; entries: BodyWeightEntry[] } {
+  try {
+    const raw = localStorage.getItem(getBodyWeightStorageKey(username));
+    if (!raw) return { updatedAt: 0, entries: [] };
+    const parsed = JSON.parse(raw);
+    const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.entries) ? parsed.entries : [];
+    const normalized = list
+      .filter((item: any) => item && item.date && Number.isFinite(Number(item.weight)) && Number(item.weight) > 0)
+      .map((item: any) => ({
+        id: String(item.id || `bw_${item.date}`),
+        date: String(item.date),
+        weight: Number(item.weight),
+        unit: (item.unit === 'lbs' ? 'lbs' : 'kg') as WeightUnit,
+        ...(item.note ? { note: String(item.note) } : {}),
+        ...(item.updatedAt ? { updatedAt: String(item.updatedAt) } : {}),
+      }))
+      .sort((a: BodyWeightEntry, b: BodyWeightEntry) => a.date.localeCompare(b.date));
+    return {
+      updatedAt: Number(parsed?.updatedAt) || 0,
+      entries: normalized,
+    };
+  } catch {
+    return { updatedAt: 0, entries: [] };
+  }
+}
+
+function saveStoredBodyWeight(username: string, entries: BodyWeightEntry[]) {
+  try {
+    localStorage.setItem(
+      getBodyWeightStorageKey(username),
+      JSON.stringify({ updatedAt: Date.now(), entries })
+    );
+  } catch {
+    // ignore storage errors
   }
 }
 
@@ -115,6 +200,14 @@ const REST_TIMER_PRESETS = [45, 60, 90, 120, 180] as const;
 
 function getRestTimerStorageKey(username: string): string {
   return `gymworkout_rest_sec_${(username || 'member').toLowerCase().trim()}`;
+}
+
+function getRestSoundStorageKey(username: string): string {
+  return `gymworkout_rest_sound_${(username || 'member').toLowerCase().trim()}`;
+}
+
+function getActiveRestTimerStorageKey(username: string): string {
+  return `gymworkout_active_rest_${(username || 'member').toLowerCase().trim()}`;
 }
 
 function readStoredRestSeconds(username: string): number {
@@ -139,7 +232,84 @@ function saveStoredRestSeconds(username: string, seconds: number) {
   }
 }
 
-function playRestFinishedChime() {
+function readStoredRestSound(username: string): RestSoundType {
+  try {
+    const raw = localStorage.getItem(getRestSoundStorageKey(username)) as RestSoundType | null;
+    if (raw && REST_SOUND_OPTIONS.some(o => o.id === raw)) return raw;
+    return 'chime';
+  } catch {
+    return 'chime';
+  }
+}
+
+function saveStoredRestSound(username: string, sound: RestSoundType) {
+  try {
+    localStorage.setItem(getRestSoundStorageKey(username), sound);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function readStoredActiveRestTimer(username: string): ActiveRestTimerState | null {
+  try {
+    const raw = localStorage.getItem(getActiveRestTimerStorageKey(username));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as ActiveRestTimerState;
+    if (!parsed || !parsed.timerKey) return null;
+    if (parsed.running && parsed.endAtMs) {
+      const rem = Math.ceil((parsed.endAtMs - Date.now()) / 1000);
+      if (rem <= 0) {
+        return { ...parsed, remainingSec: 0, running: false, finished: true };
+      }
+      return { ...parsed, remainingSec: rem, running: true, finished: false };
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function persistActiveRestTimer(username: string, timer: ActiveRestTimerState | null) {
+  try {
+    const key = getActiveRestTimerStorageKey(username);
+    if (!timer) {
+      localStorage.removeItem(key);
+    } else {
+      localStorage.setItem(key, JSON.stringify(timer));
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+async function triggerBrowserRestNotification(title: string, body: string, tag: string) {
+  try {
+    if (typeof window === 'undefined' || !('Notification' in window)) return;
+    if (Notification.permission !== 'granted') return;
+
+    if ('serviceWorker' in navigator) {
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (reg?.active) {
+        reg.active.postMessage({ type: 'SHOW_NOTIFICATION', title, body, tag });
+        return;
+      }
+    }
+    new Notification(title, { body, tag, icon: '/favicon.ico' });
+  } catch {
+    // ignore browser notification failures
+  }
+}
+
+function playRestFinishedChime(sound: RestSoundType = 'chime') {
+  try {
+    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+      navigator.vibrate(sound === 'bell' || sound === 'fanfare' ? [180, 80, 180, 80, 220] : [120, 60, 120]);
+    }
+  } catch {
+    // ignore vibration unsupported
+  }
+  if (sound === 'silent') return;
+
   try {
     const win = window as unknown as {
       AudioContext?: typeof AudioContext;
@@ -152,46 +322,80 @@ function playRestFinishedChime() {
       ctx.resume().catch(() => {});
     }
     const now = ctx.currentTime;
-    const notes = [523.25, 659.25, 783.99];
-    notes.forEach((freq, idx) => {
+
+    const scheduleTone = (
+      freq: number,
+      offsetSec: number,
+      durSec: number,
+      wave: OscillatorType,
+      peakGain: number
+    ) => {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
-      osc.type = 'sine';
-      const startAt = now + idx * 0.11;
-      const endAt = startAt + 0.34;
+      osc.type = wave;
+      const startAt = now + offsetSec;
+      const endAt = startAt + durSec;
       osc.frequency.setValueAtTime(freq, startAt);
       gain.gain.setValueAtTime(0.0001, startAt);
-      gain.gain.exponentialRampToValueAtTime(0.075, startAt + 0.02);
+      gain.gain.exponentialRampToValueAtTime(peakGain, startAt + 0.02);
       gain.gain.exponentialRampToValueAtTime(0.0001, endAt);
       osc.connect(gain);
       gain.connect(ctx.destination);
       osc.start(startAt);
       osc.stop(endAt + 0.02);
-    });
+    };
+
+    if (sound === 'bell') {
+      // Twin metallic boxing bell strikes
+      [0, 0.24].forEach((offset) => {
+        scheduleTone(1046.5, offset, 0.45, 'triangle', 0.11);
+        scheduleTone(1568, offset, 0.35, 'sine', 0.07);
+        scheduleTone(2093, offset, 0.25, 'sine', 0.045);
+      });
+    } else if (sound === 'beep') {
+      // Crisp digital timer beeps
+      scheduleTone(880, 0, 0.11, 'square', 0.045);
+      scheduleTone(880, 0.16, 0.11, 'square', 0.045);
+      scheduleTone(1174.66, 0.32, 0.24, 'triangle', 0.075);
+    } else if (sound === 'gong') {
+      // Deep warm zen gong
+      scheduleTone(220, 0, 1.15, 'sine', 0.12);
+      scheduleTone(330, 0.02, 0.95, 'triangle', 0.055);
+      scheduleTone(440, 0.04, 0.75, 'sine', 0.035);
+    } else if (sound === 'fanfare') {
+      // Energetic 4-note triad
+      scheduleTone(523.25, 0, 0.18, 'triangle', 0.08);
+      scheduleTone(659.25, 0.1, 0.18, 'triangle', 0.08);
+      scheduleTone(783.99, 0.2, 0.18, 'triangle', 0.085);
+      scheduleTone(1046.5, 0.3, 0.48, 'triangle', 0.1);
+    } else {
+      // Default harmonic chime
+      [523.25, 659.25, 783.99].forEach((freq, idx) => {
+        scheduleTone(freq, idx * 0.11, 0.34, 'sine', 0.08);
+      });
+    }
+
     setTimeout(() => {
       ctx.close().catch(() => {});
-    }, 1000);
+    }, 1500);
   } catch {
     // ignore Web Audio restriction errors
   }
-  try {
-    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
-      navigator.vibrate([120, 60, 120]);
-    }
-  } catch {
-    // ignore vibration unsupported
-  }
 }
 
-function readStoredWaterCount(username: string): number {
+function readStoredWaterCount(username: string): { count: number; updatedAt: number } {
   try {
     const raw = localStorage.getItem(getWaterStorageKey(username));
-    if (!raw) return 0;
+    if (!raw) return { count: 0, updatedAt: 0 };
     const parsed = JSON.parse(raw);
     const val = typeof parsed === 'number' ? parsed : Number(parsed?.count ?? 0);
-    return Number.isFinite(val) && val >= 0 ? Math.min(40, Math.floor(val)) : 0;
+    const ts = parsed?.updatedAt ? (Date.parse(parsed.updatedAt) || 0) : 0;
+    return {
+      count: Number.isFinite(val) && val >= 0 ? Math.min(40, Math.floor(val)) : 0,
+      updatedAt: ts,
+    };
   } catch {
-    return 0;
+    return { count: 0, updatedAt: 0 };
   }
 }
 
@@ -235,6 +439,7 @@ function normalizeSetEntries(
       unit: existing?.unit || logged.unit || defaultUnit,
       reps: existing?.reps ?? '',
       rpe: existing?.rpe ?? '',
+      rir: existing?.rir ?? '',
     }));
   }
 
@@ -247,6 +452,7 @@ function normalizeSetEntries(
       unit: logged.unit || defaultUnit,
       reps: logged.reps ?? '',
       rpe: '',
+      rir: '',
     }));
   }
 
@@ -256,6 +462,7 @@ function normalizeSetEntries(
     unit: defaultUnit,
     reps: '',
     rpe: '',
+    rir: '',
   }));
 }
 
@@ -264,12 +471,64 @@ function entryHasLoggedData(entry?: ExerciseLogEntry): boolean {
   if (
     entry.setEntries &&
     entry.setEntries.some(
-      s => s.weight.trim() !== '' || s.reps.trim() !== '' || (s.rpe || '').trim() !== ''
+      s =>
+        s.weight.trim() !== '' ||
+        s.reps.trim() !== '' ||
+        (s.rpe || '').trim() !== '' ||
+        (s.rir || '').trim() !== ''
     )
   ) {
     return true;
   }
   return Boolean(entry.weight?.trim() || entry.reps?.trim() || entry.sets?.trim());
+}
+
+interface RpeIntensityMeta {
+  level: 'Light' | 'Moderate' | 'High' | 'Max';
+  dotClass: string;
+  chipClass: string;
+  textClass: string;
+}
+
+function getRpeIntensityMeta(rpeRaw?: string): RpeIntensityMeta | null {
+  const clean = (rpeRaw || '').trim();
+  if (!clean) return null;
+  const nums = (clean.match(/\d+(?:\.\d+)?/g) || [])
+    .map(Number)
+    .filter(n => Number.isFinite(n) && n > 0 && n <= 10);
+  if (nums.length === 0) return null;
+  const peak = Math.max(...nums);
+
+  if (peak >= 9) {
+    return {
+      level: 'Max',
+      dotClass: 'bg-red-500 shadow-[0_0_6px_rgba(239,68,68,0.85)]',
+      chipClass: 'border-red-500/40 bg-red-950/35 text-neutral-100',
+      textClass: 'text-red-300',
+    };
+  }
+  if (peak >= 8) {
+    return {
+      level: 'High',
+      dotClass: 'bg-orange-400',
+      chipClass: 'border-orange-500/35 bg-orange-950/25 text-neutral-100',
+      textClass: 'text-orange-300',
+    };
+  }
+  if (peak >= 6.5) {
+    return {
+      level: 'Moderate',
+      dotClass: 'bg-amber-400',
+      chipClass: 'border-amber-500/30 bg-amber-950/20 text-neutral-100',
+      textClass: 'text-amber-300',
+    };
+  }
+  return {
+    level: 'Light',
+    dotClass: 'bg-emerald-400',
+    chipClass: 'border-emerald-500/30 bg-emerald-950/20 text-neutral-100',
+    textClass: 'text-emerald-300',
+  };
 }
 
 interface WeekHistoryRecord {
@@ -307,9 +566,15 @@ function buildWeeklyHistory(
       const setsList = hasSets
         ? entry?.setEntries && entry.setEntries.length > 0
           ? entry.setEntries
-              .filter(s => s.weight.trim() !== '' || s.reps.trim() !== '' || (s.rpe || '').trim() !== '')
+              .filter(
+                s =>
+                  s.weight.trim() !== '' ||
+                  s.reps.trim() !== '' ||
+                  (s.rpe || '').trim() !== '' ||
+                  (s.rir || '').trim() !== ''
+              )
               .map(s => ({ ...s, unit: s.unit || entry.unit || planUnit }))
-          : [{ setNumber: 1, weight: entry?.weight || '', unit: entry?.unit || planUnit, reps: entry?.reps || '', rpe: '' }]
+          : [{ setNumber: 1, weight: entry?.weight || '', unit: entry?.unit || planUnit, reps: entry?.reps || '', rpe: '', rir: '' }]
         : [];
       if (setsList.length === 0 && !weekNote) return;
       records.push({
@@ -345,9 +610,15 @@ function buildWeeklyHistory(
         const setsList = hasSets
           ? entry?.setEntries && entry.setEntries.length > 0
             ? entry.setEntries
-                .filter(s => s.weight.trim() !== '' || s.reps.trim() !== '' || (s.rpe || '').trim() !== '')
+                .filter(
+                  s =>
+                    s.weight.trim() !== '' ||
+                    s.reps.trim() !== '' ||
+                    (s.rpe || '').trim() !== '' ||
+                    (s.rir || '').trim() !== ''
+                )
                 .map(s => ({ ...s, unit: s.unit || entry.unit || otherUnit }))
-            : [{ setNumber: 1, weight: entry?.weight || '', unit: entry?.unit || otherUnit, reps: entry?.reps || '', rpe: '' }]
+            : [{ setNumber: 1, weight: entry?.weight || '', unit: entry?.unit || otherUnit, reps: entry?.reps || '', rpe: '', rir: '' }]
           : [];
         if (setsList.length === 0 && !weekNote) continue;
         records.push({
@@ -444,6 +715,10 @@ export const GymApp: React.FC<GymAppProps> = ({
   }, [userAccounts, currentUser, localAccountOverride]);
 
   const resolvedDisplayName = matchedAccount?.displayName?.trim() || currentUser;
+  const matchedAccountRef = useRef<UserAccount | null>(matchedAccount);
+  matchedAccountRef.current = matchedAccount;
+  const resolvedDisplayNameRef = useRef<string>(resolvedDisplayName);
+  resolvedDisplayNameRef.current = resolvedDisplayName;
 
   const [profileDisplayName, setProfileDisplayName] = useState('');
   const [profileGender, setProfileGender] = useState('male');
@@ -527,39 +802,50 @@ export const GymApp: React.FC<GymAppProps> = ({
   const [justCompletedMotivation, setJustCompletedMotivation] = useState<string | null>(null);
 
   // Water intake counter + Telegram hydration reminder state
-  const [waterGlasses, setWaterGlasses] = useState<number>(() => readStoredWaterCount(currentUser));
+  const [waterGlasses, setWaterGlasses] = useState<number>(() => readStoredWaterCount(currentUser).count);
   const [waterReminderEnabled, setWaterReminderEnabled] = useState<boolean>(
     () => readStoredWaterReminder(currentUser).enabled
   );
   const [waterReminderIntervalMinutes, setWaterReminderIntervalMinutes] = useState<number>(
     () => readStoredWaterReminder(currentUser).intervalMinutes
   );
+  const [customWaterIntervalInput, setCustomWaterIntervalInput] = useState<string>(
+    () => String(readStoredWaterReminder(currentUser).intervalMinutes)
+  );
+  const waterGlassesRef = useRef<number>(waterGlasses);
+  waterGlassesRef.current = waterGlasses;
+  const waterReminderEnabledRef = useRef<boolean>(waterReminderEnabled);
+  waterReminderEnabledRef.current = waterReminderEnabled;
+  const waterReminderIntervalRef = useRef<number>(waterReminderIntervalMinutes);
+  waterReminderIntervalRef.current = waterReminderIntervalMinutes;
+  const activeTelegramConfigRef = useRef<ReturnType<typeof getTelegramConfig> | null>(null);
+  const memberWhitelistStatusRef = useRef<'active' | 'paused' | 'not_whitelisted'>('not_whitelisted');
+  const resolvedMemberChatIdRef = useRef<string>('');
   const [isSendingWaterAlert, setIsSendingWaterAlert] = useState(false);
   const [waterAlertNotice, setWaterAlertNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
-  useEffect(() => {
-    setWaterGlasses(readStoredWaterCount(currentUser));
-    const rem = readStoredWaterReminder(currentUser);
-    setWaterReminderEnabled(rem.enabled);
-    setWaterReminderIntervalMinutes(rem.intervalMinutes);
-    const storedRest = readStoredRestSeconds(currentUser);
-    setDefaultRestSeconds(storedRest);
-    setCustomRestInput(String(storedRest));
-  }, [currentUser]);
+  // Body Weight Tracker state
+  const [bodyWeightEntries, setBodyWeightEntries] = useState<BodyWeightEntry[]>(
+    () => readStoredBodyWeight(currentUser).entries
+  );
+  const [bodyWeightDateInput, setBodyWeightDateInput] = useState<string>(() => getTodayDateKey());
+  const [bodyWeightValueInput, setBodyWeightValueInput] = useState<string>('');
+  const [bodyWeightUnitInput, setBodyWeightUnitInput] = useState<WeightUnit>(() => matchedAccount?.weightUnitPreference || 'kg');
+  const [bodyWeightChartUnit, setBodyWeightChartUnit] = useState<WeightUnit>(() => matchedAccount?.weightUnitPreference || 'kg');
+  const [bodyWeightNoteInput, setBodyWeightNoteInput] = useState<string>('');
+  const [bodyWeightNotice, setBodyWeightNotice] = useState<string | null>(null);
 
-  // Per-set Rest Timer state (user-controlled countdown + configurable duration)
+  // Per-set Rest Timer state (user-controlled countdown + sound variety + background persistence)
   const [defaultRestSeconds, setDefaultRestSeconds] = useState<number>(() => readStoredRestSeconds(currentUser));
   const [customRestInput, setCustomRestInput] = useState<string>(() => String(readStoredRestSeconds(currentUser)));
-  const [setRestTimer, setSetRestTimer] = useState<{
-    timerKey: string;
-    exerciseId: string;
-    exerciseName: string;
-    setNumber: number;
-    remainingSec: number;
-    totalSec: number;
-    running: boolean;
-    finished?: boolean;
-  } | null>(null);
+  const [restSound, setRestSound] = useState<RestSoundType>(() => readStoredRestSound(currentUser));
+  const restSoundRef = useRef<RestSoundType>(restSound);
+  useEffect(() => {
+    restSoundRef.current = restSound;
+  }, [restSound]);
+  const [setRestTimer, setSetRestTimer] = useState<ActiveRestTimerState | null>(
+    () => readStoredActiveRestTimer(currentUser)
+  );
   const [restAlertBanner, setRestAlertBanner] = useState<{
     id: string;
     timerKey: string;
@@ -569,7 +855,124 @@ export const GymApp: React.FC<GymAppProps> = ({
     totalSec: number;
   } | null>(null);
 
-  // Inline exercise metadata editor (to freely modify sets/reps/targetRpe/superset/notes/video later)
+  // Register lightweight Service Worker for reliable rest-timer notifications
+  useEffect(() => {
+    if (typeof window !== 'undefined' && 'serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
+  }, []);
+
+  // Re-initialize per-user local caches on username switch
+  useEffect(() => {
+    const storedWater = readStoredWaterCount(currentUser);
+    waterGlassesRef.current = storedWater.count;
+    setWaterGlasses(storedWater.count);
+    const rem = readStoredWaterReminder(currentUser);
+    waterReminderEnabledRef.current = rem.enabled;
+    waterReminderIntervalRef.current = rem.intervalMinutes;
+    setWaterReminderEnabled(rem.enabled);
+    setWaterReminderIntervalMinutes(rem.intervalMinutes);
+    setCustomWaterIntervalInput(String(rem.intervalMinutes));
+    const storedRest = readStoredRestSeconds(currentUser);
+    setDefaultRestSeconds(storedRest);
+    setCustomRestInput(String(storedRest));
+    setRestSound(readStoredRestSound(currentUser));
+    setSetRestTimer(readStoredActiveRestTimer(currentUser));
+    setBodyWeightEntries(readStoredBodyWeight(currentUser).entries);
+
+    if (currentUser) {
+      fetch('/api/water-intake/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: currentUser,
+          date: getTodayDateKey(),
+          timezoneOffsetMinutes: -new Date().getTimezoneOffset(),
+          glasses: storedWater.count,
+          updatedAt: storedWater.updatedAt > 0 ? new Date(storedWater.updatedAt).toISOString() : new Date().toISOString(),
+          reminderEnabled: rem.enabled,
+          reminderIntervalMinutes: rem.intervalMinutes,
+        }),
+      }).catch(() => {});
+    }
+  }, [currentUser]);
+
+  // Hydrate persistent Water Reminder, Body Weight & Rest Timer prefs from Firestore UserAccount
+  useEffect(() => {
+    if (!matchedAccount) return;
+    if (matchedAccount.waterIntake) {
+      const dbUpdated = matchedAccount.waterIntake.updatedAt ? (Date.parse(matchedAccount.waterIntake.updatedAt) || 0) : 0;
+      const localRem = readStoredWaterReminder(currentUser);
+      if (dbUpdated >= localRem.updatedAt || localRem.updatedAt === 0) {
+        if (typeof matchedAccount.waterIntake.reminderEnabled === 'boolean') {
+          waterReminderEnabledRef.current = matchedAccount.waterIntake.reminderEnabled;
+          setWaterReminderEnabled(matchedAccount.waterIntake.reminderEnabled);
+          const dbInterval = Number(matchedAccount.waterIntake.reminderIntervalMinutes);
+          const nextInt = Number.isFinite(dbInterval) && dbInterval >= 1 && dbInterval <= 1440
+            ? Math.round(dbInterval)
+            : localRem.intervalMinutes;
+          waterReminderIntervalRef.current = nextInt;
+          setWaterReminderIntervalMinutes(nextInt);
+          setCustomWaterIntervalInput(String(nextInt));
+          saveStoredWaterReminder(currentUser, matchedAccount.waterIntake.reminderEnabled, nextInt);
+        }
+      }
+      const localWater = readStoredWaterCount(currentUser);
+      if (matchedAccount.waterIntake.date === getTodayDateKey() && (dbUpdated > localWater.updatedAt || localWater.updatedAt === 0)) {
+        const dbGlasses = Math.max(0, Math.min(40, Math.floor(Number(matchedAccount.waterIntake.glasses) || 0)));
+        waterGlassesRef.current = dbGlasses;
+        setWaterGlasses(dbGlasses);
+        try {
+          localStorage.setItem(
+            getWaterStorageKey(currentUser),
+            JSON.stringify({ count: dbGlasses, updatedAt: matchedAccount.waterIntake.updatedAt || new Date().toISOString() })
+          );
+        } catch {
+          // ignore
+        }
+      } else if (localWater.updatedAt > dbUpdated && matchedAccount.password) {
+        // Local water intake is newer than DB (e.g. saved just before refresh); push local state up cleanly
+        const syncPayload: UserAccount = {
+          ...matchedAccount,
+          waterIntake: {
+            date: getTodayDateKey(),
+            glasses: localWater.count,
+            updatedAt: new Date(localWater.updatedAt).toISOString(),
+            timezoneOffsetMinutes: -new Date().getTimezoneOffset(),
+            reminderEnabled: readStoredWaterReminder(currentUser).enabled,
+            reminderIntervalMinutes: readStoredWaterReminder(currentUser).intervalMinutes,
+          },
+        };
+        setLocalAccountOverride(syncPayload);
+        saveUserAccountDoc(syncPayload).catch(() => {});
+      }
+    }
+
+    if (Array.isArray(matchedAccount.bodyWeightHistory) && matchedAccount.bodyWeightHistory.length > 0) {
+      const localBw = readStoredBodyWeight(currentUser);
+      if (matchedAccount.bodyWeightHistory.length >= localBw.entries.length || localBw.entries.length === 0) {
+        const sorted = [...matchedAccount.bodyWeightHistory].sort((a, b) => a.date.localeCompare(b.date));
+        setBodyWeightEntries(sorted);
+        saveStoredBodyWeight(currentUser, sorted);
+      }
+    }
+
+    if (matchedAccount.restTimerPrefs) {
+      const dbSec = Number(matchedAccount.restTimerPrefs.seconds);
+      if (Number.isFinite(dbSec) && dbSec >= 10 && dbSec <= 600) {
+        setDefaultRestSeconds(Math.round(dbSec));
+        setCustomRestInput(String(Math.round(dbSec)));
+        saveStoredRestSeconds(currentUser, dbSec);
+      }
+      const dbSound = matchedAccount.restTimerPrefs.sound as RestSoundType | undefined;
+      if (dbSound && REST_SOUND_OPTIONS.some(o => o.id === dbSound)) {
+        setRestSound(dbSound);
+        saveStoredRestSound(currentUser, dbSound);
+      }
+    }
+  }, [matchedAccount?.id, matchedAccount?.waterIntake?.updatedAt, matchedAccount?.bodyWeightHistory?.length, currentUser]);
+
+  // Inline exercise metadata editor (to freely modify sets/reps/targetRpe/targetRir/superset/notes/video later)
   const [editingExerciseId, setEditingExerciseId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<{
     name: string;
@@ -577,6 +980,7 @@ export const GymApp: React.FC<GymAppProps> = ({
     sets: string;
     reps: string;
     targetRpe: string;
+    targetRir: string;
     notes: string;
     videoUrl: string;
     isSuperset: boolean;
@@ -596,6 +1000,8 @@ export const GymApp: React.FC<GymAppProps> = ({
     weeks: number;
     defaultWeightUnit: WeightUnit;
     sourceFileName?: string;
+    hasRpeColumn?: boolean;
+    hasRirColumn?: boolean;
     exercises: Array<{
       id?: string;
       day: string;
@@ -603,6 +1009,7 @@ export const GymApp: React.FC<GymAppProps> = ({
       sets: string;
       reps: string;
       targetRpe?: string;
+      targetRir?: string;
       notes: string;
       videoUrl: string;
       isSuperset: boolean;
@@ -777,7 +1184,7 @@ export const GymApp: React.FC<GymAppProps> = ({
     wk: number,
     ex: WorkoutExercise,
     setIdx: number,
-    field: 'weight' | 'reps' | 'rpe' | 'unit',
+    field: 'weight' | 'reps' | 'rpe' | 'rir' | 'unit',
     value: string
   ) => {
     const dKey = draftKey(plan.id, wk, ex.id);
@@ -816,7 +1223,7 @@ export const GymApp: React.FC<GymAppProps> = ({
     let next = current;
     if (delta === 1 && current.length < 20) {
       const lastUnit = current[current.length - 1]?.unit || planUnit;
-      next = [...current, { setNumber: current.length + 1, weight: '', unit: lastUnit, reps: '', rpe: '' }];
+      next = [...current, { setNumber: current.length + 1, weight: '', unit: lastUnit, reps: '', rpe: '', rir: '' }];
     } else if (delta === -1 && current.length > 1) {
       next = current.slice(0, current.length - 1);
     } else {
@@ -872,6 +1279,7 @@ export const GymApp: React.FC<GymAppProps> = ({
       unit: s.unit || planUnit,
       reps: (s.reps || '').trim(),
       rpe: (s.rpe || '').trim(),
+      rir: (s.rir || '').trim(),
     }));
 
     const prevLogged = plan.exerciseLogs?.[wKey]?.[ex.id];
@@ -881,10 +1289,11 @@ export const GymApp: React.FC<GymAppProps> = ({
         u: s.unit || prevLogged?.unit || planUnit,
         r: (s.reps || '').trim(),
         e: (s.rpe || '').trim(),
+        i: (s.rir || '').trim(),
       }))
     );
     const nextNormalized = JSON.stringify(
-      cleanedEntries.map(s => ({ w: s.weight, u: s.unit || planUnit, r: s.reps, e: s.rpe }))
+      cleanedEntries.map(s => ({ w: s.weight, u: s.unit || planUnit, r: s.reps, e: s.rpe, i: s.rir }))
     );
 
     const existingDoneList = plan.progress?.[wKey] || [];
@@ -896,7 +1305,7 @@ export const GymApp: React.FC<GymAppProps> = ({
       return;
     }
 
-    const firstPopulated = cleanedEntries.find(s => s.weight || s.reps || s.rpe);
+    const firstPopulated = cleanedEntries.find(s => s.weight || s.reps || s.rpe || s.rir);
     const updatedWeekLogs: Record<string, ExerciseLogEntry> = {
       ...(plan.exerciseLogs?.[wKey] || {}),
       [ex.id]: {
@@ -1047,25 +1456,87 @@ export const GymApp: React.FC<GymAppProps> = ({
     return () => clearInterval(id);
   }, [warmupTimer?.running]);
 
-  // Per-Set Rest Timer Countdown Effect
+  // Sync active rest timer to localStorage on every update
+  useEffect(() => {
+    persistActiveRestTimer(currentUser, setRestTimer);
+  }, [setRestTimer, currentUser]);
+
+  // Timestamp-based Rest Timer Countdown Effect (resilient to background tab throttling & reloads)
   useEffect(() => {
     if (!setRestTimer || !setRestTimer.running) return;
     const id = setInterval(() => {
       setSetRestTimer(prev => {
         if (!prev || !prev.running) return prev;
-        if (prev.remainingSec <= 1) {
+        const nextRem = prev.endAtMs
+          ? Math.ceil((prev.endAtMs - Date.now()) / 1000)
+          : prev.remainingSec - 1;
+        if (nextRem <= 0) {
           return { ...prev, remainingSec: 0, running: false, finished: true };
         }
-        return { ...prev, remainingSec: prev.remainingSec - 1 };
+        if (nextRem === prev.remainingSec) return prev;
+        return { ...prev, remainingSec: nextRem };
       });
-    }, 1000);
-    return () => clearInterval(id);
+    }, 400);
+
+    const handleVisibilityResume = () => {
+      setSetRestTimer(prev => {
+        if (!prev || !prev.running || !prev.endAtMs) return prev;
+        const nextRem = Math.ceil((prev.endAtMs - Date.now()) / 1000);
+        if (nextRem <= 0) {
+          return { ...prev, remainingSec: 0, running: false, finished: true };
+        }
+        return { ...prev, remainingSec: nextRem };
+      });
+    };
+    document.addEventListener('visibilitychange', handleVisibilityResume);
+    window.addEventListener('focus', handleVisibilityResume);
+
+    return () => {
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', handleVisibilityResume);
+      window.removeEventListener('focus', handleVisibilityResume);
+    };
   }, [setRestTimer?.running]);
 
-  // Play subtle chime & show dismissible alert when set rest timer completes
+  const scheduleBackendRestTimer = (timer: {
+    timerKey: string;
+    exerciseName: string;
+    setNumber: number;
+    totalSec: number;
+    endAtMs: number;
+  }) => {
+    fetch('/api/rest-timer/schedule', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: currentUser,
+        timerKey: timer.timerKey,
+        exerciseName: timer.exerciseName,
+        setNumber: timer.setNumber,
+        totalSec: timer.totalSec,
+        endAtMs: timer.endAtMs,
+      }),
+    }).catch(() => {});
+  };
+
+  const cancelBackendRestTimer = (timerKey?: string) => {
+    fetch('/api/rest-timer/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: currentUser, timerKey }),
+    }).catch(() => {});
+  };
+
+  // Play selected sound, trigger SW Notification & show dismissible alert when rest timer completes
   useEffect(() => {
     if (!setRestTimer?.finished) return;
-    playRestFinishedChime();
+    playRestFinishedChime(restSoundRef.current);
+    cancelBackendRestTimer(setRestTimer.timerKey);
+    triggerBrowserRestNotification(
+      `Rest Complete (${setRestTimer.totalSec}s)`,
+      `${setRestTimer.exerciseName} — Set ${setRestTimer.setNumber} ready!`,
+      setRestTimer.timerKey
+    );
     const bannerId = `${setRestTimer.timerKey}_${Date.now()}`;
     setRestAlertBanner({
       id: bannerId,
@@ -1081,11 +1552,31 @@ export const GymApp: React.FC<GymAppProps> = ({
     return () => clearTimeout(autoClear);
   }, [setRestTimer?.finished, setRestTimer?.timerKey]);
 
+  const persistRestPrefsToProfile = (nextSeconds: number, nextSound: RestSoundType) => {
+    if (!matchedAccount) return;
+    const nextAccount: UserAccount = {
+      ...matchedAccount,
+      restTimerPrefs: {
+        seconds: nextSeconds,
+        sound: nextSound,
+      },
+    };
+    setLocalAccountOverride(nextAccount);
+    saveUserAccountDoc(nextAccount).catch(() => {});
+  };
+
   const updateDefaultRestSeconds = (seconds: number) => {
     const clamped = Math.min(600, Math.max(10, Math.round(seconds)));
     setDefaultRestSeconds(clamped);
     setCustomRestInput(String(clamped));
     saveStoredRestSeconds(currentUser, clamped);
+    persistRestPrefsToProfile(clamped, restSound);
+  };
+
+  const updateRestSound = (sound: RestSoundType) => {
+    setRestSound(sound);
+    saveStoredRestSound(currentUser, sound);
+    persistRestPrefsToProfile(defaultRestSeconds, sound);
   };
 
   const startOrToggleSetRestTimer = (
@@ -1096,51 +1587,97 @@ export const GymApp: React.FC<GymAppProps> = ({
   ) => {
     const totalSec = Math.min(600, Math.max(10, Math.round(overrideSec ?? defaultRestSeconds)));
     setRestAlertBanner(null);
-    setSetRestTimer(prev => {
-      if (prev && prev.timerKey === timerKey && overrideSec === undefined) {
-        if (prev.remainingSec <= 0 || prev.finished) {
-          return {
-            timerKey,
-            exerciseId: ex.id,
-            exerciseName: ex.name,
-            setNumber,
-            remainingSec: totalSec,
-            totalSec,
-            running: true,
-            finished: false,
-          };
-        }
-        return { ...prev, running: !prev.running, finished: false };
+
+    if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission().catch(() => {});
+    }
+
+    const now = Date.now();
+    if (setRestTimer && setRestTimer.timerKey === timerKey && overrideSec === undefined) {
+      if (setRestTimer.remainingSec <= 0 || setRestTimer.finished) {
+        const endAtMs = now + totalSec * 1000;
+        const next: ActiveRestTimerState = {
+          timerKey,
+          exerciseId: ex.id,
+          exerciseName: ex.name,
+          setNumber,
+          remainingSec: totalSec,
+          totalSec,
+          endAtMs,
+          running: true,
+          finished: false,
+        };
+        setSetRestTimer(next);
+        scheduleBackendRestTimer({ timerKey, exerciseName: ex.name, setNumber, totalSec, endAtMs });
+        return;
       }
-      return {
+      if (setRestTimer.running) {
+        const rem = setRestTimer.endAtMs
+          ? Math.max(1, Math.ceil((setRestTimer.endAtMs - now) / 1000))
+          : setRestTimer.remainingSec;
+        setSetRestTimer({ ...setRestTimer, remainingSec: rem, endAtMs: undefined, running: false, finished: false });
+        cancelBackendRestTimer(timerKey);
+        return;
+      }
+      const endAtMs = now + setRestTimer.remainingSec * 1000;
+      setSetRestTimer({ ...setRestTimer, endAtMs, running: true, finished: false });
+      scheduleBackendRestTimer({
         timerKey,
-        exerciseId: ex.id,
         exerciseName: ex.name,
         setNumber,
-        remainingSec: totalSec,
-        totalSec,
-        running: true,
-        finished: false,
-      };
-    });
+        totalSec: setRestTimer.totalSec,
+        endAtMs,
+      });
+      return;
+    }
+
+    const endAtMs = now + totalSec * 1000;
+    const next: ActiveRestTimerState = {
+      timerKey,
+      exerciseId: ex.id,
+      exerciseName: ex.name,
+      setNumber,
+      remainingSec: totalSec,
+      totalSec,
+      endAtMs,
+      running: true,
+      finished: false,
+    };
+    setSetRestTimer(next);
+    scheduleBackendRestTimer({ timerKey, exerciseName: ex.name, setNumber, totalSec, endAtMs });
   };
 
   const stopSetRestTimer = () => {
+    if (setRestTimer?.timerKey) {
+      cancelBackendRestTimer(setRestTimer.timerKey);
+    }
     setSetRestTimer(null);
   };
 
   const addSecondsToActiveRestTimer = (extraSeconds: number) => {
     setRestAlertBanner(null);
-    setSetRestTimer(prev => {
-      if (!prev) return prev;
-      const nextRemaining = Math.min(600, Math.max(1, prev.remainingSec + extraSeconds));
-      return {
-        ...prev,
-        remainingSec: nextRemaining,
-        totalSec: Math.max(prev.totalSec, nextRemaining),
-        running: true,
-        finished: false,
-      };
+    if (!setRestTimer) return;
+    const now = Date.now();
+    const curRem = setRestTimer.running && setRestTimer.endAtMs
+      ? Math.max(0, Math.ceil((setRestTimer.endAtMs - now) / 1000))
+      : setRestTimer.remainingSec;
+    const nextRemaining = Math.min(600, Math.max(1, curRem + extraSeconds));
+    const endAtMs = now + nextRemaining * 1000;
+    const nextState: ActiveRestTimerState = {
+      ...setRestTimer,
+      remainingSec: nextRemaining,
+      totalSec: Math.max(setRestTimer.totalSec, nextRemaining),
+      endAtMs,
+      running: true,
+      finished: false,
+    };
+    setSetRestTimer(nextState);
+    scheduleBackendRestTimer({
+      timerKey: nextState.timerKey,
+      exerciseName: nextState.exerciseName,
+      setNumber: nextState.setNumber,
+      totalSec: nextState.totalSec,
+      endAtMs,
     });
   };
 
@@ -1564,89 +2101,177 @@ export const GymApp: React.FC<GymAppProps> = ({
     }
   };
 
-  const persistWaterToProfile = (nextCount: number, remEnabled = waterReminderEnabled, remInterval = waterReminderIntervalMinutes) => {
-    if (!matchedAccount) return;
-    const nextAccount: UserAccount = {
-      ...matchedAccount,
-      waterIntake: {
-        date: getTodayDateKey(),
+  const persistWaterToProfile = (
+    nextCount: number,
+    remEnabled = waterReminderEnabledRef.current,
+    remInterval = waterReminderIntervalRef.current,
+    updatedAtIso = new Date().toISOString()
+  ) => {
+    const todayKey = getTodayDateKey();
+    const tzOffset = -new Date().getTimezoneOffset();
+
+    // Always sync live count to backend server cache so /water & closed-tab reminders stay current immediately
+    fetch('/api/water-intake/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: currentUser,
+        date: todayKey,
+        timezoneOffsetMinutes: tzOffset,
         glasses: nextCount,
-        updatedAt: new Date().toISOString(),
+        updatedAt: updatedAtIso,
+        reminderEnabled: remEnabled,
+        reminderIntervalMinutes: remInterval,
+      }),
+    }).catch(() => {});
+
+    const baseAccount = matchedAccountRef.current;
+    if (!baseAccount) return;
+    const nextAccount: UserAccount = {
+      ...baseAccount,
+      waterIntake: {
+        date: todayKey,
+        glasses: nextCount,
+        updatedAt: updatedAtIso,
+        timezoneOffsetMinutes: tzOffset,
         reminderEnabled: remEnabled,
         reminderIntervalMinutes: remInterval,
       },
     };
     setLocalAccountOverride(nextAccount);
-    saveUserAccountDoc(nextAccount).catch(() => {});
-  };
-
-  const adjustWaterGlasses = (delta: 1 | -1) => {
-    setWaterGlasses(prev => {
-      const next = Math.max(0, Math.min(40, prev + delta));
-      try {
-        localStorage.setItem(
-          getWaterStorageKey(currentUser),
-          JSON.stringify({ count: next, updatedAt: new Date().toISOString() })
-        );
-      } catch {
-        // ignore storage quota errors
-      }
-      persistWaterToProfile(next);
-      return next;
+    saveUserAccountDoc(nextAccount).catch((err) => {
+      console.warn('Failed to persist water intake to profile:', err);
     });
   };
 
+  const adjustWaterGlasses = (delta: 1 | -1) => {
+    const next = Math.max(0, Math.min(40, waterGlassesRef.current + delta));
+    const updatedAtIso = new Date().toISOString();
+    waterGlassesRef.current = next;
+    setWaterGlasses(next);
+    try {
+      localStorage.setItem(
+        getWaterStorageKey(currentUser),
+        JSON.stringify({ count: next, updatedAt: updatedAtIso })
+      );
+    } catch {
+      // ignore storage quota errors
+    }
+    persistWaterToProfile(next, waterReminderEnabledRef.current, waterReminderIntervalRef.current, updatedAtIso);
+  };
+
   const resetWaterGlasses = () => {
+    const updatedAtIso = new Date().toISOString();
+    waterGlassesRef.current = 0;
     setWaterGlasses(0);
     try {
       localStorage.setItem(
         getWaterStorageKey(currentUser),
-        JSON.stringify({ count: 0, updatedAt: new Date().toISOString() })
+        JSON.stringify({ count: 0, updatedAt: updatedAtIso })
       );
     } catch {
       // ignore
     }
-    persistWaterToProfile(0);
+    persistWaterToProfile(0, waterReminderEnabledRef.current, waterReminderIntervalRef.current, updatedAtIso);
   };
 
   const saveWaterReminderPrefs = (enabled: boolean, intervalMinutes: number) => {
+    const clampedInterval = Math.min(1440, Math.max(1, Math.round(intervalMinutes || 30)));
+    waterReminderEnabledRef.current = enabled;
+    waterReminderIntervalRef.current = clampedInterval;
     setWaterReminderEnabled(enabled);
-    setWaterReminderIntervalMinutes(intervalMinutes);
-    try {
-      localStorage.setItem(
-        getWaterReminderStorageKey(currentUser),
-        JSON.stringify({ enabled, intervalMinutes })
-      );
-    } catch {
-      // ignore
+    setWaterReminderIntervalMinutes(clampedInterval);
+    setCustomWaterIntervalInput(String(clampedInterval));
+    saveStoredWaterReminder(currentUser, enabled, clampedInterval);
+    persistWaterToProfile(waterGlassesRef.current, enabled, clampedInterval);
+  };
+
+  const handleSaveBodyWeight = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const numeric = parseFloat(bodyWeightValueInput.replace(',', '.'));
+    if (!Number.isFinite(numeric) || numeric <= 0 || numeric > 600) {
+      setBodyWeightNotice('Enter a valid positive weight.');
+      setTimeout(() => setBodyWeightNotice(null), 3000);
+      return;
     }
-    persistWaterToProfile(waterGlasses, enabled, intervalMinutes);
+    const cleanDate = bodyWeightDateInput.trim() || getTodayDateKey();
+    const rounded = Math.round(numeric * 10) / 10;
+    const cleanNote = bodyWeightNoteInput.trim();
+    const existingIdx = bodyWeightEntries.findIndex(item => item.date === cleanDate);
+    const nextEntry: BodyWeightEntry = {
+      id: existingIdx >= 0 ? bodyWeightEntries[existingIdx].id : `bw_${cleanDate}_${Date.now().toString(36)}`,
+      date: cleanDate,
+      weight: rounded,
+      unit: bodyWeightUnitInput,
+      ...(cleanNote ? { note: cleanNote } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+    const nextList = (
+      existingIdx >= 0
+        ? bodyWeightEntries.map((item, idx) => (idx === existingIdx ? nextEntry : item))
+        : [...bodyWeightEntries, nextEntry]
+    ).sort((a, b) => a.date.localeCompare(b.date));
+
+    setBodyWeightEntries(nextList);
+    saveStoredBodyWeight(currentUser, nextList);
+    setBodyWeightValueInput('');
+    setBodyWeightNoteInput('');
+    setBodyWeightNotice(existingIdx >= 0 ? `Updated ${cleanDate} (${rounded} ${bodyWeightUnitInput})` : `Saved ${rounded} ${bodyWeightUnitInput} for ${cleanDate}`);
+    setTimeout(() => setBodyWeightNotice(null), 3500);
+
+    if (matchedAccount) {
+      const nextAccount: UserAccount = {
+        ...matchedAccount,
+        bodyWeightHistory: nextList,
+      };
+      setLocalAccountOverride(nextAccount);
+      saveUserAccountDoc(nextAccount).catch(() => {});
+    }
+  };
+
+  const handleDeleteBodyWeight = (entryId: string) => {
+    const nextList = bodyWeightEntries.filter(item => item.id !== entryId);
+    setBodyWeightEntries(nextList);
+    saveStoredBodyWeight(currentUser, nextList);
+    if (matchedAccount) {
+      const nextAccount: UserAccount = {
+        ...matchedAccount,
+        bodyWeightHistory: nextList,
+      };
+      setLocalAccountOverride(nextAccount);
+      saveUserAccountDoc(nextAccount).catch(() => {});
+    }
   };
 
   const dispatchWaterTelegramAlert = async (manual = false) => {
     if (isSendingWaterAlert) return;
-    if (!activeTelegramConfig.enabled || !activeTelegramConfig.botToken.trim()) {
+    const tgCfg = activeTelegramConfigRef.current || activeTelegramConfig;
+    const wlStatus = memberWhitelistStatusRef.current;
+    const targetChat = resolvedMemberChatIdRef.current || resolvedMemberChatId;
+    const liveGlasses = waterGlassesRef.current;
+    const displayName = resolvedDisplayNameRef.current || currentUser;
+
+    if (!tgCfg.enabled || !tgCfg.botToken.trim()) {
       if (manual) {
         setWaterAlertNotice({ type: 'error', text: 'Telegram Bot is not enabled in Admin Panel.' });
         setTimeout(() => setWaterAlertNotice(null), 4000);
       }
       return;
     }
-    if (activeTelegramConfig.notifyWater === false) {
+    if (tgCfg.notifyWater === false) {
       if (manual) {
         setWaterAlertNotice({ type: 'error', text: 'Water intake alerts are turned off in Admin Panel.' });
         setTimeout(() => setWaterAlertNotice(null), 4000);
       }
       return;
     }
-    if (memberWhitelistStatus !== 'active') {
+    if (wlStatus !== 'active') {
       if (manual) {
         setWaterAlertNotice({ type: 'error', text: 'Your Telegram account must be whitelisted by Admin first.' });
         setTimeout(() => setWaterAlertNotice(null), 4500);
       }
       return;
     }
-    const targetChat = resolvedMemberChatId;
     if (!targetChat) {
       if (manual) {
         setWaterAlertNotice({ type: 'error', text: 'Save your Chat ID in Profile -> Telegram Bot first.' });
@@ -1658,17 +2283,22 @@ export const GymApp: React.FC<GymAppProps> = ({
     setIsSendingWaterAlert(true);
     try {
       const note =
-        waterGlasses >= WATER_DAILY_GOAL
+        liveGlasses >= WATER_DAILY_GOAL
           ? 'Great work staying hydrated!'
           : 'Time for another glass of water to fuel your recovery!';
       const msg = formatWaterIntakeTelegramMessage(
-        resolvedDisplayName,
-        waterGlasses,
+        displayName,
+        liveGlasses,
         WATER_DAILY_GOAL,
         note
       );
-      const res = await sendDirectTelegramMessage(activeTelegramConfig.botToken, targetChat, msg);
+      const res = await sendDirectTelegramMessage(tgCfg.botToken, targetChat, msg);
       if (res.success) {
+        fetch('/api/water-intake/mark-sent', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: currentUser, sentAtMs: Date.now() }),
+        }).catch(() => {});
         setWaterAlertNotice({
           type: 'success',
           text: manual ? 'Water alert sent to Telegram Bot!' : 'Scheduled hydration alert sent!',
@@ -1695,6 +2325,7 @@ export const GymApp: React.FC<GymAppProps> = ({
       sets: setsDisplay || '',
       reps: repsDisplay || '',
       targetRpe: ex.targetRpe || '',
+      targetRir: ex.targetRir || '',
       notes: ex.notes || '',
       videoUrl: ex.videoUrl || '',
       isSuperset: !!ex.isSuperset,
@@ -1719,6 +2350,7 @@ export const GymApp: React.FC<GymAppProps> = ({
       ...(nextSets ? { sets: nextSets } : {}),
       ...(nextReps ? { reps: nextReps } : {}),
       ...(editDraft.targetRpe.trim() ? { targetRpe: editDraft.targetRpe.trim() } : {}),
+      ...(editDraft.targetRir.trim() ? { targetRir: editDraft.targetRir.trim() } : {}),
       ...(editDraft.notes.trim() ? { notes: editDraft.notes.trim() } : {}),
       ...(editDraft.videoUrl.trim() ? { videoUrl: editDraft.videoUrl.trim() } : {}),
       ...(editDraft.isSuperset ? { isSuperset: true } : {}),
@@ -1742,14 +2374,15 @@ export const GymApp: React.FC<GymAppProps> = ({
           unit: planUnit,
           reps: '',
           rpe: '',
+          rir: '',
         })),
       ];
     } else if (currEntries.length > newTargetCount) {
-      // Only shrink trailing empty sets so logged weights/reps/RPE are never lost
+      // Only shrink trailing empty sets so logged weights/reps/RPE/RIR are never lost
       const copy = [...currEntries];
       while (copy.length > newTargetCount) {
         const tail = copy[copy.length - 1];
-        if (!tail.weight.trim() && !tail.reps.trim() && !(tail.rpe || '').trim()) {
+        if (!tail.weight.trim() && !tail.reps.trim() && !(tail.rpe || '').trim() && !(tail.rir || '').trim()) {
           copy.pop();
         } else {
           break;
@@ -1770,6 +2403,8 @@ export const GymApp: React.FC<GymAppProps> = ({
     const nextPlan: WorkoutPlan = {
       ...plan,
       exercises: nextExercises,
+      ...(editDraft.targetRpe.trim() ? { hasRpeColumn: true } : {}),
+      ...(editDraft.targetRir.trim() ? { hasRirColumn: true } : {}),
       ...(updatedWeekLog
         ? {
             exerciseLogs: {
@@ -1905,7 +2540,7 @@ export const GymApp: React.FC<GymAppProps> = ({
           ownerName: resolvedDisplayName,
           waterGlasses,
         });
-        const caption = `📊 <b>${plan.title}</b> (Excel .xlsx)\nIncludes Workout Plan, Set-by-Set History (RPE & Volume), Warm-up Tracker & Notes.`;
+        const caption = `📊 <b>${plan.title}</b> (Excel .xlsx)\nIncludes Workout Sheet, Daily Analytics, Set-by-Set Log, Warm-up & Hydration & Notes.`;
         const res = await sendTelegramDocumentFile({
           botToken,
           chatId: resolvedMemberChatId,
@@ -2201,12 +2836,16 @@ export const GymApp: React.FC<GymAppProps> = ({
     return matchingAuth?.chatId?.trim() || '';
   }, [tgChatIdInput, matchedAccount?.telegramChatId, activeTelegramConfig.authorizedUsers, currentUser, tgUsernameInput]);
 
+  activeTelegramConfigRef.current = activeTelegramConfig;
+  memberWhitelistStatusRef.current = memberWhitelistStatus;
+  resolvedMemberChatIdRef.current = resolvedMemberChatId;
+
   useEffect(() => {
     if (!waterReminderEnabled) return;
     if (memberWhitelistStatus !== 'active' || !resolvedMemberChatId) return;
     if (!activeTelegramConfig.enabled || activeTelegramConfig.notifyWater === false || !activeTelegramConfig.botToken.trim()) return;
 
-    const intervalMs = Math.max(5, waterReminderIntervalMinutes || 60) * 60 * 1000;
+    const intervalMs = Math.max(1, Math.min(1440, waterReminderIntervalMinutes || 30)) * 60 * 1000;
     const timer = window.setInterval(() => {
       dispatchWaterTelegramAlert(false);
     }, intervalMs);
@@ -2214,7 +2853,6 @@ export const GymApp: React.FC<GymAppProps> = ({
   }, [
     waterReminderEnabled,
     waterReminderIntervalMinutes,
-    waterGlasses,
     memberWhitelistStatus,
     resolvedMemberChatId,
     activeTelegramConfig.enabled,
@@ -2406,6 +3044,8 @@ export const GymApp: React.FC<GymAppProps> = ({
       weeks: Math.max(1, plan.weeks || 1),
       defaultWeightUnit: plan.defaultWeightUnit || 'kg',
       sourceFileName: plan.sourceFileName,
+      hasRpeColumn: planHasRpeColumn(plan),
+      hasRirColumn: planHasRirColumn(plan),
       exercises: (plan.exercises || []).map((ex) => {
         const { setsDisplay, repsDisplay } = getExerciseTargetDisplay(ex);
         return {
@@ -2415,6 +3055,7 @@ export const GymApp: React.FC<GymAppProps> = ({
           sets: setsDisplay || '',
           reps: repsDisplay || '',
           targetRpe: ex.targetRpe || '',
+          targetRir: ex.targetRir || '',
           notes: ex.notes || '',
           videoUrl: ex.videoUrl || '',
           isSuperset: !!ex.isSuperset,
@@ -2482,6 +3123,7 @@ export const GymApp: React.FC<GymAppProps> = ({
           sets: row.sets || '',
           reps: row.reps || '',
           targetRpe: row.rpe || matched?.targetRpe || '',
+          targetRir: row.rir || matched?.targetRir || '',
           notes: row.notes || '',
           videoUrl: row.video || '',
           isSuperset: !!row.isSuperset,
@@ -2500,7 +3142,7 @@ export const GymApp: React.FC<GymAppProps> = ({
         .join('\n\n');
 
       const prefilledCount = mappedExercises.filter(
-        m => m.weeklyLogs || m.loggedWeight || m.loggedReps || m.targetRpe || m.completed
+        m => m.weeklyLogs || m.loggedWeight || m.loggedReps || m.targetRpe || m.targetRir || m.completed
       ).length;
 
       setWorksheetDraft((prev) =>
@@ -2510,13 +3152,15 @@ export const GymApp: React.FC<GymAppProps> = ({
               weeks: Math.max(prev.weeks, bestWorkoutTab.detectedDataWeeks || 0),
               defaultWeightUnit: bestWorkoutTab.detectedWeightUnit || prev.defaultWeightUnit,
               sourceFileName: file.name,
+              hasRpeColumn: bestWorkoutTab.hasRpeColumn,
+              hasRirColumn: bestWorkoutTab.hasRirColumn,
               instructions: infoText || prev.instructions,
               exercises: mappedExercises,
             }
           : prev
       );
       setWorksheetImportNotice(
-        `Loaded ${mappedExercises.length} exercises from "${file.name}" (${usedExistingIds.size} matched to keep saved data${prefilledCount > 0 ? `, ${prefilledCount} rows with sheet data/RPE ready to fill empty slots` : ''}). Click Save Worksheet to apply.`
+        `Loaded ${mappedExercises.length} exercises from "${file.name}" (${usedExistingIds.size} matched to keep saved data${prefilledCount > 0 ? `, ${prefilledCount} rows with sheet data ready to fill empty slots` : ''}). Click Save Worksheet to apply.`
       );
     } catch (err: any) {
       setWorksheetImportNotice(`Failed to read file: ${err?.message || String(err)}`);
@@ -2536,6 +3180,8 @@ export const GymApp: React.FC<GymAppProps> = ({
         weeks: worksheetDraft.weeks,
         defaultWeightUnit: worksheetDraft.defaultWeightUnit,
         sourceFileName: worksheetDraft.sourceFileName,
+        hasRpeColumn: worksheetDraft.hasRpeColumn,
+        hasRirColumn: worksheetDraft.hasRirColumn,
         exercises: worksheetDraft.exercises.map(row => {
           const split = splitSetsAndReps(row.sets);
           return {
@@ -2545,6 +3191,7 @@ export const GymApp: React.FC<GymAppProps> = ({
             sets: split ? split.sets : row.sets,
             reps: row.reps.trim() || (split ? split.reps : ''),
             targetRpe: row.targetRpe?.trim() || '',
+            targetRir: row.targetRir?.trim() || '',
             notes: row.notes,
             videoUrl: row.videoUrl,
             isSuperset: row.isSuperset,
@@ -2593,19 +3240,21 @@ export const GymApp: React.FC<GymAppProps> = ({
     setWorksheetImportNotice(null);
   };
 
-  const renderWorkoutsWorkspace = (showEmptyState = true) => {
+  const renderWorkoutsWorkspace = (showEmptyState = true, allowModify = true) => {
     if (myPlans.length === 0) {
       if (!showEmptyState) return null;
       return (
         <div className="space-y-4">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-bold text-white uppercase tracking-wider">My Workouts (0)</h2>
-            <button
-              onClick={() => setActiveTab('upload')}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white text-xs font-bold cursor-pointer"
-            >
-              <Upload className="w-3.5 h-3.5" /> Upload
-            </button>
+            {allowModify && (
+              <button
+                onClick={() => setActiveTab('upload')}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white text-xs font-bold cursor-pointer"
+              >
+                <Upload className="w-3.5 h-3.5" /> Upload
+              </button>
+            )}
           </div>
           <EmptyPlans onUpload={() => setActiveTab('upload')} />
         </div>
@@ -2619,6 +3268,8 @@ export const GymApp: React.FC<GymAppProps> = ({
     const doneIds = plan.progress?.[weekKey(selectedWeek - 1)] || [];
     const weekDone = doneIds.length;
     const weekPct = plan.exercises.length > 0 ? Math.round((weekDone / plan.exercises.length) * 100) : 0;
+    const showRpe = planHasRpeColumn(plan);
+    const showRir = planHasRirColumn(plan);
 
     const visibleExercises =
       selectedDayFilter === 'ALL' || activePlanDays.length === 0
@@ -2641,12 +3292,14 @@ export const GymApp: React.FC<GymAppProps> = ({
               >
                 {myPlans.map(p => <option key={p.id} value={p.id}>{p.title} ({p.exercises.length} ex)</option>)}
               </select>
-              <button
-                onClick={() => setActiveTab('upload')}
-                className="h-9 px-3 inline-flex items-center gap-1.5 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold cursor-pointer"
-              >
-                <Upload className="w-3.5 h-3.5" /> Upload
-              </button>
+              {allowModify && (
+                <button
+                  onClick={() => setActiveTab('upload')}
+                  className="h-9 px-3 inline-flex items-center gap-1.5 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold cursor-pointer"
+                >
+                  <Upload className="w-3.5 h-3.5" /> Upload
+                </button>
+              )}
             </div>
           </div>
 
@@ -2699,53 +3352,57 @@ export const GymApp: React.FC<GymAppProps> = ({
             </div>
 
             <div className="flex items-center gap-2 w-full sm:w-auto sm:shrink-0">
-  <div className="inline-flex items-center rounded-xl bg-neutral-950 border border-white/15 p-0.5 shrink-0" title="Workout default weight unit">
-    {(['kg', 'lbs'] as WeightUnit[]).map((u) => (
-      <button
-        key={u}
-        type="button"
-        onClick={() => changePlanWeightUnit(plan, u)}
-        className={`h-8 px-2.5 rounded-lg text-[11px] font-bold uppercase transition-all cursor-pointer ${
-          planUnit === u ? 'bg-red-600 text-white shadow' : 'text-neutral-400 hover:text-white'
-        }`}
-      >
-        {u}
-      </button>
-    ))}
-  </div>
+              <div className="inline-flex items-center rounded-xl bg-neutral-950 border border-white/15 p-0.5 shrink-0" title="Workout default weight unit">
+                {(['kg', 'lbs'] as WeightUnit[]).map((u) => (
+                  <button
+                    key={u}
+                    type="button"
+                    onClick={() => changePlanWeightUnit(plan, u)}
+                    className={`h-8 px-2.5 rounded-lg text-[11px] font-bold uppercase transition-all cursor-pointer ${
+                      planUnit === u ? 'bg-red-600 text-white shadow' : 'text-neutral-400 hover:text-white'
+                    }`}
+                  >
+                    {u}
+                  </button>
+                ))}
+              </div>
 
-  <button
-    type="button"
-    onClick={() => {
-      if (worksheetEditPlanId === plan.id) {
-        setWorksheetEditPlanId(null);
-        setWorksheetDraft(null);
-      } else {
-        startModifyWorksheet(plan);
-      }
-    }}
-    className={`flex-1 sm:flex-none min-w-0 h-9 inline-flex items-center justify-center gap-1.5 px-3 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
-      worksheetEditPlanId === plan.id
-        ? 'bg-emerald-600 text-white border-emerald-400 shadow'
-        : 'bg-neutral-950 hover:bg-neutral-800 text-neutral-200 border-white/15 hover:border-emerald-500/50'
-    }`}
-  >
-    <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-    <span className="truncate sm:hidden">{worksheetEditPlanId === plan.id ? 'Close' : 'Modify'}</span>
-    <span className="hidden sm:inline">{worksheetEditPlanId === plan.id ? 'Close Editor' : 'Modify Worksheet'}</span>
-  </button>
+              {allowModify && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (worksheetEditPlanId === plan.id) {
+                      setWorksheetEditPlanId(null);
+                      setWorksheetDraft(null);
+                    } else {
+                      startModifyWorksheet(plan);
+                    }
+                  }}
+                  className={`flex-1 sm:flex-none min-w-0 h-9 inline-flex items-center justify-center gap-1.5 px-3 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
+                    worksheetEditPlanId === plan.id
+                      ? 'bg-emerald-600 text-white border-emerald-400 shadow'
+                      : 'bg-neutral-950 hover:bg-neutral-800 text-neutral-200 border-white/15 hover:border-emerald-500/50'
+                  }`}
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  <span className="truncate sm:hidden">{worksheetEditPlanId === plan.id ? 'Close' : 'Modify'}</span>
+                  <span className="hidden sm:inline">{worksheetEditPlanId === plan.id ? 'Close Editor' : 'Modify Worksheet'}</span>
+                </button>
+              )}
 
-  {renderExportControl(plan, 'toolbar', 'toolbar')}
+              {renderExportControl(plan, 'toolbar', 'toolbar')}
 
-  <button
-    type="button"
-    onClick={() => setPlanToDelete(plan)}
-    aria-label="Delete plan"
-    className="h-9 w-9 shrink-0 inline-flex items-center justify-center rounded-xl border border-white/10 text-neutral-400 hover:text-red-400 hover:bg-red-500/10 cursor-pointer"
-  >
-    <Trash2 className="w-4 h-4" />
-  </button>
-</div>
+              {allowModify && (
+                <button
+                  type="button"
+                  onClick={() => setPlanToDelete(plan)}
+                  aria-label="Delete plan"
+                  className="h-9 w-9 shrink-0 inline-flex items-center justify-center rounded-xl border border-white/10 text-neutral-400 hover:text-red-400 hover:bg-red-500/10 cursor-pointer"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              )}
+            </div>
           </div>
 
           {savedNoticeId === `plan_${plan.id}` && (
@@ -2766,8 +3423,8 @@ export const GymApp: React.FC<GymAppProps> = ({
           </div>
         </div>
 
-        {/* FULL WORKSHEET MODIFIER PANEL (PRESERVES SAVED DATA) */}
-        {worksheetEditPlanId === plan.id && worksheetDraft && (
+        {/* FULL WORKSHEET MODIFIER PANEL (PRESERVES SAVED DATA — MY WORKOUTS ONLY) */}
+        {allowModify && worksheetEditPlanId === plan.id && worksheetDraft && (
           <div className="rounded-2xl border border-emerald-500/35 bg-neutral-950/90 p-4 sm:p-5 space-y-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
@@ -2871,7 +3528,7 @@ export const GymApp: React.FC<GymAppProps> = ({
 
             {/* Editable Worksheet Table */}
             <div className="rounded-xl border border-white/10 bg-black/40 overflow-x-auto">
-              <table className="w-full text-left border-collapse min-w-[900px]">
+              <table className="w-full text-left border-collapse min-w-[960px]">
                 <thead>
                   <tr className="text-[10px] uppercase tracking-wider text-neutral-500 bg-neutral-900/80">
                     <th className="px-2 py-2 w-32">Day</th>
@@ -2880,6 +3537,7 @@ export const GymApp: React.FC<GymAppProps> = ({
                     <th className="px-2 py-2 w-20">Sets</th>
                     <th className="px-2 py-2 w-24">Reps</th>
                     <th className="px-2 py-2 w-20">RPE</th>
+                    <th className="px-2 py-2 w-20">RIR</th>
                     <th className="px-2 py-2">Notes</th>
                     <th className="px-2 py-2 w-56">Video URL</th>
                     <th className="px-2 py-2 w-10"></th>
@@ -2973,6 +3631,18 @@ export const GymApp: React.FC<GymAppProps> = ({
                       </td>
                       <td className="px-1.5 py-1">
                         <input
+                          value={row.targetRir || ''}
+                          onChange={(e) => {
+                            const next = [...worksheetDraft.exercises];
+                            next[rIdx] = { ...next[rIdx], targetRir: e.target.value };
+                            setWorksheetDraft({ ...worksheetDraft, exercises: next });
+                          }}
+                          placeholder="2"
+                          className="w-full bg-neutral-900 border border-white/10 rounded-lg px-2 py-1 text-xs text-sky-200 font-mono outline-none"
+                        />
+                      </td>
+                      <td className="px-1.5 py-1">
+                        <input
                           value={row.notes}
                           onChange={(e) => {
                             const next = [...worksheetDraft.exercises];
@@ -3027,6 +3697,7 @@ export const GymApp: React.FC<GymAppProps> = ({
                         sets: '3',
                         reps: '8-12',
                         targetRpe: '',
+                        targetRir: '',
                         notes: '',
                         videoUrl: '',
                         isSuperset: false,
@@ -3191,21 +3862,23 @@ export const GymApp: React.FC<GymAppProps> = ({
                   )}
                 </button>
 
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowWarmupSection(true);
-                    setShowAddWarmupForm(v => !v);
-                  }}
-                  className="h-8 px-2.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/35 text-amber-200 text-xs font-bold inline-flex items-center gap-1 cursor-pointer whitespace-nowrap"
-                >
-                  <Plus className="w-3.5 h-3.5" /> Add Warm-up
-                </button>
+                {allowModify && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowWarmupSection(true);
+                      setShowAddWarmupForm(v => !v);
+                    }}
+                    className="h-8 px-2.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/35 text-amber-200 text-xs font-bold inline-flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                  >
+                    <Plus className="w-3.5 h-3.5" /> Add Warm-up
+                  </button>
+                )}
               </div>
 
               {showWarmupSection && (
                 <div className="px-4 pb-4 pt-2 border-t border-amber-500/20 space-y-3">
-                  {showAddWarmupForm && (
+                  {allowModify && showAddWarmupForm && (
                     <div className="rounded-xl border border-amber-500/30 bg-neutral-950/80 p-3 space-y-2.5">
                       <div className="grid grid-cols-1 sm:grid-cols-12 gap-2">
                         <label className="flex flex-col gap-1 sm:col-span-5">
@@ -3438,28 +4111,32 @@ export const GymApp: React.FC<GymAppProps> = ({
                                     )}
                                   </div>
                                 )}
-                                <button
-                                  type="button"
-                                  onClick={() => (isEditingWu ? setEditingWarmupId(null) : startEditWarmup(wu))}
-                                  aria-label={`Edit warm-up ${wu.name}`}
-                                  className="p-1.5 text-neutral-400 hover:text-amber-300 rounded-lg hover:bg-white/5 cursor-pointer"
-                                  title="Edit warm-up minutes & target sets"
-                                >
-                                  <Pencil className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => handleDeleteWarmupExercise(plan, wu.id)}
-                                  aria-label={`Remove warm-up ${wu.name}`}
-                                  className="p-1.5 text-neutral-500 hover:text-red-400 rounded-lg hover:bg-red-500/10 cursor-pointer"
-                                  title="Remove warm-up exercise"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
+                                {allowModify && (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() => (isEditingWu ? setEditingWarmupId(null) : startEditWarmup(wu))}
+                                      aria-label={`Edit warm-up ${wu.name}`}
+                                      className="p-1.5 text-neutral-400 hover:text-amber-300 rounded-lg hover:bg-white/5 cursor-pointer"
+                                      title="Edit warm-up minutes & target sets"
+                                    >
+                                      <Pencil className="w-3.5 h-3.5" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteWarmupExercise(plan, wu.id)}
+                                      aria-label={`Remove warm-up ${wu.name}`}
+                                      className="p-1.5 text-neutral-500 hover:text-red-400 rounded-lg hover:bg-red-500/10 cursor-pointer"
+                                      title="Remove warm-up exercise"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  </>
+                                )}
                               </div>
                             </div>
 
-                            {isEditingWu && editWarmupDraft && (
+                            {allowModify && isEditingWu && editWarmupDraft && (
                               <div className="rounded-xl border border-amber-500/30 bg-black/50 p-3 space-y-2 text-xs">
                                 <div className="grid grid-cols-1 sm:grid-cols-12 gap-2">
                                   <label className="flex flex-col gap-1 sm:col-span-5">
@@ -3565,8 +4242,14 @@ export const GymApp: React.FC<GymAppProps> = ({
                                 </div>
                               </div>
 
-                              <div className="grid grid-cols-[30px_minmax(0,1.35fr)_minmax(0,0.85fr)_minmax(0,0.75fr)] gap-1.5 sm:hidden text-[9px] uppercase tracking-wider text-neutral-500 font-mono px-0.5">
-                                <span className="text-center">Set</span><span>Weight</span><span>Reps</span><span>RPE</span>
+                              <div
+                                className={`grid ${
+                                  showRpe
+                                    ? 'grid-cols-[30px_minmax(0,1.35fr)_minmax(0,0.85fr)_minmax(0,0.75fr)]'
+                                    : 'grid-cols-[34px_minmax(0,1.4fr)_minmax(0,1fr)]'
+                                } gap-1.5 sm:hidden text-[9px] uppercase tracking-wider text-neutral-500 font-mono px-0.5`}
+                              >
+                                <span className="text-center">Set</span><span>Weight</span><span>Reps</span>{showRpe && <span>RPE</span>}
                               </div>
 
                               <div className="space-y-1.5">
@@ -3575,7 +4258,11 @@ export const GymApp: React.FC<GymAppProps> = ({
                                   return (
                                     <div
                                       key={sIdx}
-                                      className="grid grid-cols-[30px_minmax(0,1.35fr)_minmax(0,0.85fr)_minmax(0,0.75fr)] sm:grid-cols-[60px_145px_110px_92px] items-center gap-1.5 sm:gap-2"
+                                      className={`grid ${
+                                        showRpe
+                                          ? 'grid-cols-[30px_minmax(0,1.35fr)_minmax(0,0.85fr)_minmax(0,0.75fr)] sm:grid-cols-[60px_145px_110px_92px]'
+                                          : 'grid-cols-[34px_minmax(0,1.4fr)_minmax(0,1fr)] sm:grid-cols-[60px_155px_125px]'
+                                      } items-center gap-1.5 sm:gap-2`}
                                     >
                                       <span className="h-10 sm:h-auto flex items-center justify-center text-[11px] font-mono font-bold text-amber-300 bg-amber-500/10 border border-amber-500/25 rounded-lg sm:py-1">
                                         <span className="sm:hidden">W{sIdx + 1}</span>
@@ -3615,19 +4302,21 @@ export const GymApp: React.FC<GymAppProps> = ({
                                           className="w-full min-w-0 h-10 sm:h-auto bg-neutral-900 border border-white/15 focus:border-amber-500/60 rounded-lg px-2.5 sm:pl-9 sm:pr-2 sm:py-1 text-sm sm:text-xs text-white font-mono outline-none"
                                         />
                                       </label>
-                                      <label className="relative flex items-center min-w-0">
-                                        <span className="hidden sm:block absolute left-2 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">RPE</span>
-                                        <input
-                                          type="text"
-                                          inputMode="decimal"
-                                          value={sRow.rpe || ''}
-                                          onChange={(e) => updateWarmupSetField(plan, selectedWeek, wu, sIdx, 'rpe', e.target.value)}
-                                          onBlur={() => saveWarmupSets(plan, selectedWeek, wu)}
-                                          placeholder="-"
-                                          aria-label={`Warm-up ${wu.name} Set ${sIdx + 1} RPE`}
-                                          className="w-full min-w-0 h-10 sm:h-auto bg-neutral-900 border border-white/15 focus:border-amber-500/60 rounded-lg px-2.5 sm:pl-8 sm:pr-2 sm:py-1 text-sm sm:text-xs text-white font-mono outline-none"
-                                        />
-                                      </label>
+                                      {showRpe && (
+                                        <label className="relative flex items-center min-w-0">
+                                          <span className="hidden sm:block absolute left-2 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">RPE</span>
+                                          <input
+                                            type="text"
+                                            inputMode="decimal"
+                                            value={sRow.rpe || ''}
+                                            onChange={(e) => updateWarmupSetField(plan, selectedWeek, wu, sIdx, 'rpe', e.target.value)}
+                                            onBlur={() => saveWarmupSets(plan, selectedWeek, wu)}
+                                            placeholder="-"
+                                            aria-label={`Warm-up ${wu.name} Set ${sIdx + 1} RPE`}
+                                            className="w-full min-w-0 h-10 sm:h-auto bg-neutral-900 border border-white/15 focus:border-amber-500/60 rounded-lg px-2.5 sm:pl-8 sm:pr-2 sm:py-1 text-sm sm:text-xs text-white font-mono outline-none"
+                                          />
+                                        </label>
+                                      )}
                                     </div>
                                   );
                                 })}
@@ -3698,6 +4387,33 @@ export const GymApp: React.FC<GymAppProps> = ({
                 />
                 <span className="text-[10px] font-mono text-neutral-500">sec</span>
               </div>
+
+              {/* Sound Variety Selector + Preview */}
+              <div className="flex items-center gap-1 ml-1">
+                <Volume2 className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                <select
+                  value={restSound}
+                  onChange={(e) => {
+                    const nextSound = e.target.value as RestSoundType;
+                    updateRestSound(nextSound);
+                    playRestFinishedChime(nextSound);
+                  }}
+                  aria-label="Rest timer notification sound"
+                  className="h-7 bg-neutral-950 border border-white/15 focus:border-amber-500/70 rounded-lg px-2 text-[11px] text-neutral-200 outline-none cursor-pointer"
+                >
+                  {REST_SOUND_OPTIONS.map(opt => (
+                    <option key={opt.id} value={opt.id}>{opt.label}</option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => playRestFinishedChime(restSound)}
+                  className="h-7 px-2 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-[10px] font-semibold text-neutral-300 hover:text-white cursor-pointer"
+                  title="Preview selected timer sound"
+                >
+                  Test
+                </button>
+              </div>
             </div>
           </div>
 
@@ -3728,14 +4444,13 @@ export const GymApp: React.FC<GymAppProps> = ({
               <button
                 type="button"
                 onClick={() => {
+                  const targetEx =
+                    plan.exercises.find(e => e.id === setRestTimer.exerciseId) ||
+                    ({ id: setRestTimer.exerciseId, name: setRestTimer.exerciseName } as WorkoutExercise);
                   if (setRestTimer.finished) {
-                    setSetRestTimer(prev =>
-                      prev
-                        ? { ...prev, remainingSec: prev.totalSec, running: true, finished: false }
-                        : prev
-                    );
+                    startOrToggleSetRestTimer(setRestTimer.timerKey, targetEx, setRestTimer.setNumber, setRestTimer.totalSec);
                   } else {
-                    setSetRestTimer(prev => (prev ? { ...prev, running: !prev.running } : prev));
+                    startOrToggleSetRestTimer(setRestTimer.timerKey, targetEx, setRestTimer.setNumber);
                   }
                 }}
                 aria-label={setRestTimer.running ? 'Pause active rest timer' : 'Resume rest timer'}
@@ -3831,9 +4546,14 @@ export const GymApp: React.FC<GymAppProps> = ({
                             Target: {[setsDisplay && `${setsDisplay} sets`, repsDisplay && `${repsDisplay} reps`].filter(Boolean).join(' × ')}
                           </span>
                         )}
-                        {ex.targetRpe && (
+                        {showRpe && ex.targetRpe && (
                           <span className="text-[11px] text-amber-200 font-mono font-semibold bg-amber-500/15 border border-amber-500/30 px-2 py-0.5 rounded-md">
                             Target RPE: {ex.targetRpe}
+                          </span>
+                        )}
+                        {showRir && ex.targetRir && (
+                          <span className="text-[11px] text-sky-200 font-mono font-semibold bg-sky-500/15 border border-sky-500/30 px-2 py-0.5 rounded-md">
+                            Target RIR: {ex.targetRir}
                           </span>
                         )}
                         {videoInfo && (
@@ -3845,14 +4565,16 @@ export const GymApp: React.FC<GymAppProps> = ({
                             {inlineVideoExId === ex.id ? <X className="w-3 h-3" /> : <Play className="w-3 h-3 fill-current" />} Demo
                           </button>
                         )}
-                        <button
-                          type="button"
-                          onClick={() => (isEditingThis ? setEditingExerciseId(null) : startEditExercise(ex))}
-                          className="text-[10px] font-semibold text-neutral-400 hover:text-white bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg px-2 py-0.5 inline-flex items-center gap-1 cursor-pointer"
-                          title="Freely modify target sets, reps, superset or notes"
-                        >
-                          <Pencil className="w-3 h-3" /> {isEditingThis ? 'Close' : 'Edit'}
-                        </button>
+                        {allowModify && (
+                          <button
+                            type="button"
+                            onClick={() => (isEditingThis ? setEditingExerciseId(null) : startEditExercise(ex))}
+                            className="text-[10px] font-semibold text-neutral-400 hover:text-white bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg px-2 py-0.5 inline-flex items-center gap-1 cursor-pointer"
+                            title="Freely modify target sets, reps, superset or notes"
+                          >
+                            <Pencil className="w-3 h-3" /> {isEditingThis ? 'Close' : 'Edit'}
+                          </button>
+                        )}
                         {isSavedRecently && (
                           <span className="text-[10px] font-mono text-emerald-300 bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 rounded-full inline-flex items-center gap-1">
                             <Check className="w-3 h-3" /> Saved
@@ -3868,12 +4590,12 @@ export const GymApp: React.FC<GymAppProps> = ({
                         </div>
                       )}
 
-                      {ex.notes && !isEditingThis && (
+                      {ex.notes && !(allowModify && isEditingThis) && (
                         <p className="text-[12px] text-neutral-400 leading-relaxed">{ex.notes}</p>
                       )}
 
-                      {/* FREE INLINE EXERCISE MODIFIER */}
-                      {isEditingThis && editDraft && (
+                      {/* FREE INLINE EXERCISE MODIFIER (MY WORKOUTS ONLY) */}
+                      {allowModify && isEditingThis && editDraft && (
                         <div className="-ml-9 sm:ml-0 rounded-xl border border-amber-500/30 bg-black/50 p-3 space-y-2.5 text-xs">
                           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                             <label className="flex flex-col gap-1">
@@ -3929,6 +4651,15 @@ export const GymApp: React.FC<GymAppProps> = ({
                               />
                             </label>
                             <label className="flex flex-col gap-1">
+                              <span className="text-[10px] uppercase text-neutral-400 font-semibold">Target RIR (RIP / Reps in Reserve)</span>
+                              <input
+                                value={editDraft.targetRir}
+                                onChange={(e) => setEditDraft({ ...editDraft, targetRir: e.target.value })}
+                                placeholder="e.g. 2 or 1-2"
+                                className="bg-neutral-900 border border-white/15 rounded-lg px-2.5 py-1.5 text-sky-200 font-mono outline-none"
+                              />
+                            </label>
+                            <label className="flex flex-col gap-1 sm:col-span-2">
                               <span className="text-[10px] uppercase text-neutral-400 font-semibold">Video URL</span>
                               <input
                                 value={editDraft.videoUrl}
@@ -4030,8 +4761,21 @@ export const GymApp: React.FC<GymAppProps> = ({
                         </div>
 
                         {/* column labels, phones only */}
-                        <div className="grid grid-cols-[26px_minmax(0,1.35fr)_minmax(0,0.8fr)_minmax(0,0.7fr)_auto] gap-1 sm:hidden text-[9px] uppercase tracking-wider text-neutral-500 font-mono px-0.5">
-                          <span className="text-center">Set</span><span>Weight</span><span>Reps</span><span>RPE</span><span className="text-center">Rest</span>
+                        <div
+                          className={`grid ${
+                            showRpe && showRir
+                              ? 'grid-cols-[24px_minmax(0,1.2fr)_minmax(0,0.75fr)_minmax(0,0.6fr)_minmax(0,0.6fr)_auto]'
+                              : showRpe || showRir
+                              ? 'grid-cols-[26px_minmax(0,1.35fr)_minmax(0,0.8fr)_minmax(0,0.7fr)_auto]'
+                              : 'grid-cols-[28px_minmax(0,1.4fr)_minmax(0,0.9fr)_auto]'
+                          } gap-1 sm:hidden text-[9px] uppercase tracking-wider text-neutral-500 font-mono px-0.5`}
+                        >
+                          <span className="text-center">Set</span>
+                          <span>Weight</span>
+                          <span>Reps</span>
+                          {showRpe && <span>RPE</span>}
+                          {showRir && <span>RIR</span>}
+                          <span className="text-center">Rest</span>
                         </div>
 
                         <div className="space-y-1.5">
@@ -4043,10 +4787,17 @@ export const GymApp: React.FC<GymAppProps> = ({
                             const isTimerRunning = isThisTimer && !!setRestTimer?.running;
                             const isTimerDone = isThisTimer && !!setRestTimer?.finished;
 
+                            const rowGridClasses =
+                              showRpe && showRir
+                                ? 'grid-cols-[24px_minmax(0,1.2fr)_minmax(0,0.75fr)_minmax(0,0.6fr)_minmax(0,0.6fr)_auto] sm:grid-cols-[60px_140px_100px_84px_84px_auto]'
+                                : showRpe || showRir
+                                ? 'grid-cols-[26px_minmax(0,1.35fr)_minmax(0,0.8fr)_minmax(0,0.7fr)_auto] sm:grid-cols-[64px_150px_115px_96px_auto]'
+                                : 'grid-cols-[28px_minmax(0,1.4fr)_minmax(0,0.9fr)_auto] sm:grid-cols-[64px_165px_125px_auto]';
+
                             return (
                               <div
                                 key={sIdx}
-                                className="grid grid-cols-[26px_minmax(0,1.35fr)_minmax(0,0.8fr)_minmax(0,0.7fr)_auto] sm:grid-cols-[64px_150px_115px_96px_auto] items-center gap-1 sm:gap-2"
+                                className={`grid ${rowGridClasses} items-center gap-1 sm:gap-2`}
                               >
                                 <span
                                   className={`h-11 sm:h-auto flex items-center justify-center text-[11px] font-mono font-bold border rounded-lg sm:py-1.5 ${
@@ -4109,26 +4860,51 @@ export const GymApp: React.FC<GymAppProps> = ({
                                   />
                                 </label>
 
-                                {/* RPE */}
-                                <label className="relative flex items-center min-w-0">
-                                  <span className="hidden sm:block absolute left-2 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">RPE</span>
-                                  <input
-                                    type="text"
-                                    inputMode="decimal"
-                                    value={setRow.rpe || ''}
-                                    onChange={(e) => updateSetField(plan, selectedWeek, ex, sIdx, 'rpe', e.target.value)}
-                                    onBlur={() => saveExerciseSets(plan, selectedWeek, ex)}
-                                    onKeyDown={(e) => {
-                                      if (e.key === 'Enter') {
-                                        e.preventDefault();
-                                        (e.currentTarget as HTMLInputElement).blur();
-                                      }
-                                    }}
-                                    placeholder={ex.targetRpe || prevForThisSet?.rpe || 'RPE'}
-                                    aria-label={`Set ${sIdx + 1} RPE`}
-                                    className="w-full min-w-0 h-11 sm:h-auto bg-neutral-900 border border-white/15 focus:border-amber-500/70 rounded-lg px-1.5 sm:pl-8 sm:pr-2 sm:py-1.5 text-base sm:text-xs text-amber-200 font-mono outline-none"
-                                  />
-                                </label>
+                                {/* Conditional RPE (only if sheet/plan includes RPE column) */}
+                                {showRpe && (
+                                  <label className="relative flex items-center min-w-0">
+                                    <span className="hidden sm:block absolute left-2 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">RPE</span>
+                                    <input
+                                      type="text"
+                                      inputMode="decimal"
+                                      value={setRow.rpe || ''}
+                                      onChange={(e) => updateSetField(plan, selectedWeek, ex, sIdx, 'rpe', e.target.value)}
+                                      onBlur={() => saveExerciseSets(plan, selectedWeek, ex)}
+                                      onKeyDown={(e) => {
+                                        if (e.key === 'Enter') {
+                                          e.preventDefault();
+                                          (e.currentTarget as HTMLInputElement).blur();
+                                        }
+                                      }}
+                                      placeholder={ex.targetRpe || prevForThisSet?.rpe || 'RPE'}
+                                      aria-label={`Set ${sIdx + 1} RPE`}
+                                      className="w-full min-w-0 h-11 sm:h-auto bg-neutral-900 border border-white/15 focus:border-amber-500/70 rounded-lg px-1.5 sm:pl-8 sm:pr-2 sm:py-1.5 text-base sm:text-xs text-amber-200 font-mono outline-none"
+                                    />
+                                  </label>
+                                )}
+
+                                {/* Conditional RIR / RIP (only if sheet/plan includes RIR/RIP column) */}
+                                {showRir && (
+                                  <label className="relative flex items-center min-w-0">
+                                    <span className="hidden sm:block absolute left-2 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">RIR</span>
+                                    <input
+                                      type="text"
+                                      inputMode="decimal"
+                                      value={setRow.rir || ''}
+                                      onChange={(e) => updateSetField(plan, selectedWeek, ex, sIdx, 'rir', e.target.value)}
+                                      onBlur={() => saveExerciseSets(plan, selectedWeek, ex)}
+                                      onKeyDown={(e) => {
+                                        if (e.key === 'Enter') {
+                                          e.preventDefault();
+                                          (e.currentTarget as HTMLInputElement).blur();
+                                        }
+                                      }}
+                                      placeholder={ex.targetRir || prevForThisSet?.rir || 'RIR'}
+                                      aria-label={`Set ${sIdx + 1} RIR`}
+                                      className="w-full min-w-0 h-11 sm:h-auto bg-neutral-900 border border-white/15 focus:border-sky-500/70 rounded-lg px-1.5 sm:pl-8 sm:pr-2 sm:py-1.5 text-base sm:text-xs text-sky-200 font-mono outline-none"
+                                    />
+                                  </label>
+                                )}
 
                                 {/* User-Controlled Per-Set Rest Timer */}
                                 <div className="flex items-center gap-1 justify-end shrink-0">
@@ -4259,43 +5035,87 @@ export const GymApp: React.FC<GymAppProps> = ({
                       })()}
 
                       {/* WEEKLY HISTORY */}
-                      {weeklyHistory.length > 0 && (
-                        <div className="-ml-9 sm:ml-0 rounded-xl border border-indigo-500/20 bg-indigo-950/15 p-3 space-y-2">
-                          <div className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-indigo-300">
-                            <History className="w-3.5 h-3.5 text-indigo-400" />
-                            <span>History by Weeks</span>
-                          </div>
-                          <div className="space-y-1.5">
-                            {weeklyHistory.map((rec, rIdx) => (
-                              <div
-                                key={`${rec.weekLabel}-${rIdx}`}
-                                className="flex flex-col gap-1 text-[11px] bg-black/30 border border-white/5 rounded-lg px-2.5 py-1.5"
-                              >
-                                <div className="flex flex-wrap items-center gap-2">
-                                  <span className="font-bold text-indigo-200 min-w-[68px]">{rec.weekLabel}</span>
-                                  <div className="flex flex-wrap gap-1.5 flex-1">
-                                    {rec.setEntries.map((s) => (
-                                      <span
-                                        key={s.setNumber}
-                                        className="font-mono text-[10px] px-2 py-0.5 rounded bg-neutral-900 border border-white/10 text-neutral-200"
-                                      >
-                                        <span className="text-red-300 font-semibold">S{s.setNumber}:</span>{' '}
-                                        {s.weight ? `${s.weight} ${s.unit || planUnit}` : '—'} × {s.reps || '—'}
-                                        {s.rpe ? <span className="text-amber-300"> · RPE {s.rpe}</span> : null}
-                                      </span>
-                                    ))}
-                                  </div>
-                                </div>
-                                {rec.note && (
-                                  <p className="text-[11px] text-neutral-300 pl-[76px] italic">
-                                    Note: {rec.note}
-                                  </p>
-                                )}
+                      {weeklyHistory.length > 0 && (() => {
+                        const hasAnyHistoryRpe = weeklyHistory.some(rec =>
+                          rec.setEntries.some(s => getRpeIntensityMeta(s.rpe) !== null)
+                        );
+                        return (
+                          <div className="-ml-9 sm:ml-0 rounded-xl border border-indigo-500/20 bg-indigo-950/15 p-3 space-y-2">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-indigo-300">
+                                <History className="w-3.5 h-3.5 text-indigo-400" />
+                                <span>History by Weeks</span>
                               </div>
-                            ))}
+                              {hasAnyHistoryRpe && (
+                                <div className="flex flex-wrap items-center gap-2 text-[9px] font-medium text-neutral-400">
+                                  <span className="inline-flex items-center gap-1">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" /> Light (&lt;6.5)
+                                  </span>
+                                  <span className="inline-flex items-center gap-1">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-amber-400" /> Mod (6.5–7.9)
+                                  </span>
+                                  <span className="inline-flex items-center gap-1">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-orange-400" /> Hard (8–8.9)
+                                  </span>
+                                  <span className="inline-flex items-center gap-1">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-red-500" /> Max (9–10)
+                                  </span>
+                                </div>
+                              )}
+                            </div>
+                            <div className="space-y-1.5">
+                              {weeklyHistory.map((rec, rIdx) => (
+                                <div
+                                  key={`${rec.weekLabel}-${rIdx}`}
+                                  className="flex flex-col gap-1 text-[11px] bg-black/30 border border-white/5 rounded-lg px-2.5 py-1.5"
+                                >
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span className="font-bold text-indigo-200 min-w-[68px]">{rec.weekLabel}</span>
+                                    <div className="flex flex-wrap gap-1.5 flex-1">
+                                      {rec.setEntries.map((s) => {
+                                        const rpeMeta = getRpeIntensityMeta(s.rpe);
+                                        return (
+                                          <span
+                                            key={s.setNumber}
+                                            title={rpeMeta ? `RPE ${s.rpe} — ${rpeMeta.level} Intensity` : undefined}
+                                            className={`inline-flex items-center gap-1.5 font-mono text-[10px] px-2 py-0.5 rounded border ${
+                                              rpeMeta
+                                                ? rpeMeta.chipClass
+                                                : 'bg-neutral-900 border-white/10 text-neutral-200'
+                                            }`}
+                                          >
+                                            {rpeMeta && (
+                                              <span
+                                                className={`w-2 h-2 rounded-full shrink-0 ${rpeMeta.dotClass}`}
+                                                aria-hidden="true"
+                                              />
+                                            )}
+                                            <span>
+                                              <span className="text-red-300 font-semibold">S{s.setNumber}:</span>{' '}
+                                              {s.weight ? `${s.weight} ${s.unit || planUnit}` : '—'} × {s.reps || '—'}
+                                              {s.rpe ? (
+                                                <span className={`font-semibold ${rpeMeta ? rpeMeta.textClass : 'text-amber-300'}`}>
+                                                  {' '}· RPE {s.rpe}
+                                                </span>
+                                              ) : null}
+                                              {s.rir ? <span className="text-sky-300"> · RIR {s.rir}</span> : null}
+                                            </span>
+                                          </span>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+                                  {rec.note && (
+                                    <p className="text-[11px] text-neutral-300 pl-[76px] italic">
+                                      Note: {rec.note}
+                                    </p>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
                           </div>
-                        </div>
-                      )}
+                        );
+                      })()}
                       </div>  
                    </div>
 
@@ -4650,38 +5470,77 @@ export const GymApp: React.FC<GymAppProps> = ({
           </div>
         </div>
 
-        {/* Telegram Water Intake Alert Controls */}
-        <div className="pt-2.5 border-t border-white/10 flex flex-wrap items-center justify-between gap-2">
-          <div className="flex flex-wrap items-center gap-2">
+        {/* Telegram Water Intake Alert Controls (Easy minutes including 5m + persistent ON/OFF) */}
+        <div className="pt-3 border-t border-white/10 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+          <div className="flex flex-wrap items-center gap-1.5">
             <button
               type="button"
               onClick={() => saveWaterReminderPrefs(!waterReminderEnabled, waterReminderIntervalMinutes)}
-              className={`h-8 px-2.5 rounded-lg border text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors ${
+              className={`h-8 px-3 rounded-lg border text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer transition-colors ${
                 waterReminderEnabled
-                  ? 'bg-sky-500/20 border-sky-400/50 text-sky-200'
+                  ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-200'
                   : 'bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300'
               }`}
             >
-              <Bell className="w-3.5 h-3.5 text-sky-400" />
-              <span>Bot Water Reminder: {waterReminderEnabled ? 'ON' : 'OFF'}</span>
+              <Bell className={`w-3.5 h-3.5 ${waterReminderEnabled ? 'text-emerald-400' : 'text-sky-400'}`} />
+              <span>Bot Reminder: {waterReminderEnabled ? 'ON' : 'OFF'}</span>
             </button>
 
-            {waterReminderEnabled && (
-              <select
-                value={waterReminderIntervalMinutes}
-                onChange={(e) => saveWaterReminderPrefs(true, Number(e.target.value))}
-                aria-label="Water intake Telegram reminder interval"
-                className="h-8 rounded-lg bg-neutral-950 border border-white/15 px-2 text-xs font-mono text-sky-200 outline-none cursor-pointer"
-              >
-                <option value={30}>Every 30m</option>
-                <option value={45}>Every 45m</option>
-                <option value={60}>Every 60m</option>
-                <option value={90}>Every 90m</option>
-              </select>
-            )}
+            <div className="flex flex-wrap items-center gap-1">
+              {WATER_REMINDER_PRESETS.map((mins) => {
+                const isSelected = waterReminderIntervalMinutes === mins;
+                return (
+                  <button
+                    key={mins}
+                    type="button"
+                    onClick={() => saveWaterReminderPrefs(waterReminderEnabled, mins)}
+                    className={`h-7 px-2 rounded-lg text-[11px] font-mono tabular-nums font-bold border cursor-pointer transition-colors ${
+                      isSelected
+                        ? 'bg-sky-500/25 border-sky-400/60 text-sky-200'
+                        : 'bg-neutral-950 border-white/10 text-neutral-400 hover:text-white'
+                    }`}
+                  >
+                    {mins}m
+                  </button>
+                );
+              })}
+
+              <div className="flex items-center gap-1 ml-1">
+                <input
+                  type="number"
+                  min={1}
+                  max={1440}
+                  value={customWaterIntervalInput}
+                  onChange={(e) => {
+                    const raw = e.target.value;
+                    setCustomWaterIntervalInput(raw);
+                    const n = parseInt(raw, 10);
+                    if (Number.isFinite(n) && n >= 1 && n <= 1440) {
+                      saveWaterReminderPrefs(waterReminderEnabled, n);
+                    }
+                  }}
+                  onBlur={() => {
+                    const n = parseInt(customWaterIntervalInput, 10);
+                    if (!Number.isFinite(n) || n < 1) {
+                      setCustomWaterIntervalInput(String(waterReminderIntervalMinutes));
+                    } else {
+                      saveWaterReminderPrefs(waterReminderEnabled, n);
+                    }
+                  }}
+                  aria-label="Custom water reminder interval in minutes"
+                  className="w-14 h-7 bg-neutral-950 border border-white/15 focus:border-sky-500/70 rounded-lg px-1.5 text-[11px] font-mono tabular-nums text-sky-200 text-center outline-none"
+                />
+                <span className="text-[10px] font-mono text-neutral-500">min</span>
+              </div>
+            </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            {waterReminderEnabled && (
+              <span className="text-[10px] font-mono text-emerald-300/90">
+                Active every {waterReminderIntervalMinutes}m (even when closed)
+              </span>
+            )}
             {waterAlertNotice && (
               <span className={`text-[11px] font-mono ${waterAlertNotice.type === 'success' ? 'text-emerald-300' : 'text-rose-300'}`}>
                 {waterAlertNotice.text}
@@ -4701,14 +5560,294 @@ export const GymApp: React.FC<GymAppProps> = ({
         </div>
       </div>
 
-      {/* ACTIVE WORKOUT DIRECTLY IN DASHBOARD FOR EASY TRAINING */}
+      {/* ACTIVE WORKOUT DIRECTLY IN DASHBOARD FOR EASY TRAINING (MODIFICATIONS HIDDEN — USE MY WORKOUTS TO EDIT) */}
       {myPlans.length === 0 ? (
         <EmptyPlans onUpload={() => setActiveTab('upload')} />
       ) : (
-        renderWorkoutsWorkspace(false)
+        renderWorkoutsWorkspace(false, false)
       )}
     </div>
   );
+
+  const renderBodyWeight = () => {
+    const toDisplayWeight = (w: number, u: WeightUnit): number => {
+      if (u === bodyWeightChartUnit) return Math.round(w * 10) / 10;
+      const converted = u === 'kg' ? w * 2.20462 : w / 2.20462;
+      return Math.round(converted * 10) / 10;
+    };
+
+    const chartData = [...bodyWeightEntries]
+      .sort((a, b) => a.date.localeCompare(b.date))
+      .map((entry) => ({
+        date: entry.date,
+        label: entry.date.slice(5),
+        weight: toDisplayWeight(entry.weight, entry.unit),
+        rawWeight: entry.weight,
+        rawUnit: entry.unit,
+        note: entry.note || '',
+      }));
+
+    const latest = chartData.length > 0 ? chartData[chartData.length - 1] : null;
+    const first = chartData.length > 0 ? chartData[0] : null;
+    const netChange = latest && first ? Math.round((latest.weight - first.weight) * 10) / 10 : null;
+    const minVal = chartData.length > 0 ? Math.min(...chartData.map(d => d.weight)) : null;
+    const maxVal = chartData.length > 0 ? Math.max(...chartData.map(d => d.weight)) : null;
+
+    return (
+      <div className="space-y-5">
+        {/* Hero Header */}
+        <div className="rounded-2xl border border-red-500/20 bg-gradient-to-r from-red-950/40 via-neutral-900 to-neutral-900 p-5 sm:p-6 flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="p-2.5 rounded-xl bg-red-500/15 border border-red-500/30 text-red-400">
+              <Scale className="w-6 h-6" />
+            </div>
+            <div>
+              <h2 className="text-lg sm:text-xl font-black text-white">Body Weight Tracker</h2>
+              <p className="text-xs text-neutral-400 mt-0.5">Log daily scale check-ins and track your long-term weight trend</p>
+            </div>
+          </div>
+
+          <div className="inline-flex items-center rounded-xl bg-neutral-950 border border-white/15 p-1">
+            {(['kg', 'lbs'] as WeightUnit[]).map((u) => (
+              <button
+                key={u}
+                type="button"
+                onClick={() => setBodyWeightChartUnit(u)}
+                className={`px-3 py-1 rounded-lg text-xs font-bold uppercase cursor-pointer ${
+                  bodyWeightChartUnit === u ? 'bg-red-600 text-white shadow' : 'text-neutral-400 hover:text-white'
+                }`}
+              >
+                {u}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* KPI Cards */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <div className="rounded-xl border border-white/10 bg-neutral-900/70 p-3.5">
+            <div className="text-[10px] uppercase tracking-wider text-neutral-400 font-semibold">Latest Weight</div>
+            <div className="text-xl font-black text-white font-mono tabular-nums mt-1">
+              {latest ? `${latest.weight} ${bodyWeightChartUnit}` : '—'}
+            </div>
+          </div>
+          <div className="rounded-xl border border-white/10 bg-neutral-900/70 p-3.5">
+            <div className="text-[10px] uppercase tracking-wider text-neutral-400 font-semibold">Starting</div>
+            <div className="text-xl font-black text-neutral-200 font-mono tabular-nums mt-1">
+              {first ? `${first.weight} ${bodyWeightChartUnit}` : '—'}
+            </div>
+          </div>
+          <div className="rounded-xl border border-white/10 bg-neutral-900/70 p-3.5">
+            <div className="text-[10px] uppercase tracking-wider text-neutral-400 font-semibold">Net Change</div>
+            <div
+              className={`text-xl font-black font-mono tabular-nums mt-1 ${
+                netChange === null
+                  ? 'text-neutral-400'
+                  : netChange > 0
+                  ? 'text-amber-300'
+                  : netChange < 0
+                  ? 'text-emerald-300'
+                  : 'text-white'
+              }`}
+            >
+              {netChange === null ? '—' : `${netChange > 0 ? '+' : ''}${netChange} ${bodyWeightChartUnit}`}
+            </div>
+          </div>
+          <div className="rounded-xl border border-white/10 bg-neutral-900/70 p-3.5">
+            <div className="text-[10px] uppercase tracking-wider text-neutral-400 font-semibold">Range / Logs</div>
+            <div className="text-sm font-bold text-white font-mono tabular-nums mt-1.5">
+              {minVal !== null && maxVal !== null ? `${minVal}–${maxVal} ${bodyWeightChartUnit}` : 'No entries'}
+            </div>
+            <div className="text-[10px] text-neutral-500 mt-0.5">{chartData.length} check-in{chartData.length === 1 ? '' : 's'}</div>
+          </div>
+        </div>
+
+        {/* Daily Input Form */}
+        <form onSubmit={handleSaveBodyWeight} className="rounded-2xl border border-white/10 bg-neutral-900/70 p-4 sm:p-5 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-xs font-bold text-neutral-200 uppercase tracking-wider">Log Daily Weight</h3>
+            {bodyWeightNotice && (
+              <span className="text-xs font-mono text-emerald-300 inline-flex items-center gap-1">
+                <Check className="w-3.5 h-3.5" /> {bodyWeightNotice}
+              </span>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5">
+            <label className="flex flex-col gap-1 sm:col-span-3">
+              <span className="text-[10px] uppercase tracking-wider text-neutral-400 font-semibold">Date</span>
+              <input
+                type="date"
+                value={bodyWeightDateInput}
+                onChange={(e) => setBodyWeightDateInput(e.target.value)}
+                required
+                className="h-10 bg-neutral-950 border border-white/15 focus:border-red-500/60 rounded-xl px-3 text-xs text-white font-mono outline-none"
+              />
+            </label>
+
+            <div className="flex flex-col gap-1 sm:col-span-3">
+              <span className="text-[10px] uppercase tracking-wider text-neutral-400 font-semibold">Weight ({bodyWeightUnitInput})</span>
+              <div className="relative flex items-center">
+                <input
+                  type="number"
+                  step="0.1"
+                  min="1"
+                  max="600"
+                  value={bodyWeightValueInput}
+                  onChange={(e) => setBodyWeightValueInput(e.target.value)}
+                  placeholder="e.g. 78.5"
+                  required
+                  className="w-full h-10 bg-neutral-950 border border-white/15 focus:border-red-500/60 rounded-xl pl-3 pr-14 text-sm text-white font-mono tabular-nums outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => setBodyWeightUnitInput(u => (u === 'kg' ? 'lbs' : 'kg'))}
+                  className="absolute right-1.5 h-7 px-2 rounded-lg bg-white/10 hover:bg-white/20 text-[10px] font-bold uppercase text-neutral-200 cursor-pointer"
+                >
+                  {bodyWeightUnitInput}
+                </button>
+              </div>
+            </div>
+
+            <label className="flex flex-col gap-1 sm:col-span-4">
+              <span className="text-[10px] uppercase tracking-wider text-neutral-400 font-semibold">Note (optional)</span>
+              <input
+                type="text"
+                value={bodyWeightNoteInput}
+                onChange={(e) => setBodyWeightNoteInput(e.target.value)}
+                placeholder="Morning fasted, post-refeed..."
+                className="h-10 bg-neutral-950 border border-white/15 focus:border-red-500/60 rounded-xl px-3 text-xs text-white outline-none"
+              />
+            </label>
+
+            <div className="flex items-end sm:col-span-2">
+              <button
+                type="submit"
+                className="w-full h-10 px-4 rounded-xl bg-gradient-to-r from-red-600 to-red-500 hover:from-red-500 hover:to-red-400 text-white text-xs font-bold inline-flex items-center justify-center gap-1.5 shadow-lg shadow-red-950/40 cursor-pointer"
+              >
+                <Plus className="w-4 h-4" /> Log Weight
+              </button>
+            </div>
+          </div>
+        </form>
+
+        {/* Trend Line Chart */}
+        <div className="rounded-2xl border border-white/10 bg-neutral-900/70 p-4 sm:p-5 space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="text-xs font-bold text-neutral-200 uppercase tracking-wider flex items-center gap-2">
+              <TrendingUp className="w-4 h-4 text-red-500" /> Weight Trend ({bodyWeightChartUnit})
+            </h3>
+            {chartData.length > 0 && (
+              <span className="text-[11px] font-mono text-neutral-400">
+                {chartData[0].date} → {chartData[chartData.length - 1].date}
+              </span>
+            )}
+          </div>
+
+          {chartData.length === 0 ? (
+            <div className="h-56 rounded-xl border border-dashed border-white/10 bg-neutral-950/50 flex flex-col items-center justify-center text-center p-4">
+              <Scale className="w-8 h-8 text-neutral-600 mb-2" />
+              <p className="text-xs font-semibold text-neutral-300">No body weight entries logged yet</p>
+              <p className="text-[11px] text-neutral-500 mt-1">Log your weight above to plot your daily trend chart.</p>
+            </div>
+          ) : (
+            <div className="w-full h-64 sm:h-72">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={chartData} margin={{ top: 10, right: 16, left: -12, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#262626" />
+                  <XAxis
+                    dataKey="label"
+                    stroke="#737373"
+                    tick={{ fill: '#a3a3a3', fontSize: 11 }}
+                  />
+                  <YAxis
+                    stroke="#737373"
+                    domain={['auto', 'auto']}
+                    tick={{ fill: '#a3a3a3', fontSize: 11 }}
+                    tickFormatter={(v) => `${v}`}
+                  />
+                  <Tooltip
+                    contentStyle={{
+                      backgroundColor: '#0a0a0a',
+                      borderColor: 'rgba(255,255,255,0.15)',
+                      borderRadius: '12px',
+                      fontSize: '12px',
+                      color: '#fff',
+                    }}
+                    formatter={(val: unknown) => [`${val} ${bodyWeightChartUnit}`, 'Weight']}
+                    labelFormatter={(_, payload) => payload?.[0]?.payload?.date || ''}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="weight"
+                    stroke="#ef4444"
+                    strokeWidth={2.5}
+                    dot={{ r: 4, fill: '#ef4444', strokeWidth: 2, stroke: '#171717' }}
+                    activeDot={{ r: 6, fill: '#f87171', stroke: '#fff', strokeWidth: 2 }}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </div>
+
+        {/* History List */}
+        {bodyWeightEntries.length > 0 && (
+          <div className="rounded-2xl border border-white/10 bg-neutral-900/70 p-4 sm:p-5 space-y-2.5">
+            <h3 className="text-xs font-bold text-neutral-200 uppercase tracking-wider">Check-in History</h3>
+            <div className="space-y-1.5">
+              {[...bodyWeightEntries]
+                .sort((a, b) => b.date.localeCompare(a.date))
+                .map((entry) => (
+                  <div
+                    key={entry.id}
+                    className="flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-neutral-950/70 px-3.5 py-2.5"
+                  >
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 min-w-0">
+                      <span className="text-xs font-mono text-neutral-400">{entry.date}</span>
+                      <span className="text-sm font-black text-white font-mono tabular-nums">
+                        {entry.weight} {entry.unit}
+                      </span>
+                      {entry.unit !== bodyWeightChartUnit && (
+                        <span className="text-[11px] font-mono text-neutral-500">
+                          ({toDisplayWeight(entry.weight, entry.unit)} {bodyWeightChartUnit})
+                        </span>
+                      )}
+                      {entry.note && <span className="text-xs text-neutral-400 truncate">{entry.note}</span>}
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setBodyWeightDateInput(entry.date);
+                          setBodyWeightValueInput(String(entry.weight));
+                          setBodyWeightUnitInput(entry.unit);
+                          setBodyWeightNoteInput(entry.note || '');
+                        }}
+                        aria-label={`Edit weight entry for ${entry.date}`}
+                        className="p-1.5 text-neutral-400 hover:text-amber-300 rounded-lg hover:bg-white/5 cursor-pointer"
+                        title="Load into form to edit"
+                      >
+                        <Pencil className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteBodyWeight(entry.id)}
+                        aria-label={`Delete weight entry for ${entry.date}`}
+                        className="p-1.5 text-neutral-500 hover:text-red-400 rounded-lg hover:bg-red-500/10 cursor-pointer"
+                        title="Delete entry"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
 
   const renderProgress = () => (
     <div className="space-y-4">
@@ -5251,13 +6390,14 @@ export const GymApp: React.FC<GymAppProps> = ({
         <main className="flex-1 overflow-y-auto overscroll-contain">
           <div className="max-w-5xl mx-auto px-3 sm:px-4 py-4 sm:py-5 pb-[calc(5.5rem+env(safe-area-inset-bottom))] sm:pb-8">
           {activeTab === 'dashboard' && renderDashboard()}
-          {activeTab === 'workouts' && renderWorkoutsWorkspace(true)}
+          {activeTab === 'workouts' && renderWorkoutsWorkspace(true, true)}
+          {activeTab === 'weight' && renderBodyWeight()}
           {activeTab === 'upload' && (
             <div className="space-y-4">
               <div>
                 <h2 className="text-lg font-black text-white">Upload your workout sheet</h2>
                 <p className="text-[13px] text-neutral-400 mt-0.5">
-                  Upload a multi-sheet Excel, CSV, or PDF file. Supports combined &ldquo;Sets × Reps&rdquo; (e.g. 4 × 5–12), Day headers, Supersets, and auto-fetched video URLs.
+                  Upload a multi-sheet Excel, CSV, or PDF file. Supports combined &ldquo;Sets × Reps&rdquo; (e.g. 4 × 5–12), Day headers, Supersets, RPE/RIR columns, and auto-fetched video URLs.
                 </p>
               </div>
               <div className="rounded-2xl border border-white/10 bg-neutral-900/40 p-4">
@@ -5281,7 +6421,7 @@ export const GymApp: React.FC<GymAppProps> = ({
 
       {/* Mobile bottom nav */}
       <nav className="sm:hidden fixed bottom-0 inset-x-0 z-40 bg-black/90 backdrop-blur-xl border-t border-red-500/20 pb-[env(safe-area-inset-bottom)]">
-        <div className="grid grid-cols-5 px-1">
+        <div className="grid grid-cols-6 px-1">
           {GYM_TABS.map((tab) => {
             const active = activeTab === tab.id;
             return (

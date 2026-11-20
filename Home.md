@@ -1047,4 +1047,43 @@ Expanded and fixed the event trigger architecture to ensure 100% of security eve
 - Refactored `renderExportControl` to render its dropdown menu via `createPortal(..., document.body)` with `position: fixed` (`z-[9999]`), viewport-clamped alignment, automatic upward flipping near the viewport bottom, and dynamic scroll/resize repositioning.
 - Isolated `overflow-hidden` inside the Training Dashboard hero card glow wrapper so the Export dropdown never clips or hides underneath adjacent cards.
 
+---
 
+## 34. Body Weight Tab, ExcelJS Center-Aligned Export (No Volume), Conditional RPE & RIR ("RIP"), Dashboard vs. My Workouts Separation, Persistent Water Reminders & Background Rest Timer
+
+### A. Dedicated "Body Weight" Tab with Daily Logger & Recharts Trend Chart (`src/components/gym/GymApp.tsx`, `src/types.ts`)
+- Added `BodyWeightEntry` and `UserAccount.bodyWeightHistory` in `src/types.ts` and persisted entries across `localStorage` (`gymworkout_body_weight_<username>`) and Firestore `userAccounts` via `saveUserAccountDoc`.
+- Added a dedicated **`Body Weight`** navigation tab (`id: 'weight'`, `Scale` icon) in `GYM_TABS` and the 6-column mobile bottom navigation bar (`grid-cols-6`).
+- Implemented daily weight logging (`date`, `weight`, `kg`/`lbs` unit switcher, optional `note`, edit & delete controls), summary KPI cards (Latest Weight, Starting, Net Change, Min/Max Range), unit-normalized trend visualization via Recharts (`ResponsiveContainer`, `LineChart`, `Line`, `XAxis`, `YAxis`, `CartesianGrid`, `Tooltip`), and chronological check-in history.
+
+### B. Dashboard vs. My Workouts Modification Separation & Hydration (`src/components/gym/GymApp.tsx`)
+- Added `allowModify` parameter to `renderWorkoutsWorkspace(showEmptyState, allowModify)` so **Dashboard** (`allowModify = false`) hides all sheet/plan modification controls (`+ Upload`, `Modify Worksheet`, `Delete Plan`, `+ Add Warm-up`, warm-up edit/delete, and per-exercise `Edit`), keeping the Training Dashboard focused on active set logging, timers, notes, exports, and the **Water Intake** tracker, while **My Workouts** (`allowModify = true`) retains full plan and worksheet editing.
+
+### C. Conditional RPE & RIR ("RIP") Columns & Volume Removal Across Exports (`src/lib/sheetParser.ts`, `src/lib/gymService.ts`, `src/components/gym/SheetUploader.tsx`, `src/lib/workoutExcelExport.ts`, `src/lib/workoutPdfExport.ts`, `server/telegramBotEngine.ts`)
+- Separated `TARGET_RPE_HEADER_HINT` and `TARGET_RIR_HEADER_HINT` (`rir|rip|reps in reserve`) in `src/lib/sheetParser.ts`, added `hasRpeColumn` and `hasRirColumn` flags on `WorkoutPlan` / `DetectedSheet`, and added `targetRir` (`WorkoutExercise`) and `rir` (`SetLogEntry`).
+- Added `planHasRpeColumn` and `planHasRirColumn` helpers in `src/lib/gymService.ts` to conditionally display `RPE` and `RIR` inputs, target badges, weekly history badges, SheetUploader columns, and PDF/Excel export columns only when present in the uploaded sheet or explicitly enabled/logged.
+- Migrated `src/lib/workoutExcelExport.ts` to **`exceljs`** (`exportWorkoutPlanToExcel` & `exportWorkoutPlanToExcelBuffer`), removed all Volume columns/totals from both Excel and PDF exports (`src/lib/workoutPdfExport.ts`) and Telegram bot captions (`server/telegramBotEngine.ts`), and applied uniform horizontal & vertical centering (`horizontal: 'center', vertical: 'middle', wrapText: true`) on all cells across the 5 Excel sheets (`Workout Sheet`, `Daily Analytics`, `Set-by-Set Log`, `Warm-up & Hydration`, `Notes & Instructions`).
+
+### D. Easy Custom Water Reminder Intervals & Server-Side Persistent ON/OFF Scheduler (`src/components/gym/GymApp.tsx`, `server.ts`, `server/telegramBotEngine.ts`)
+- Replaced fixed interval options with quick presets (`5m`, `10m`, `15m`, `30m`, `45m`, `60m`, `90m`) and a custom numeric minute input (`1–1440`) that persists the user's last **ON/OFF** toggle state and interval in `localStorage` and Firestore `UserAccount.waterIntake`.
+- Added a 60-second background `runScheduledWaterRemindersPass` loop in `server.ts` (persisting `lastWaterReminderSentAt` in `tmp/telegram_bot_state.json`) that sends scheduled Telegram water reminders to whitelisted members with `waterIntake.reminderEnabled === true` even when the website is closed.
+
+### E. Rest Timer Sound Variety & Background / Closed-Website Notifications (`public/sw.js`, `server.ts`, `src/components/gym/GymApp.tsx`)
+- Added selectable notification sounds (`chime`, `bell`, `beep`, `gong`, `fanfare`, `silent`) with a **Test** preview button and Firestore persistence (`UserAccount.restTimerPrefs`).
+- Switched active Rest Timer countdowns to timestamp-based persistence (`endAtMs` stored in `localStorage`) with `visibilitychange`/`focus` synchronization, Service Worker notification support (`/public/sw.js`), and backend Telegram fallback routes (`POST /api/rest-timer/schedule`, `POST /api/rest-timer/cancel` in `server.ts`) so rest alerts still fire even if the browser tab is closed.
+
+---
+
+## 35. Exercise History RPE Intensity Indicators & Live Water Intake Bot Synchronization
+
+### A. Color-Coded RPE Intensity Indicators in History by Weeks (`src/components/gym/GymApp.tsx`)
+- Added `getRpeIntensityMeta(rpeRaw)` helper mapping numeric or ranged RPE values (`Light` `< 6.5` in emerald, `Moderate` `6.5–7.9` in amber, `High` `8–8.9` in orange, `Max` `9–10` in red).
+- Upgraded **History by Weeks** set chips inside `GymApp.tsx` to render a color-coded intensity dot (`w-2 h-2 rounded-full`), tinted chip border/surface, color-matched RPE value, native hover tooltip (`RPE X — <Level> Intensity`), optional RIR tag, and a compact 4-tier color legend in the History header whenever any historical set includes RPE data.
+
+### B. Live Water Intake Synchronization & Timezone-Aware Bot Alerts (`src/components/gym/GymApp.tsx`, `server/telegramBotEngine.ts`, `server.ts`, `src/types.ts`)
+- **Stale-Closure & State-Updater Fix (`GymApp.tsx`)**: Added synchronized refs (`waterGlassesRef`, `waterReminderEnabledRef`, `waterReminderIntervalRef`, `matchedAccountRef`, `resolvedDisplayNameRef`, `activeTelegramConfigRef`, `memberWhitelistStatusRef`, `resolvedMemberChatIdRef`), updated `waterGlassesRef.current` synchronously before `setWaterGlasses`, moved profile persistence side effects out of React state updaters, and updated `dispatchWaterTelegramAlert` to always read live ref values so scheduled and manual Telegram hydration alerts never stall at `0 / 8`.
+- **Timezone-Safe Daily Intake Evaluation (`src/types.ts`, `server/telegramBotEngine.ts`)**: Added optional `timezoneOffsetMinutes` on `UserAccount.waterIntake` and updated `getUserTodayWaterGlasses()` to compare stored calendar dates against the member's own local timezone (with a safe UTC/14h fallback when omitted) rather than comparing against the host server's timezone.
+- **Real-Time Client/Server Sync & Deduplication (`server.ts`, `server/telegramBotEngine.ts`)**:
+  - Added server water-intake override tracking (`hydrateServerWaterIntakeOverrides`, `upsertServerWaterIntakeOverride`, `exportServerWaterIntakeOverrides`, `resolveEffectiveUserWaterIntake`) persisted inside `tmp/telegram_bot_state.json`, merging Firestore vs. live synced updates by newest `updatedAt`.
+  - Added `POST /api/water-intake/sync` (invoked on initial load, hydration hydration, `+`/`-`/`Reset`, and reminder toggle/interval edits) and `POST /api/water-intake/mark-sent` (called after successful client-side reminder sends to prevent duplicate server reminders in the same interval).
+  - Unified `/water` command replies and scheduled `runScheduledWaterRemindersPass` messages via `formatWaterIntakeTelegramMessageHtml` so bot commands, browser alerts, and closed-tab server reminders share identical progress bar formatting and live counts.

@@ -5,6 +5,7 @@ import {
   WorkoutExercise,
   WorkoutPlan,
 } from '../types';
+import { planHasRirColumn, planHasRpeColumn } from './gymService';
 import { parseSetsCount, splitSetsAndReps } from './sheetParser';
 
 const weekKey = (weekIdx: number) => `w${weekIdx + 1}`;
@@ -33,7 +34,11 @@ function entryHasData(entry?: ExerciseLogEntry): boolean {
   if (
     entry.setEntries &&
     entry.setEntries.some(
-      s => (s.weight || '').trim() !== '' || (s.reps || '').trim() !== '' || (s.rpe || '').trim() !== ''
+      (s) =>
+        (s.weight || '').trim() !== '' ||
+        (s.reps || '').trim() !== '' ||
+        (s.rpe || '').trim() !== '' ||
+        (s.rir || '').trim() !== ''
     )
   ) {
     return true;
@@ -48,7 +53,11 @@ function resolveSetList(
 ): SetLogEntry[] {
   if (entry.setEntries && entry.setEntries.length > 0) {
     const populated = entry.setEntries.filter(
-      s => (s.weight || '').trim() !== '' || (s.reps || '').trim() !== '' || (s.rpe || '').trim() !== ''
+      (s) =>
+        (s.weight || '').trim() !== '' ||
+        (s.reps || '').trim() !== '' ||
+        (s.rpe || '').trim() !== '' ||
+        (s.rir || '').trim() !== ''
     );
     if (populated.length > 0) {
       return populated.map((s) => ({
@@ -74,94 +83,81 @@ function resolveSetList(
     unit: entry.unit || fallbackUnit,
     reps: '',
     rpe: '',
+    rir: '',
   }));
+}
+
+function averageMetric(rawList: string[]): string {
+  const clean = rawList.map((v) => v.trim()).filter(Boolean);
+  if (clean.length === 0) return '';
+  const nums = clean.map((v) => parseFloat(v)).filter((n) => Number.isFinite(n));
+  if (nums.length > 0) {
+    if (nums.length === 1) return String(nums[0]);
+    const avg = nums.reduce((a, b) => a + b, 0) / nums.length;
+    return avg.toFixed(1).replace(/\.0$/, '');
+  }
+  return Array.from(new Set(clean)).join(', ');
 }
 
 function summarizeWeekMetrics(
   ex: WorkoutExercise,
   entry: ExerciseLogEntry | undefined,
-  fallbackUnit: WeightUnit
+  fallbackUnit: WeightUnit,
+  showRpe: boolean,
+  showRir: boolean
 ): {
   weightSummary: string;
   repsSummary: string;
   rpeSummary: string;
+  rirSummary: string;
   setBreakdown: string;
-  weekVolume: number;
 } {
   if (!entry || !entryHasData(entry)) {
-    return { weightSummary: '', repsSummary: '', rpeSummary: '', setBreakdown: '', weekVolume: 0 };
+    return { weightSummary: '', repsSummary: '', rpeSummary: '', rirSummary: '', setBreakdown: '' };
   }
   const list = resolveSetList(ex, entry, fallbackUnit).filter(
-    s => (s.weight || '').trim() !== '' || (s.reps || '').trim() !== '' || (s.rpe || '').trim() !== ''
+    (s) =>
+      (s.weight || '').trim() !== '' ||
+      (s.reps || '').trim() !== '' ||
+      (s.rpe || '').trim() !== '' ||
+      (s.rir || '').trim() !== ''
   );
   if (list.length === 0) {
-    return { weightSummary: '', repsSummary: '', rpeSummary: '', setBreakdown: '', weekVolume: 0 };
+    return { weightSummary: '', repsSummary: '', rpeSummary: '', rirSummary: '', setBreakdown: '' };
   }
 
-  const weights = list.map(s => (s.weight || '').trim()).filter(Boolean);
-  const repsList = list.map(s => (s.reps || '').trim()).filter(Boolean);
-  const rpes = list.map(s => (s.rpe || '').trim()).filter(Boolean);
+  const weights = list.map((s) => (s.weight || '').trim()).filter(Boolean);
+  const repsList = list.map((s) => (s.reps || '').trim()).filter(Boolean);
+  const rpes = list.map((s) => (s.rpe || '').trim()).filter(Boolean);
+  const rirs = list.map((s) => (s.rir || '').trim()).filter(Boolean);
 
   const uniqueWeights = Array.from(new Set(weights));
   const uniqueReps = Array.from(new Set(repsList));
 
-  const numericRpes = rpes.map(r => parseFloat(r)).filter(n => Number.isFinite(n));
-  const rpeSummary =
-    numericRpes.length > 0
-      ? numericRpes.length === 1
-        ? String(numericRpes[0])
-        : numericRpes.reduce((a, b) => a + b, 0) / numericRpes.length > 0
-        ? (numericRpes.reduce((a, b) => a + b, 0) / numericRpes.length).toFixed(1).replace(/\.0$/, '')
-        : rpes.join(', ')
-      : rpes.join(', ');
-
-  let weekVolume = 0;
   const setBreakdown = list
     .map((s) => {
       const wt = (s.weight || '').trim();
       const rp = (s.reps || '').trim();
-      const rpe = (s.rpe || '').trim();
+      const rpe = showRpe ? (s.rpe || '').trim() : '';
+      const rir = showRir ? (s.rir || '').trim() : '';
       const unit = s.unit || entry.unit || fallbackUnit;
-      const wNum = parseFloat(wt);
-      const rNum = parseFloat(rp);
-      if (Number.isFinite(wNum) && Number.isFinite(rNum) && wNum > 0 && rNum > 0) {
-        weekVolume += wNum * rNum;
-      }
       const wtPart = wt ? (wt.toUpperCase() === 'BW' ? 'BW' : `${wt} ${unit}`) : '-';
       const rpPart = rp || '-';
-      const rpePart = rpe ? ` (RPE ${rpe})` : '';
-      return `Set ${s.setNumber}: ${wtPart} x ${rpPart}${rpePart}`;
+      const extraTags: string[] = [];
+      if (rpe) extraTags.push(`RPE ${rpe}`);
+      if (rir) extraTags.push(`RIR ${rir}`);
+      const extraStr = extraTags.length > 0 ? ` (${extraTags.join(' · ')})` : '';
+      return `Set ${s.setNumber}: ${wtPart} x ${rpPart}${extraStr}`;
     })
     .join('\n');
 
   return {
     weightSummary: uniqueWeights.length === 1 ? uniqueWeights[0] : weights.join(' / '),
     repsSummary: uniqueReps.length === 1 ? uniqueReps[0] : repsList.join(' / '),
-    rpeSummary,
+    rpeSummary: showRpe ? averageMetric(rpes) : '',
+    rirSummary: showRir ? averageMetric(rirs) : '',
     setBreakdown,
-    weekVolume: Math.round(weekVolume * 100) / 100,
   };
-}
-
-function calcVolume(weight?: string, reps?: string): string | number {
-  const w = parseFloat((weight || '').trim());
-  const r = parseFloat((reps || '').trim());
-  if (!Number.isFinite(w) || !Number.isFinite(r) || w <= 0 || r <= 0) return '';
-  return Math.round(w * r * 100) / 100;
-}
-
-function computeColWidths(rows: Array<Array<string | number>>, minWidth = 10, maxWidth = 44) {
-  const colCount = rows.reduce((max, r) => Math.max(max, r.length), 0);
-  return Array.from({ length: colCount }, (_, colIdx) => {
-    let widest = minWidth;
-    rows.forEach((r) => {
-      const val = r[colIdx] !== undefined && r[colIdx] !== null ? String(r[colIdx]) : '';
-      val.split('\n').forEach((line) => {
-        if (line.length + 3 > widest) widest = line.length + 3;
-      });
-    });
-    return { wch: Math.min(maxWidth, widest) };
-  });
 }
 
 function formatWarmupSummaryTarget(wu: { minutes?: string; targetSets?: string; target?: string }): string {
@@ -177,20 +173,122 @@ function normalizeDayKey(day?: string): string {
   return d ? d : 'General Workout';
 }
 
+function applySheetColumnWidths(
+  ws: any,
+  rows: Array<Array<string | number>>,
+  minWidth = 11,
+  maxWidth = 42,
+  skipTopRows = 0
+) {
+  const sample = rows.slice(skipTopRows);
+  const colCount = rows.reduce((max, r) => Math.max(max, r.length), 0);
+  for (let c = 1; c <= colCount; c++) {
+    let widest = minWidth;
+    sample.forEach((r) => {
+      const raw = r[c - 1];
+      const str = raw !== undefined && raw !== null ? String(raw) : '';
+      str.split('\n').forEach((line) => {
+        if (line.length + 4 > widest) widest = line.length + 4;
+      });
+    });
+    const col = ws.getColumn(c);
+    col.width = Math.min(maxWidth, widest);
+    col.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+  }
+}
+
+const THIN_BORDER = {
+  top: { style: 'thin', color: { argb: 'FFE2E8F0' } },
+  left: { style: 'thin', color: { argb: 'FFE2E8F0' } },
+  bottom: { style: 'thin', color: { argb: 'FFE2E8F0' } },
+  right: { style: 'thin', color: { argb: 'FFE2E8F0' } },
+};
+
+function styleAllWorksheetCellsCentered(ws: any) {
+  ws.eachRow({ includeEmpty: false }, (row: any) => {
+    row.eachCell({ includeEmpty: true }, (cell: any) => {
+      cell.alignment = {
+        horizontal: 'center',
+        vertical: 'middle',
+        wrapText: true,
+      };
+    });
+  });
+}
+
+function styleBannerRow(row: any, colCount: number, bgArgb = 'FF0F172A', accentFontArgb = 'FFFFFFFF') {
+  row.height = 30;
+  for (let c = 1; c <= colCount; c++) {
+    const cell = row.getCell(c);
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: bgArgb } };
+    cell.font = { name: 'Calibri', size: 13, bold: true, color: { argb: accentFontArgb } };
+    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+  }
+}
+
+function styleMetaRow(row: any, colCount: number) {
+  row.height = 22;
+  for (let c = 1; c <= colCount; c++) {
+    const cell = row.getCell(c);
+    const isLabel = c % 2 === 1;
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: isLabel ? 'FFF1F5F9' : 'FFFFFFFF' } };
+    cell.font = {
+      name: 'Calibri',
+      size: 10,
+      bold: isLabel,
+      color: { argb: isLabel ? 'FF475569' : 'FF0F172A' },
+    };
+    cell.border = THIN_BORDER;
+    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+  }
+}
+
+function styleHeaderRow(row: any, colCount: number, bgArgb = 'FF1E293B') {
+  row.height = 25;
+  for (let c = 1; c <= colCount; c++) {
+    const cell = row.getCell(c);
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: bgArgb } };
+    cell.font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FFFFFFFF' } };
+    cell.border = {
+      top: { style: 'thin', color: { argb: 'FF334155' } },
+      left: { style: 'thin', color: { argb: 'FF334155' } },
+      bottom: { style: 'medium', color: { argb: 'FFDC2626' } },
+      right: { style: 'thin', color: { argb: 'FF334155' } },
+    };
+    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+  }
+}
+
+function styleDataRow(row: any, colCount: number, stripe: boolean, bgOverride?: string) {
+  const fillArgb = bgOverride || (stripe ? 'FFF8FAFC' : 'FFFFFFFF');
+  for (let c = 1; c <= colCount; c++) {
+    const cell = row.getCell(c);
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: fillArgb } };
+    cell.font = { name: 'Calibri', size: 10, color: { argb: 'FF0F172A' } };
+    cell.border = THIN_BORDER;
+    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+  }
+}
+
 /**
- * Recreated 5-sheet .xlsx workbook designed for clarity, day-grouped coaching readability,
- * analytics, and seamless re-import compatibility with sheetParser.ts:
- *  1. Workout Sheet       (Banner + KPIs + 2-row Week Super-Headers + Day-grouped rows + Target RPE + Set Details)
- *  2. Daily Analytics     (Day x Week completion, sets logged, avg RPE, volume & session notes)
- *  3. Set-by-Set Log      (Flat filterable ledger across Warm-up & Main Workout + RPE + Volume)
+ * Builds a styled ExcelJS workbook with ALL cells centered horizontally & vertically,
+ * NO volume columns/totals, and conditional RPE / RIR columns matching the workout sheet.
+ *  1. Workout Sheet       (Banner + KPIs + Super-Headers + Day-grouped rows + Re-import compatible)
+ *  2. Daily Analytics     (Day x Week completion, sets logged, conditional Avg RPE/RIR & feedback)
+ *  3. Set-by-Set Log      (Flat filterable ledger across Warm-up & Main Workout)
  *  4. Warm-up & Hydration (Dedicated warm-up duration/sets/logs + daily water intake summary)
  *  5. Notes & Instructions(Instructions, Description, Exercise Week Notes & Session Feedback)
  */
 export async function buildWorkoutPlanExcelWorkbook(
   plan: WorkoutPlan,
   options: ExportWorkoutExcelOptions = {}
-): Promise<{ wb: any; filename: string; XLSX: any }> {
-  const XLSX: any = await import('xlsx');
+): Promise<{ wb: any; filename: string }> {
+  const ExcelJSMod: any = await import('exceljs');
+  const ExcelJS = ExcelJSMod.default || ExcelJSMod;
+
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Gym Workout Tracker';
+  wb.created = new Date();
 
   const planUnit: WeightUnit = plan.defaultWeightUnit || 'kg';
   const weeks = Math.max(1, Number(plan.weeks) || 1);
@@ -198,7 +296,9 @@ export async function buildWorkoutPlanExcelWorkbook(
   const warmupExercises = plan.warmupExercises || [];
   const loggedWeeks = plan.exerciseLogs || {};
 
-  // Discover max week index present across plan & logs
+  const showRpe = planHasRpeColumn(plan);
+  const showRir = planHasRirColumn(plan);
+
   let totalWeekColumns = weeks;
   Object.keys(loggedWeeks).forEach((k) => {
     const m = k.match(/^w(\d+)$/i);
@@ -228,39 +328,41 @@ export async function buildWorkoutPlanExcelWorkbook(
   }
   const overallPct = totalPossible > 0 ? Math.round((totalDone / totalPossible) * 100) : 0;
 
-  let grandTotalVolume = 0;
-  const weeklyVolumeTotals: Record<number, number> = {};
-
-  for (let w = 1; w <= totalWeekColumns; w++) {
-    const wk = weekKey(w - 1);
-    exercises.forEach((ex) => {
-      const metrics = summarizeWeekMetrics(ex, loggedWeeks[wk]?.[ex.id], planUnit);
-      if (metrics.weekVolume > 0) {
-        weeklyVolumeTotals[w] = (weeklyVolumeTotals[w] || 0) + metrics.weekVolume;
-        grandTotalVolume += metrics.weekVolume;
-      }
-    });
-  }
-
   // =========================================================================
-  // SHEET 1: WORKOUT SHEET (BY DAY — Banner + Week Super-Headers + Clean Columns)
-  // Row indices: 0 = Banner, 1 = Meta Strip, 2 = Spacer, 3 = Super-Header, 4 = Header (scan-friendly <= row 15)
+  // SHEET 1: WORKOUT SHEET (Row 5 = Main Headers <= Row 15 for sheetParser)
   // =========================================================================
-  const fixedColCount = 9; // #, Day, Type, Exercise, Sets, Reps, Target RPE, Coach Notes, Video
-  const weekGroupCols = 6; // Done, Weight, Reps, RPE, Set Breakdown, Notes
+  const ws1 = wb.addWorksheet('Workout Sheet', {
+    views: [{ state: 'frozen', ySplit: 5 }],
+  });
+
+  const fixedHeaders: string[] = ['#', 'Day', 'Type', 'Exercise', 'Sets', 'Reps'];
+  if (showRpe) fixedHeaders.push('Target RPE');
+  if (showRir) fixedHeaders.push('Target RIR');
+  fixedHeaders.push('Coach Notes', 'Video');
+  const fixedColCount = fixedHeaders.length;
+
+  const weekGroupHeaders = (w: number): string[] => {
+    const h = [`Week ${w} Done`, `Week ${w} Weight (${planUnit})`, `Week ${w} Reps`];
+    if (showRpe) h.push(`Week ${w} RPE`);
+    if (showRir) h.push(`Week ${w} RIR`);
+    h.push(`Week ${w} Set Breakdown`, `Week ${w} Notes`);
+    return h;
+  };
+  const weekGroupCols = weekGroupHeaders(1).length;
   const totalSheet1Cols = fixedColCount + totalWeekColumns * weekGroupCols;
 
-  const sheet1Merges: Array<{ s: { r: number; c: number }; e: { r: number; c: number } }> = [];
-  const sheet1RowHeights: Array<{ hpt?: number } | undefined> = [];
+  const sheet1AllRows: Array<Array<string | number>> = [];
 
-  // Row 0: Banner
-  const titleRow: Array<string | number> = [`GYM WORKOUT  —  ${plan.title || 'Training Plan'}`];
-  while (titleRow.length < totalSheet1Cols) titleRow.push('');
-  sheet1Merges.push({ s: { r: 0, c: 0 }, e: { r: 0, c: Math.max(8, fixedColCount - 1) } });
-  sheet1RowHeights[0] = { hpt: 28 };
+  // Row 1: Title Banner
+  const titleRowData: Array<string | number> = [`GYM WORKOUT  —  ${plan.title || 'Training Plan'}`];
+  while (titleRowData.length < totalSheet1Cols) titleRowData.push('');
+  const rTitle1 = ws1.addRow(titleRowData);
+  ws1.mergeCells(1, 1, 1, totalSheet1Cols);
+  styleBannerRow(rTitle1, totalSheet1Cols, 'FF111827', 'FFFFFFFF');
+  sheet1AllRows.push(titleRowData);
 
-  // Row 1: Meta strip
-  const metaRow: Array<string | number> = [
+  // Row 2: Meta Strip (No Volume!)
+  const metaRowData: Array<string | number> = [
     'Athlete',
     options.ownerName || plan.ownerUsername || 'Athlete',
     'Unit',
@@ -269,69 +371,84 @@ export async function buildWorkoutPlanExcelWorkbook(
     `${dayOrder.length} Days / ${weeks} Weeks`,
     'Completion',
     `${overallPct}% (${totalDone}/${totalPossible})`,
-    grandTotalVolume > 0
-      ? `Total Volume: ${Math.round(grandTotalVolume)} ${planUnit}`
-      : `Water Today: ${typeof options.waterGlasses === 'number' ? `${options.waterGlasses}/8` : '—'}`,
+    'Water Today',
+    typeof options.waterGlasses === 'number' ? `${options.waterGlasses} / 8 glasses` : '—',
   ];
-  while (metaRow.length < totalSheet1Cols) metaRow.push('');
-  sheet1RowHeights[1] = { hpt: 20 };
+  while (metaRowData.length < totalSheet1Cols) metaRowData.push('');
+  const rMeta1 = ws1.addRow(metaRowData);
+  styleMetaRow(rMeta1, totalSheet1Cols);
+  sheet1AllRows.push(metaRowData);
 
-  // Row 2: Spacer
-  const spacerRow: Array<string | number> = [''];
-  sheet1RowHeights[2] = { hpt: 8 };
+  // Row 3: Spacer
+  const spacerData: Array<string | number> = [''];
+  const rSpacer1 = ws1.addRow(spacerData);
+  rSpacer1.height = 8;
+  sheet1AllRows.push(spacerData);
 
-  // Row 3: Super-Header (Program Specification | Week 1 | Week 2 | ...)
-  const superHeaderRow: Array<string | number> = ['Program Specification'];
-  for (let c = 1; c < fixedColCount; c++) superHeaderRow.push('');
-  sheet1Merges.push({ s: { r: 3, c: 0 }, e: { r: 3, c: fixedColCount - 1 } });
-
+  // Row 4: Super-Header (Program Specification | Week 1 Performance | ...)
+  const superHeaderData: Array<string | number> = ['Program Specification'];
+  for (let c = 1; c < fixedColCount; c++) superHeaderData.push('');
   for (let w = 1; w <= totalWeekColumns; w++) {
-    const startCol = fixedColCount + (w - 1) * weekGroupCols;
-    superHeaderRow.push(`Week ${w} Performance`);
-    for (let k = 1; k < weekGroupCols; k++) superHeaderRow.push('');
-    sheet1Merges.push({ s: { r: 3, c: startCol }, e: { r: 3, c: startCol + weekGroupCols - 1 } });
+    superHeaderData.push(`Week ${w} Performance`);
+    for (let k = 1; k < weekGroupCols; k++) superHeaderData.push('');
   }
-  sheet1RowHeights[3] = { hpt: 22 };
-
-  // Row 4: Main Table Header (Explicit re-import compatible headers!)
-  const planHeaders: string[] = [
-    '#',
-    'Day',
-    'Type',
-    'Exercise',
-    'Sets',
-    'Reps',
-    'Target RPE',
-    'Coach Notes',
-    'Video',
-  ];
+  const rSuper1 = ws1.addRow(superHeaderData);
+  rSuper1.height = 22;
+  ws1.mergeCells(4, 1, 4, fixedColCount);
+  for (let c = 1; c <= fixedColCount; c++) {
+    const cell = rSuper1.getCell(c);
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0F172A' } };
+    cell.font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FFFCA5A5' } };
+    cell.border = THIN_BORDER;
+    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+  }
   for (let w = 1; w <= totalWeekColumns; w++) {
-    planHeaders.push(
-      `Week ${w} Done`,
-      `Week ${w} Weight (${planUnit})`,
-      `Week ${w} Reps`,
-      `Week ${w} RPE`,
-      `Week ${w} Set Breakdown`,
-      `Week ${w} Notes`
-    );
+    const startCol = fixedColCount + (w - 1) * weekGroupCols + 1;
+    const endCol = startCol + weekGroupCols - 1;
+    ws1.mergeCells(4, startCol, 4, endCol);
+    const wkBg = w % 2 === 1 ? 'FF1E293B' : 'FF334155';
+    for (let c = startCol; c <= endCol; c++) {
+      const cell = rSuper1.getCell(c);
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: wkBg } };
+      cell.font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FFFFFFFF' } };
+      cell.border = THIN_BORDER;
+      cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+    }
   }
-  sheet1RowHeights[4] = { hpt: 22 };
+  sheet1AllRows.push(superHeaderData);
 
-  const planRows: Array<Array<string | number>> = [
-    titleRow,
-    metaRow,
-    spacerRow,
-    superHeaderRow,
-    planHeaders,
-  ];
+  // Row 5: Main Column Headers
+  const planHeaders: string[] = [...fixedHeaders];
+  for (let w = 1; w <= totalWeekColumns; w++) {
+    planHeaders.push(...weekGroupHeaders(w));
+  }
+  const rHead1 = ws1.addRow(planHeaders);
+  styleHeaderRow(rHead1, totalSheet1Cols, 'FF1E293B');
+  sheet1AllRows.push(planHeaders);
 
+  // Day-Grouped Rows
+  let dataRowCounter = 0;
   dayOrder.forEach((dayName) => {
     const dayItems = dayExercisesMap.get(dayName) || [];
-    // Single-cell Day Banner Row (visually clear + recognized cleanly as Day Header by sheetParser!)
-    const dayBannerIdx = planRows.length;
-    planRows.push([dayName]);
-    sheet1Merges.push({ s: { r: dayBannerIdx, c: 0 }, e: { r: dayBannerIdx, c: fixedColCount - 1 } });
-    sheet1RowHeights[dayBannerIdx] = { hpt: 22 };
+    // Single-cell Day Banner row (recognized cleanly by sheetParser.ts)
+    const bannerRowData: Array<string | number> = [dayName];
+    const rDayBanner = ws1.addRow(bannerRowData);
+    rDayBanner.height = 24;
+    const bannerRowNum = rDayBanner.number;
+    ws1.mergeCells(bannerRowNum, 1, bannerRowNum, totalSheet1Cols);
+    for (let c = 1; c <= totalSheet1Cols; c++) {
+      const cell = rDayBanner.getCell(c);
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEF2F2' } };
+      cell.font = { name: 'Calibri', size: 11, bold: true, color: { argb: 'FF991B1B' } };
+      cell.border = {
+        top: { style: 'medium', color: { argb: 'FFEF4444' } },
+        bottom: { style: 'thin', color: { argb: 'FFFCA5A5' } },
+        left: THIN_BORDER.left,
+        right: THIN_BORDER.right,
+      };
+      cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+    }
+    sheet1AllRows.push(bannerRowData);
 
     dayItems.forEach(({ ex, globalIdx }) => {
       const { setsDisplay, repsDisplay } = getTargetText(ex);
@@ -341,77 +458,120 @@ export async function buildWorkoutPlanExcelWorkbook(
           : 'Superset'
         : 'Standard';
 
-      const row: Array<string | number> = [
+      const rowData: Array<string | number> = [
         globalIdx + 1,
         ex.day || dayName,
         typeCell,
         ex.name || '',
         setsDisplay || '',
         repsDisplay || '',
-        ex.targetRpe || '',
-        ex.notes || '',
-        ex.videoUrl || '',
       ];
+      if (showRpe) rowData.push(ex.targetRpe || '');
+      if (showRir) rowData.push(ex.targetRir || '');
+      rowData.push(ex.notes || '', ex.videoUrl || '');
 
       let maxLinesInRow = 1;
       for (let w = 1; w <= totalWeekColumns; w++) {
         const wKey = weekKey(w - 1);
         const entry = loggedWeeks[wKey]?.[ex.id];
-        const metrics = summarizeWeekMetrics(ex, entry, planUnit);
+        const metrics = summarizeWeekMetrics(ex, entry, planUnit, showRpe, showRir);
         const isDone = (plan.progress?.[wKey] || []).includes(ex.id) ? 'Yes' : 'No';
         const exWeekNote = entry?.notes?.trim() || '';
         const lineCount = metrics.setBreakdown ? metrics.setBreakdown.split('\n').length : 1;
         if (lineCount > maxLinesInRow) maxLinesInRow = lineCount;
 
-        row.push(
-          isDone,
-          metrics.weightSummary,
-          metrics.repsSummary,
-          metrics.rpeSummary,
-          metrics.setBreakdown,
-          exWeekNote
-        );
+        rowData.push(isDone, metrics.weightSummary, metrics.repsSummary);
+        if (showRpe) rowData.push(metrics.rpeSummary);
+        if (showRir) rowData.push(metrics.rirSummary);
+        rowData.push(metrics.setBreakdown, exWeekNote);
       }
 
-      const rIdx = planRows.length;
-      planRows.push(row);
-      sheet1RowHeights[rIdx] = { hpt: Math.max(20, maxLinesInRow * 14 + 4) };
+      const addedRow = ws1.addRow(rowData);
+      const isStripe = dataRowCounter % 2 === 1;
+      dataRowCounter++;
+      styleDataRow(addedRow, totalSheet1Cols, isStripe, ex.isSuperset ? 'FFFDF4FF' : undefined);
+      addedRow.height = Math.max(22, maxLinesInRow * 15 + 6);
+      addedRow.getCell(4).font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FF0F172A' } };
+
+      // Color-code Done status per week
+      for (let w = 1; w <= totalWeekColumns; w++) {
+        const doneColIdx = fixedColCount + (w - 1) * weekGroupCols + 1;
+        const doneCell = addedRow.getCell(doneColIdx);
+        const isYes = doneCell.value === 'Yes';
+        doneCell.font = {
+          name: 'Calibri',
+          size: 10,
+          bold: true,
+          color: { argb: isYes ? 'FF15803D' : 'FF94A3B8' },
+        };
+      }
+
+      sheet1AllRows.push(rowData);
     });
   });
 
-  const planSheet = XLSX.utils.aoa_to_sheet(planRows);
-  planSheet['!merges'] = sheet1Merges;
-  planSheet['!rows'] = sheet1RowHeights;
-  planSheet['!cols'] = computeColWidths(planRows.slice(3), 10, 40);
-  if (planHeaders.length > 0 && planRows.length > 5) {
-    planSheet['!autofilter'] = {
-      ref: XLSX.utils.encode_range({
-        s: { r: 4, c: 0 },
-        e: { r: planRows.length - 1, c: planHeaders.length - 1 },
-      }),
+  if (ws1.rowCount >= 5) {
+    ws1.autoFilter = {
+      from: { row: 5, column: 1 },
+      to: { row: ws1.rowCount, column: totalSheet1Cols },
     };
   }
+  applySheetColumnWidths(ws1, sheet1AllRows, 11, 40, 3);
+  ws1.getColumn(1).width = 7;
+  ws1.getColumn(4).width = 28;
+  styleAllWorksheetCellsCentered(ws1);
 
   // =========================================================================
-  // SHEET 2: DAILY ANALYTICS (Day x Week Breakdown + Completion + Volume + RPE)
+  // SHEET 2: DAILY ANALYTICS (No Volume! Conditional Avg RPE & Avg RIR)
   // =========================================================================
-  const analyticsRows: Array<Array<string | number>> = [
-    [`Daily & Weekly Training Analytics  —  ${plan.title || 'Workout Plan'}`, '', '', '', '', '', '', '', ''],
-    ['Member', options.ownerName || plan.ownerUsername || 'Athlete', 'Overall Progress', `${overallPct}% (${totalDone}/${totalPossible})`, 'Total Volume', grandTotalVolume > 0 ? `${Math.round(grandTotalVolume)} ${planUnit}` : `0 ${planUnit}`, 'Water Intake Today', typeof options.waterGlasses === 'number' ? `${options.waterGlasses} glasses` : '—', ''],
-    ['', '', '', '', '', '', '', '', ''],
-    [
-      'Training Day',
-      'Week',
-      'Exercises Done',
-      'Day Exercises',
-      'Completion %',
-      'Sets Logged',
-      'Avg RPE',
-      `Day Volume (${planUnit})`,
-      'Day Session Feedback',
-    ],
+  const ws2 = wb.addWorksheet('Daily Analytics', {
+    views: [{ state: 'frozen', ySplit: 4 }],
+  });
+
+  const analyticsHeaders: string[] = [
+    'Training Day',
+    'Week',
+    'Exercises Done',
+    'Day Exercises',
+    'Completion %',
+    'Sets Logged',
   ];
+  if (showRpe) analyticsHeaders.push('Avg RPE');
+  if (showRir) analyticsHeaders.push('Avg RIR');
+  analyticsHeaders.push('Day Session Feedback');
 
+  const ws2Cols = analyticsHeaders.length;
+  const analyticsAllRows: Array<Array<string | number>> = [];
+
+  const aBannerData: Array<string | number> = [`Daily & Weekly Training Analytics  —  ${plan.title || 'Workout Plan'}`];
+  while (aBannerData.length < ws2Cols) aBannerData.push('');
+  const rABanner = ws2.addRow(aBannerData);
+  ws2.mergeCells(1, 1, 1, ws2Cols);
+  styleBannerRow(rABanner, ws2Cols);
+  analyticsAllRows.push(aBannerData);
+
+  const aMetaData: Array<string | number> = [
+    'Member',
+    options.ownerName || plan.ownerUsername || 'Athlete',
+    'Overall Progress',
+    `${overallPct}% (${totalDone}/${totalPossible})`,
+    'Water Today',
+    typeof options.waterGlasses === 'number' ? `${options.waterGlasses} glasses` : '—',
+  ];
+  while (aMetaData.length < ws2Cols) aMetaData.push('');
+  const rAMeta = ws2.addRow(aMetaData);
+  styleMetaRow(rAMeta, ws2Cols);
+  analyticsAllRows.push(aMetaData);
+
+  const aSpacer = ws2.addRow(['']);
+  aSpacer.height = 8;
+  analyticsAllRows.push(['']);
+
+  const rAHead = ws2.addRow(analyticsHeaders);
+  styleHeaderRow(rAHead, ws2Cols);
+  analyticsAllRows.push(analyticsHeaders);
+
+  let aRowIdx = 0;
   dayOrder.forEach((dayName) => {
     const dayItems = dayExercisesMap.get(dayName) || [];
     for (let w = 1; w <= totalWeekColumns; w++) {
@@ -419,27 +579,30 @@ export async function buildWorkoutPlanExcelWorkbook(
       const doneSet = new Set(plan.progress?.[wKey] || []);
       let doneInDay = 0;
       let setsLogged = 0;
-      let dayVol = 0;
       const rpeNums: number[] = [];
+      const rirNums: number[] = [];
 
       dayItems.forEach(({ ex }) => {
         if (doneSet.has(ex.id)) doneInDay++;
         const entry = loggedWeeks[wKey]?.[ex.id];
         if (entryHasData(entry)) {
           const list = resolveSetList(ex, entry!, planUnit).filter(
-            s => (s.weight || '').trim() !== '' || (s.reps || '').trim() !== '' || (s.rpe || '').trim() !== ''
+            (s) =>
+              (s.weight || '').trim() !== '' ||
+              (s.reps || '').trim() !== '' ||
+              (s.rpe || '').trim() !== '' ||
+              (s.rir || '').trim() !== ''
           );
           setsLogged += list.length;
           list.forEach((s) => {
             const rVal = parseFloat((s.rpe || '').trim());
             if (Number.isFinite(rVal)) rpeNums.push(rVal);
-            const v = calcVolume(s.weight, s.reps);
-            if (typeof v === 'number') dayVol += v;
+            const rirVal = parseFloat((s.rir || '').trim());
+            if (Number.isFinite(rirVal)) rirNums.push(rirVal);
           });
         }
       });
 
-      // Find day-specific session note for this week
       let sessionFeedback = '';
       Object.entries(loggedWeeks[wKey] || {}).forEach(([k, val]) => {
         if (!k.startsWith('__session_note__') || !val?.notes?.trim()) return;
@@ -456,56 +619,69 @@ export async function buildWorkoutPlanExcelWorkbook(
         rpeNums.length > 0
           ? (rpeNums.reduce((a, b) => a + b, 0) / rpeNums.length).toFixed(1).replace(/\.0$/, '')
           : '—';
+      const avgRirStr =
+        rirNums.length > 0
+          ? (rirNums.reduce((a, b) => a + b, 0) / rirNums.length).toFixed(1).replace(/\.0$/, '')
+          : '—';
 
-      analyticsRows.push([
+      const rowData: Array<string | number> = [
         dayName,
         `Week ${w}`,
         doneInDay,
         dayItems.length,
         `${pct}%`,
         setsLogged,
-        avgRpeStr,
-        Math.round(dayVol),
-        sessionFeedback,
-      ]);
+      ];
+      if (showRpe) rowData.push(avgRpeStr);
+      if (showRir) rowData.push(avgRirStr);
+      rowData.push(sessionFeedback);
+
+      const added = ws2.addRow(rowData);
+      styleDataRow(added, ws2Cols, aRowIdx % 2 === 1);
+      added.height = 22;
+      aRowIdx++;
+      analyticsAllRows.push(rowData);
     }
   });
 
-  const analyticsSheet = XLSX.utils.aoa_to_sheet(analyticsRows);
-  analyticsSheet['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 8 } }];
-  analyticsSheet['!rows'] = [{ hpt: 26 }, { hpt: 20 }, { hpt: 8 }, { hpt: 22 }];
-  analyticsSheet['!cols'] = computeColWidths(analyticsRows.slice(3), 12, 48);
-  analyticsSheet['!autofilter'] = {
-    ref: XLSX.utils.encode_range({
-      s: { r: 3, c: 0 },
-      e: { r: analyticsRows.length - 1, c: 8 },
-    }),
-  };
+  if (ws2.rowCount >= 4) {
+    ws2.autoFilter = {
+      from: { row: 4, column: 1 },
+      to: { row: ws2.rowCount, column: ws2Cols },
+    };
+  }
+  applySheetColumnWidths(ws2, analyticsAllRows, 13, 46, 3);
+  styleAllWorksheetCellsCentered(ws2);
 
   // =========================================================================
-  // SHEET 3: SET-BY-SET LOG (Granular Ledger + RPE + Volume)
+  // SHEET 3: SET-BY-SET LOG (No Volume! Conditional Target/Actual RPE & RIR)
   // =========================================================================
-  const setHistoryRows: Array<Array<string | number>> = [
-    [
-      'Week',
-      'Category',
-      'Day',
-      'Exercise',
-      'Superset',
-      'Set #',
-      'Target',
-      'Target RPE',
-      'Weight',
-      'Unit',
-      'Reps',
-      'Actual RPE',
-      'Volume (Wt x Reps)',
-      'Done',
-      'Exercise Note',
-      'Updated At',
-    ],
+  const ws3 = wb.addWorksheet('Set-by-Set Log', {
+    views: [{ state: 'frozen', ySplit: 1 }],
+  });
+
+  const setHeaders: string[] = [
+    'Week',
+    'Category',
+    'Day',
+    'Exercise',
+    'Superset',
+    'Set #',
+    'Target',
   ];
+  if (showRpe) setHeaders.push('Target RPE');
+  if (showRir) setHeaders.push('Target RIR');
+  setHeaders.push('Weight', 'Unit', 'Reps');
+  if (showRpe) setHeaders.push('Actual RPE');
+  if (showRir) setHeaders.push('Actual RIR');
+  setHeaders.push('Done', 'Exercise Note', 'Updated At');
 
+  const ws3Cols = setHeaders.length;
+  const setHistoryAllRows: Array<Array<string | number>> = [setHeaders];
+  const rSHead = ws3.addRow(setHeaders);
+  styleHeaderRow(rSHead, ws3Cols);
+
+  let sRowIdx = 0;
   for (let w = 1; w <= totalWeekColumns; w++) {
     const wKey = weekKey(w - 1);
     const doneSet = new Set(plan.progress?.[wKey] || []);
@@ -514,11 +690,14 @@ export async function buildWorkoutPlanExcelWorkbook(
       const wLog = plan.warmupLogs?.[wKey]?.[wu.id];
       if (!wLog) return;
       const validSets = (wLog.setEntries || []).filter(
-        s => (s.weight || '').trim() !== '' || (s.reps || '').trim() !== '' || (s.rpe || '').trim() !== ''
+        (s) =>
+          (s.weight || '').trim() !== '' ||
+          (s.reps || '').trim() !== '' ||
+          (s.rpe || '').trim() !== '' ||
+          (s.rir || '').trim() !== ''
       );
       validSets.forEach((s) => {
-        const vol = calcVolume(s.weight, s.reps);
-        setHistoryRows.push([
+        const rowData: Array<string | number> = [
           `Week ${w}`,
           'Warm-up',
           'Warm-up',
@@ -526,16 +705,22 @@ export async function buildWorkoutPlanExcelWorkbook(
           'No',
           s.setNumber,
           formatWarmupSummaryTarget(wu),
-          '',
-          s.weight || '',
-          s.unit || planUnit,
-          s.reps || '',
-          s.rpe || '',
-          vol,
+        ];
+        if (showRpe) rowData.push('');
+        if (showRir) rowData.push('');
+        rowData.push(s.weight || '', s.unit || planUnit, s.reps || '');
+        if (showRpe) rowData.push(s.rpe || '');
+        if (showRir) rowData.push(s.rir || '');
+        rowData.push(
           wLog.completed ? 'Yes' : 'No',
           wLog.notes || '',
-          wLog.updatedAt ? new Date(wLog.updatedAt).toLocaleString() : '',
-        ]);
+          wLog.updatedAt ? new Date(wLog.updatedAt).toLocaleString() : ''
+        );
+        const added = ws3.addRow(rowData);
+        styleDataRow(added, ws3Cols, sRowIdx % 2 === 1, 'FFFFFBEB');
+        added.height = 20;
+        sRowIdx++;
+        setHistoryAllRows.push(rowData);
       });
     });
 
@@ -547,11 +732,14 @@ export async function buildWorkoutPlanExcelWorkbook(
         .filter(Boolean)
         .join(' x ');
       const setsList = resolveSetList(ex, entry!, planUnit).filter(
-        s => (s.weight || '').trim() !== '' || (s.reps || '').trim() !== '' || (s.rpe || '').trim() !== ''
+        (s) =>
+          (s.weight || '').trim() !== '' ||
+          (s.reps || '').trim() !== '' ||
+          (s.rpe || '').trim() !== '' ||
+          (s.rir || '').trim() !== ''
       );
       setsList.forEach((s) => {
-        const vol = calcVolume(s.weight, s.reps);
-        setHistoryRows.push([
+        const rowData: Array<string | number> = [
           `Week ${w}`,
           'Main Workout',
           ex.day || 'General Workout',
@@ -559,63 +747,92 @@ export async function buildWorkoutPlanExcelWorkbook(
           ex.isSuperset ? (ex.supersetGroup || 'Yes') : 'No',
           s.setNumber,
           targetStr,
-          ex.targetRpe || '',
-          s.weight || '',
-          s.unit || entry?.unit || planUnit,
-          s.reps || '',
-          s.rpe || '',
-          vol,
+        ];
+        if (showRpe) rowData.push(ex.targetRpe || '');
+        if (showRir) rowData.push(ex.targetRir || '');
+        rowData.push(s.weight || '', s.unit || entry?.unit || planUnit, s.reps || '');
+        if (showRpe) rowData.push(s.rpe || '');
+        if (showRir) rowData.push(s.rir || '');
+        rowData.push(
           doneSet.has(ex.id) ? 'Yes' : 'No',
           entry?.notes?.trim() || '',
-          entry?.updatedAt ? new Date(entry.updatedAt).toLocaleString() : '',
-        ]);
+          entry?.updatedAt ? new Date(entry.updatedAt).toLocaleString() : ''
+        );
+        const added = ws3.addRow(rowData);
+        styleDataRow(added, ws3Cols, sRowIdx % 2 === 1);
+        added.height = 20;
+        sRowIdx++;
+        setHistoryAllRows.push(rowData);
       });
     });
   }
 
-  if (setHistoryRows.length === 1) {
-    setHistoryRows.push(['—', '—', '—', 'No logged sets recorded yet.', '', '', '', '', '', '', '', '', '', '', '', '']);
+  if (setHistoryAllRows.length === 1) {
+    const emptyRowData: Array<string | number> = ['—', '—', '—', 'No logged sets recorded yet.'];
+    while (emptyRowData.length < ws3Cols) emptyRowData.push('');
+    const added = ws3.addRow(emptyRowData);
+    styleDataRow(added, ws3Cols, false);
+    added.height = 22;
+    setHistoryAllRows.push(emptyRowData);
   }
-  const setHistorySheet = XLSX.utils.aoa_to_sheet(setHistoryRows);
-  setHistorySheet['!rows'] = [{ hpt: 22 }];
-  setHistorySheet['!cols'] = computeColWidths(setHistoryRows, 10, 40);
-  setHistorySheet['!autofilter'] = {
-    ref: XLSX.utils.encode_range({
-      s: { r: 0, c: 0 },
-      e: { r: setHistoryRows.length - 1, c: 15 },
-    }),
+
+  ws3.autoFilter = {
+    from: { row: 1, column: 1 },
+    to: { row: ws3.rowCount, column: ws3Cols },
   };
+  applySheetColumnWidths(ws3, setHistoryAllRows, 10, 40, 0);
+  styleAllWorksheetCellsCentered(ws3);
 
   // =========================================================================
   // SHEET 4: WARM-UP & HYDRATION
   // =========================================================================
-  const warmupRows: Array<Array<string | number>> = [
-    [`Warm-up Protocol & Hydration Tracker  —  ${plan.title || 'Workout Plan'}`, '', '', '', '', '', '', '', ''],
-    [
-      'Daily Water Intake',
-      typeof options.waterGlasses === 'number' ? `${options.waterGlasses} / 8 glasses` : 'Not logged',
-      'Warm-up Movements',
-      warmupExercises.length,
-      'Exported Date',
-      new Date().toLocaleDateString(),
-      '',
-      '',
-      '',
-    ],
-    ['', '', '', '', '', '', '', '', ''],
-    [
-      'Warm-up #',
-      'Warm-up Exercise',
-      'Duration (Min)',
-      'Target Sets',
-      'Target Reps / Cue',
-      'Week',
-      'Completed',
-      'Warm-up Sets Summary',
-      'Updated At',
-    ],
-  ];
+  const ws4 = wb.addWorksheet('Warm-up & Hydration', {
+    views: [{ state: 'frozen', ySplit: 4 }],
+  });
+  const ws4Cols = 9;
+  const warmupAllRows: Array<Array<string | number>> = [];
 
+  const wBannerData = [`Warm-up Protocol & Hydration Tracker  —  ${plan.title || 'Workout Plan'}`, '', '', '', '', '', '', '', ''];
+  const rWBanner = ws4.addRow(wBannerData);
+  ws4.mergeCells(1, 1, 1, ws4Cols);
+  styleBannerRow(rWBanner, ws4Cols, 'FF78350F', 'FFFFFFFF');
+  warmupAllRows.push(wBannerData);
+
+  const wMetaData: Array<string | number> = [
+    'Daily Water Intake',
+    typeof options.waterGlasses === 'number' ? `${options.waterGlasses} / 8 glasses` : 'Not logged',
+    'Warm-up Movements',
+    warmupExercises.length,
+    'Exported Date',
+    new Date().toLocaleDateString(),
+    '',
+    '',
+    '',
+  ];
+  const rWMeta = ws4.addRow(wMetaData);
+  styleMetaRow(rWMeta, ws4Cols);
+  warmupAllRows.push(wMetaData);
+
+  const wSpacer = ws4.addRow(['']);
+  wSpacer.height = 8;
+  warmupAllRows.push(['']);
+
+  const wuHeaders = [
+    'Warm-up #',
+    'Warm-up Exercise',
+    'Duration (Min)',
+    'Target Sets',
+    'Target Reps / Cue',
+    'Week',
+    'Completed',
+    'Warm-up Sets Summary',
+    'Updated At',
+  ];
+  const rWHead = ws4.addRow(wuHeaders);
+  styleHeaderRow(rWHead, ws4Cols, 'FF92400E');
+  warmupAllRows.push(wuHeaders);
+
+  let wRowIdx = 0;
   if (warmupExercises.length > 0) {
     warmupExercises.forEach((wu, idx) => {
       const durMin = wu.minutes?.trim() || '';
@@ -626,7 +843,11 @@ export async function buildWorkoutPlanExcelWorkbook(
         const wKey = weekKey(w - 1);
         const wLog = plan.warmupLogs?.[wKey]?.[wu.id];
         const validSets = (wLog?.setEntries || []).filter(
-          s => (s.weight || '').trim() !== '' || (s.reps || '').trim() !== '' || (s.rpe || '').trim() !== ''
+          (s) =>
+            (s.weight || '').trim() !== '' ||
+            (s.reps || '').trim() !== '' ||
+            (s.rpe || '').trim() !== '' ||
+            (s.rir || '').trim() !== ''
         );
         if (!wLog?.completed && validSets.length === 0) continue;
         hasAnyWeek = true;
@@ -634,12 +855,16 @@ export async function buildWorkoutPlanExcelWorkbook(
           .map((s) => {
             const wt = (s.weight || '').trim();
             const rp = (s.reps || '').trim();
-            const rpe = (s.rpe || '').trim();
+            const rpe = showRpe ? (s.rpe || '').trim() : '';
+            const rir = showRir ? (s.rir || '').trim() : '';
             const unit = s.unit || planUnit;
-            return `S${s.setNumber}: ${wt ? `${wt} ${unit}` : '-'} x ${rp || '-'}${rpe ? ` (RPE ${rpe})` : ''}`;
+            const tags: string[] = [];
+            if (rpe) tags.push(`RPE ${rpe}`);
+            if (rir) tags.push(`RIR ${rir}`);
+            return `S${s.setNumber}: ${wt ? `${wt} ${unit}` : '-'} x ${rp || '-'}${tags.length ? ` (${tags.join(' ')})` : ''}`;
           })
           .join(' | ');
-        warmupRows.push([
+        const rowData: Array<string | number> = [
           idx + 1,
           wu.name || '',
           durMin ? `${durMin} min` : '',
@@ -649,10 +874,15 @@ export async function buildWorkoutPlanExcelWorkbook(
           wLog?.completed ? 'Yes' : 'No',
           setSummary || 'Completed',
           wLog?.updatedAt ? new Date(wLog.updatedAt).toLocaleString() : '',
-        ]);
+        ];
+        const added = ws4.addRow(rowData);
+        styleDataRow(added, ws4Cols, wRowIdx % 2 === 1);
+        added.height = 22;
+        wRowIdx++;
+        warmupAllRows.push(rowData);
       }
       if (!hasAnyWeek) {
-        warmupRows.push([
+        const rowData: Array<string | number> = [
           idx + 1,
           wu.name || '',
           durMin ? `${durMin} min` : '',
@@ -662,28 +892,62 @@ export async function buildWorkoutPlanExcelWorkbook(
           'No',
           'Not logged yet',
           '',
-        ]);
+        ];
+        const added = ws4.addRow(rowData);
+        styleDataRow(added, ws4Cols, wRowIdx % 2 === 1);
+        added.height = 22;
+        wRowIdx++;
+        warmupAllRows.push(rowData);
       }
     });
   } else {
-    warmupRows.push(['—', 'No warm-up exercises configured for this workout plan.', '', '', '', '', '', '', '']);
+    const emptyW = ['—', 'No warm-up exercises configured for this workout plan.', '', '', '', '', '', '', ''];
+    const added = ws4.addRow(emptyW);
+    styleDataRow(added, ws4Cols, false);
+    added.height = 22;
+    warmupAllRows.push(emptyW);
   }
 
-  const warmupSheet = XLSX.utils.aoa_to_sheet(warmupRows);
-  warmupSheet['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 8 } }];
-  warmupSheet['!rows'] = [{ hpt: 26 }, { hpt: 20 }, { hpt: 8 }, { hpt: 22 }];
-  warmupSheet['!cols'] = computeColWidths(warmupRows.slice(3), 12, 48);
+  applySheetColumnWidths(ws4, warmupAllRows, 12, 46, 3);
+  styleAllWorksheetCellsCentered(ws4);
 
   // =========================================================================
-  // SHEET 5: INSTRUCTIONS & NOTES
+  // SHEET 5: NOTES & INSTRUCTIONS
   // =========================================================================
-  const notesRows: Array<Array<string | number>> = [
-    [`Instructions, Coach Overview & Session Notes  —  ${plan.title || 'Workout Plan'}`, '', '', '', '', ''],
-    ...(plan.description ? [['Plan Description', plan.description, '', '', '', '']] : []),
-    ...(plan.instructions ? [['Coach Instructions', plan.instructions, '', '', '', '']] : []),
-    ['', '', '', '', '', ''],
-    ['Note Type', 'Week', 'Day / Scope', 'Exercise', 'Notes / Feedback', 'Updated At'],
-  ];
+  const ws5 = wb.addWorksheet('Notes & Instructions');
+  const ws5Cols = 6;
+  const notesAllRows: Array<Array<string | number>> = [];
+
+  const nBannerData = [`Instructions, Coach Overview & Session Notes  —  ${plan.title || 'Workout Plan'}`, '', '', '', '', ''];
+  const rNBanner = ws5.addRow(nBannerData);
+  ws5.mergeCells(1, 1, 1, ws5Cols);
+  styleBannerRow(rNBanner, ws5Cols);
+  notesAllRows.push(nBannerData);
+
+  if (plan.description) {
+    const dRow = ['Plan Description', plan.description, '', '', '', ''];
+    const added = ws5.addRow(dRow);
+    ws5.mergeCells(added.number, 2, added.number, ws5Cols);
+    styleMetaRow(added, ws5Cols);
+    notesAllRows.push(dRow);
+  }
+  if (plan.instructions) {
+    const iRow = ['Coach Instructions', plan.instructions, '', '', '', ''];
+    const added = ws5.addRow(iRow);
+    ws5.mergeCells(added.number, 2, added.number, ws5Cols);
+    styleMetaRow(added, ws5Cols);
+    added.height = Math.max(26, Math.ceil(plan.instructions.length / 70) * 16 + 8);
+    notesAllRows.push(iRow);
+  }
+
+  const nSpacer = ws5.addRow(['']);
+  nSpacer.height = 8;
+  notesAllRows.push(['']);
+
+  const notesHeaders = ['Note Type', 'Week', 'Day / Scope', 'Exercise', 'Notes / Feedback', 'Updated At'];
+  const rNHead = ws5.addRow(notesHeaders);
+  styleHeaderRow(rNHead, ws5Cols);
+  notesAllRows.push(notesHeaders);
 
   const collectedNotes: Array<{
     type: string;
@@ -716,7 +980,7 @@ export async function buildWorkoutPlanExcelWorkbook(
           updatedAt: entryVal?.updatedAt ? new Date(entryVal.updatedAt).toLocaleString() : '',
         });
       } else {
-        const exObj = exercises.find(e => e.id === entryKey);
+        const exObj = exercises.find((e) => e.id === entryKey);
         collectedNotes.push({
           type: 'Exercise Week Note',
           weekNum,
@@ -729,33 +993,35 @@ export async function buildWorkoutPlanExcelWorkbook(
     });
   });
 
+  let nIdx = 0;
   collectedNotes
     .sort((a, b) => a.weekNum - b.weekNum || a.type.localeCompare(b.type) || a.scope.localeCompare(b.scope))
     .forEach((item) => {
-      notesRows.push([
+      const rowData = [
         item.type,
         `Week ${item.weekNum}`,
         item.scope,
         item.exerciseName,
         item.notes,
         item.updatedAt,
-      ]);
+      ];
+      const added = ws5.addRow(rowData);
+      styleDataRow(added, ws5Cols, nIdx % 2 === 1);
+      added.height = Math.max(22, Math.ceil(item.notes.length / 45) * 15 + 6);
+      nIdx++;
+      notesAllRows.push(rowData);
     });
 
   if (collectedNotes.length === 0) {
-    notesRows.push(['—', '—', '—', '—', 'No exercise notes or session notes recorded yet.', '']);
+    const emptyN = ['—', '—', '—', '—', 'No exercise notes or session notes recorded yet.', ''];
+    const added = ws5.addRow(emptyN);
+    styleDataRow(added, ws5Cols, false);
+    added.height = 22;
+    notesAllRows.push(emptyN);
   }
-  const notesSheet = XLSX.utils.aoa_to_sheet(notesRows);
-  notesSheet['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 5 } }];
-  notesSheet['!rows'] = [{ hpt: 26 }];
-  notesSheet['!cols'] = computeColWidths(notesRows, 14, 62);
 
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, planSheet, 'Workout Sheet');
-  XLSX.utils.book_append_sheet(wb, analyticsSheet, 'Daily Analytics');
-  XLSX.utils.book_append_sheet(wb, setHistorySheet, 'Set-by-Set Log');
-  XLSX.utils.book_append_sheet(wb, warmupSheet, 'Warm-up & Hydration');
-  XLSX.utils.book_append_sheet(wb, notesSheet, 'Notes & Instructions');
+  applySheetColumnWidths(ws5, notesAllRows, 14, 58, 3);
+  styleAllWorksheetCellsCentered(ws5);
 
   const safeSlug =
     (plan.title || 'workout-plan')
@@ -766,18 +1032,18 @@ export async function buildWorkoutPlanExcelWorkbook(
   const dateStamp = new Date().toISOString().slice(0, 10);
   const filename = `${safeSlug}-${dateStamp}.xlsx`;
 
-  return { wb, filename, XLSX };
+  return { wb, filename };
 }
 
 export async function exportWorkoutPlanToExcelBuffer(
   plan: WorkoutPlan,
   options: ExportWorkoutExcelOptions = {}
 ): Promise<{ filename: string; buffer: Uint8Array }> {
-  const { wb, filename, XLSX } = await buildWorkoutPlanExcelWorkbook(plan, options);
-  const arrayOut = XLSX.write(wb, { type: 'array', bookType: 'xlsx' });
+  const { wb, filename } = await buildWorkoutPlanExcelWorkbook(plan, options);
+  const rawBuffer = await wb.xlsx.writeBuffer();
   return {
     filename,
-    buffer: new Uint8Array(arrayOut),
+    buffer: new Uint8Array(rawBuffer),
   };
 }
 
@@ -785,7 +1051,17 @@ export async function exportWorkoutPlanToExcel(
   plan: WorkoutPlan,
   options: ExportWorkoutExcelOptions = {}
 ): Promise<string> {
-  const { wb, filename, XLSX } = await buildWorkoutPlanExcelWorkbook(plan, options);
-  XLSX.writeFile(wb, filename);
+  const { filename, buffer } = await exportWorkoutPlanToExcelBuffer(plan, options);
+  const blob = new Blob([buffer], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
   return filename;
 }

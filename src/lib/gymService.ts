@@ -82,6 +82,8 @@ export interface NewWorkoutPlanInput {
   sheetName?: string;
   defaultWeightUnit?: WeightUnit;
   weeks: number;
+  hasRpeColumn?: boolean;
+  hasRirColumn?: boolean;
   exercises: ParsedExerciseRow[];
   importSheetData?: boolean; // Defaults to true: import pre-filled weights/reps/weeks/done if present
   sourceFileName?: string;
@@ -89,8 +91,79 @@ export interface NewWorkoutPlanInput {
   assignedByAdmin?: boolean;
 }
 
+function anyLogMapHasField(
+  logsMap: { [weekKey: string]: { [exerciseId: string]: ExerciseLogEntry } } | undefined,
+  field: 'rpe' | 'rir'
+): boolean {
+  if (!logsMap) return false;
+  return Object.values(logsMap).some((weekMap) =>
+    Object.values(weekMap || {}).some((entry) =>
+      Boolean(entry?.setEntries?.some((s) => (s?.[field] || '').trim() !== ''))
+    )
+  );
+}
+
+function previousLogsHaveField(
+  previousLogs: { [exerciseId: string]: ExerciseLogEntry } | undefined,
+  field: 'rpe' | 'rir'
+): boolean {
+  if (!previousLogs) return false;
+  return Object.values(previousLogs).some((entry) =>
+    Boolean(entry?.setEntries?.some((s) => (s?.[field] || '').trim() !== ''))
+  );
+}
+
+function warmupLogsHaveField(
+  warmupLogs: WorkoutPlan['warmupLogs'],
+  field: 'rpe' | 'rir'
+): boolean {
+  if (!warmupLogs) return false;
+  return Object.values(warmupLogs).some((weekMap) =>
+    Object.values(weekMap || {}).some((entry) =>
+      Boolean(entry?.setEntries?.some((s) => (s?.[field] || '').trim() !== ''))
+    )
+  );
+}
+
+export function planHasRpeColumn(plan?: WorkoutPlan | null): boolean {
+  if (!plan) return false;
+  if (typeof plan.hasRpeColumn === 'boolean') {
+    if (plan.hasRpeColumn) return true;
+    // Even if sheet didn't originally declare RPE, show if user logged RPE values or exercise has targetRpe
+    if ((plan.exercises || []).some((e) => Boolean(e.targetRpe?.trim()))) return true;
+    if (anyLogMapHasField(plan.exerciseLogs, 'rpe') || previousLogsHaveField(plan.previousLogs, 'rpe') || warmupLogsHaveField(plan.warmupLogs, 'rpe')) {
+      return true;
+    }
+    return false;
+  }
+  return (
+    (plan.exercises || []).some((e) => Boolean(e.targetRpe?.trim())) ||
+    anyLogMapHasField(plan.exerciseLogs, 'rpe') ||
+    previousLogsHaveField(plan.previousLogs, 'rpe') ||
+    warmupLogsHaveField(plan.warmupLogs, 'rpe')
+  );
+}
+
+export function planHasRirColumn(plan?: WorkoutPlan | null): boolean {
+  if (!plan) return false;
+  if (typeof plan.hasRirColumn === 'boolean') {
+    if (plan.hasRirColumn) return true;
+    if ((plan.exercises || []).some((e) => Boolean(e.targetRir?.trim()))) return true;
+    if (anyLogMapHasField(plan.exerciseLogs, 'rir') || previousLogsHaveField(plan.previousLogs, 'rir') || warmupLogsHaveField(plan.warmupLogs, 'rir')) {
+      return true;
+    }
+    return false;
+  }
+  return (
+    (plan.exercises || []).some((e) => Boolean(e.targetRir?.trim())) ||
+    anyLogMapHasField(plan.exerciseLogs, 'rir') ||
+    previousLogsHaveField(plan.previousLogs, 'rir') ||
+    warmupLogsHaveField(plan.warmupLogs, 'rir')
+  );
+}
+
 function buildEntryFromSheetEntries(
-  rawEntries: Array<{ setNumber: number; weight: string; unit?: WeightUnit; reps: string; rpe?: string }>,
+  rawEntries: Array<{ setNumber: number; weight: string; unit?: WeightUnit; reps: string; rpe?: string; rir?: string }>,
   targetSetCount: number,
   fallbackUnit: WeightUnit,
   nowIso: string,
@@ -105,9 +178,10 @@ function buildEntryFromSheetEntries(
       unit: src?.unit || fallbackUnit,
       reps: (src?.reps || '').trim(),
       ...(src?.rpe?.trim() ? { rpe: src.rpe.trim() } : {}),
+      ...(src?.rir?.trim() ? { rir: src.rir.trim() } : {}),
     };
   });
-  const firstPopulated = setEntries.find(s => s.weight || s.reps || s.rpe);
+  const firstPopulated = setEntries.find(s => s.weight || s.reps || s.rpe || s.rir);
   const cleanNote = (weekNote || '').trim();
   return {
     sets: String(setEntries.length),
@@ -122,7 +196,17 @@ function buildEntryFromSheetEntries(
 
 function entryHasData(entry?: ExerciseLogEntry): boolean {
   if (!entry) return false;
-  if (entry.setEntries?.some(s => (s.weight || '').trim() !== '' || (s.reps || '').trim() !== '' || (s.rpe || '').trim() !== '')) return true;
+  if (
+    entry.setEntries?.some(
+      s =>
+        (s.weight || '').trim() !== '' ||
+        (s.reps || '').trim() !== '' ||
+        (s.rpe || '').trim() !== '' ||
+        (s.rir || '').trim() !== ''
+    )
+  ) {
+    return true;
+  }
   return Boolean(entry.weight?.trim() || entry.reps?.trim() || entry.notes?.trim());
 }
 
@@ -145,7 +229,7 @@ function applyParsedSheetDataForExercise(
       const wk = Number(k);
       const wkUnit: WeightUnit = weekData.unit || rowUnit;
       const populated = (weekData.entries || []).filter(
-        e => e.weight.trim() !== '' || e.reps.trim() !== '' || (e.rpe || '').trim() !== ''
+        e => e.weight.trim() !== '' || e.reps.trim() !== '' || (e.rpe || '').trim() !== '' || (e.rir || '').trim() !== ''
       );
       const hasWeekNote = Boolean(weekData.weekNote?.trim());
 
@@ -204,7 +288,7 @@ export function buildWorkoutPlan(input: NewWorkoutPlanInput): WorkoutPlan {
   let maxSheetWeek = 1;
 
   const exercises: WorkoutExercise[] = input.exercises
-    .filter((e) => e.name || e.sets || e.reps || e.rpe || e.notes || e.video || e.loggedWeight || e.weeklyLogs)
+    .filter((e) => e.name || e.sets || e.reps || e.rpe || e.rir || e.notes || e.video || e.loggedWeight || e.weeklyLogs)
     .map((e) => {
       const id = newId('ex');
       if (shouldImportData) {
@@ -222,6 +306,7 @@ export function buildWorkoutPlan(input: NewWorkoutPlanInput): WorkoutPlan {
       }
 
       const resolvedTargetRpe = (e.rpe || '').trim();
+      const resolvedTargetRir = (e.rir || '').trim();
       return {
         id,
         name: e.name || 'Exercise',
@@ -229,12 +314,26 @@ export function buildWorkoutPlan(input: NewWorkoutPlanInput): WorkoutPlan {
         sets: e.sets,
         reps: e.reps,
         ...(resolvedTargetRpe ? { targetRpe: resolvedTargetRpe } : {}),
+        ...(resolvedTargetRir ? { targetRir: resolvedTargetRir } : {}),
         notes: e.notes,
         videoUrl: e.video,
         ...(e.isSuperset ? { isSuperset: true } : {}),
         ...(e.supersetGroup?.trim() ? { supersetGroup: e.supersetGroup.trim() } : {}),
       };
     });
+
+  const hasRpeColumn = Boolean(
+    input.hasRpeColumn ||
+      exercises.some(ex => Boolean(ex.targetRpe)) ||
+      anyLogMapHasField(exerciseLogs, 'rpe') ||
+      previousLogsHaveField(previousLogs, 'rpe')
+  );
+  const hasRirColumn = Boolean(
+    input.hasRirColumn ||
+      exercises.some(ex => Boolean(ex.targetRir)) ||
+      anyLogMapHasField(exerciseLogs, 'rir') ||
+      previousLogsHaveField(previousLogs, 'rir')
+  );
 
   return {
     id: newId('plan'),
@@ -245,6 +344,8 @@ export function buildWorkoutPlan(input: NewWorkoutPlanInput): WorkoutPlan {
     sheetName: input.sheetName?.trim() || undefined,
     defaultWeightUnit: defaultUnit,
     weeks: Math.max(1, Number(input.weeks) || 1, maxSheetWeek),
+    hasRpeColumn,
+    hasRirColumn,
     exercises,
     sourceFileName: input.sourceFileName,
     createdBy: input.createdBy,
@@ -263,6 +364,8 @@ export interface MergeWorksheetUpdatesInput {
   sheetName?: string;
   defaultWeightUnit?: WeightUnit;
   weeks?: number;
+  hasRpeColumn?: boolean;
+  hasRirColumn?: boolean;
   sourceFileName?: string;
   importSheetData?: boolean; // Defaults to true: fills missing week/exercise logs from sheet without overwriting saved logs
   exercises: Array<
@@ -301,7 +404,7 @@ export function mergeUpdatedWorksheetIntoPlan(
   let maxSheetWeek = 1;
 
   const mergedExercises: WorkoutExercise[] = updates.exercises
-    .filter((e) => e.name || e.sets || e.reps || e.targetRpe || e.rpe || e.notes || e.videoUrl || e.video || e.loggedWeight || e.weeklyLogs)
+    .filter((e) => e.name || e.sets || e.reps || e.targetRpe || e.rpe || e.targetRir || e.rir || e.notes || e.videoUrl || e.video || e.loggedWeight || e.weeklyLogs)
     .map((e) => {
       const normName = (e.name || '').trim().toLowerCase();
       const normDay = (e.day || '').trim().toLowerCase();
@@ -349,6 +452,7 @@ export function mergeUpdatedWorksheetIntoPlan(
 
       const resolvedVideo = (e.videoUrl ?? e.video ?? '').trim();
       const resolvedTargetRpe = (e.targetRpe ?? e.rpe ?? '').trim();
+      const resolvedTargetRir = (e.targetRir ?? e.rir ?? '').trim();
 
       return {
         id: resolvedId,
@@ -357,12 +461,43 @@ export function mergeUpdatedWorksheetIntoPlan(
         ...(e.sets?.trim() ? { sets: e.sets.trim() } : {}),
         ...(e.reps?.trim() ? { reps: e.reps.trim() } : {}),
         ...(resolvedTargetRpe ? { targetRpe: resolvedTargetRpe } : {}),
+        ...(resolvedTargetRir ? { targetRir: resolvedTargetRir } : {}),
         ...(e.notes?.trim() ? { notes: e.notes.trim() } : {}),
         ...(resolvedVideo ? { videoUrl: resolvedVideo } : {}),
         ...(e.isSuperset ? { isSuperset: true } : {}),
         ...(e.isSuperset && e.supersetGroup?.trim() ? { supersetGroup: e.supersetGroup.trim() } : {}),
       };
     });
+
+  const resolvedHasRpeColumn =
+    typeof updates.hasRpeColumn === 'boolean'
+      ? Boolean(
+          updates.hasRpeColumn ||
+            mergedExercises.some(ex => Boolean(ex.targetRpe)) ||
+            anyLogMapHasField(nextExerciseLogs, 'rpe') ||
+            previousLogsHaveField(nextPreviousLogs, 'rpe')
+        )
+      : Boolean(
+          existing.hasRpeColumn ||
+            mergedExercises.some(ex => Boolean(ex.targetRpe)) ||
+            anyLogMapHasField(nextExerciseLogs, 'rpe') ||
+            previousLogsHaveField(nextPreviousLogs, 'rpe')
+        );
+
+  const resolvedHasRirColumn =
+    typeof updates.hasRirColumn === 'boolean'
+      ? Boolean(
+          updates.hasRirColumn ||
+            mergedExercises.some(ex => Boolean(ex.targetRir)) ||
+            anyLogMapHasField(nextExerciseLogs, 'rir') ||
+            previousLogsHaveField(nextPreviousLogs, 'rir')
+        )
+      : Boolean(
+          existing.hasRirColumn ||
+            mergedExercises.some(ex => Boolean(ex.targetRir)) ||
+            anyLogMapHasField(nextExerciseLogs, 'rir') ||
+            previousLogsHaveField(nextPreviousLogs, 'rir')
+        );
 
   return {
     ...existing,
@@ -376,6 +511,8 @@ export function mergeUpdatedWorksheetIntoPlan(
       updates.weeks !== undefined ? (Number(updates.weeks) || 1) : existing.weeks,
       maxSheetWeek
     ),
+    hasRpeColumn: resolvedHasRpeColumn,
+    hasRirColumn: resolvedHasRirColumn,
     sourceFileName: updates.sourceFileName || existing.sourceFileName,
     exercises: mergedExercises,
     // Strictly preserve all saved workout data, warmups, & history + merge new prefilled slots
