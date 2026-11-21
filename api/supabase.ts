@@ -1,4 +1,4 @@
-import { handleSupabaseProxyAction } from '../server/supabaseProxy';
+import { handleSupabaseProxyAction } from '../server/supabaseProxy.js';
 
 export default async function handler(req: any, res: any) {
   try {
