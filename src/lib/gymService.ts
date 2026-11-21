@@ -6,7 +6,7 @@
 
 import { collection, doc, onSnapshot, setDoc, deleteDoc } from 'firebase/firestore';
 import { db } from './firebase';
-import { sanitizeForFirestore } from './firebaseService';
+import { sanitizeForFirestore, handleFirestoreError, OperationType } from './firebaseService';
 import {
   mapToDb,
   safeUpsert,
@@ -32,6 +32,11 @@ export function subscribeToWorkoutPlans(callback: (plans: WorkoutPlan[]) => void
       },
       (error) => {
         console.warn('Workout plans realtime sync unavailable:', error?.message || error);
+        try {
+          handleFirestoreError(error, OperationType.GET, 'workoutPlans');
+        } catch {
+          // surface diagnostic context cleanly without crashing UI listener
+        }
       }
     );
   } catch (error: any) {
@@ -51,7 +56,12 @@ export async function saveWorkoutPlanDoc(plan: WorkoutPlan): Promise<void> {
     exercises: Array.isArray(plan.exercises) ? plan.exercises : [],
   });
 
-  await setDoc(doc(db, 'workoutPlans', stamped.id), stamped);
+  try {
+    await setDoc(doc(db, 'workoutPlans', stamped.id), stamped);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, `workoutPlans/${stamped.id}`);
+    throw err;
+  }
 
   try {
     if (await ensureSupabaseConfigured()) {
@@ -63,7 +73,12 @@ export async function saveWorkoutPlanDoc(plan: WorkoutPlan): Promise<void> {
 }
 
 export async function deleteWorkoutPlanDoc(id: string): Promise<void> {
-  await deleteDoc(doc(db, 'workoutPlans', id));
+  try {
+    await deleteDoc(doc(db, 'workoutPlans', id));
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, `workoutPlans/${id}`);
+    throw err;
+  }
 
   try {
     if (await ensureSupabaseConfigured()) {
@@ -194,7 +209,7 @@ function buildEntryFromSheetEntries(
   };
 }
 
-function entryHasData(entry?: ExerciseLogEntry): boolean {
+function entryHasLoggedMetrics(entry?: ExerciseLogEntry): boolean {
   if (!entry) return false;
   if (
     entry.setEntries?.some(
@@ -207,7 +222,81 @@ function entryHasData(entry?: ExerciseLogEntry): boolean {
   ) {
     return true;
   }
-  return Boolean(entry.weight?.trim() || entry.reps?.trim() || entry.notes?.trim());
+  return Boolean(entry.weight?.trim() || entry.reps?.trim());
+}
+
+function mergeLogEntryWithSheet(
+  existingEntry: ExerciseLogEntry | undefined,
+  rawEntries: Array<{ setNumber: number; weight: string; unit?: WeightUnit; reps: string; rpe?: string; rir?: string }>,
+  targetSetCount: number,
+  fallbackUnit: WeightUnit,
+  nowIso: string,
+  overwriteExisting: boolean,
+  weekNote?: string
+): ExerciseLogEntry {
+  const incoming = buildEntryFromSheetEntries(rawEntries, targetSetCount, fallbackUnit, nowIso, weekNote);
+  if (!existingEntry || !entryHasLoggedMetrics(existingEntry)) {
+    const preservedNote = (existingEntry?.notes || '').trim();
+    const incomingNote = (weekNote || '').trim();
+    const finalNote = overwriteExisting ? (incomingNote || preservedNote) : (preservedNote || incomingNote);
+    return {
+      ...incoming,
+      ...(finalNote ? { notes: finalNote, noteEnabled: existingEntry?.noteEnabled ?? true } : {}),
+      ...(existingEntry?.noteEnabled !== undefined ? { noteEnabled: existingEntry.noteEnabled || Boolean(finalNote) } : {}),
+    };
+  }
+
+  const existingSets = existingEntry.setEntries || [];
+  const totalCount = Math.max(existingSets.length, incoming.setEntries.length, targetSetCount, 1);
+  const mergedSets: SetLogEntry[] = Array.from({ length: totalCount }, (_, idx) => {
+    const exS = existingSets[idx];
+    const inS = incoming.setEntries[idx];
+    const exWt = (exS?.weight || '').trim();
+    const exRp = (exS?.reps || '').trim();
+    const exRpe = (exS?.rpe || '').trim();
+    const exRir = (exS?.rir || '').trim();
+    const inWt = (inS?.weight || '').trim();
+    const inRp = (inS?.reps || '').trim();
+    const inRpe = (inS?.rpe || '').trim();
+    const inRir = (inS?.rir || '').trim();
+
+    if (overwriteExisting) {
+      return {
+        setNumber: idx + 1,
+        weight: inWt !== '' ? inWt : exWt,
+        unit: inS?.unit || exS?.unit || existingEntry.unit || fallbackUnit,
+        reps: inRp !== '' ? inRp : exRp,
+        ...((inRpe !== '' ? inRpe : exRpe) ? { rpe: inRpe !== '' ? inRpe : exRpe } : {}),
+        ...((inRir !== '' ? inRir : exRir) ? { rir: inRir !== '' ? inRir : exRir } : {}),
+      };
+    }
+
+    // Backfill only empty fields per set while keeping all user-logged values intact
+    return {
+      setNumber: idx + 1,
+      weight: exWt !== '' ? exWt : inWt,
+      unit: exS?.unit || inS?.unit || existingEntry.unit || fallbackUnit,
+      reps: exRp !== '' ? exRp : inRp,
+      ...((exRpe !== '' ? exRpe : inRpe) ? { rpe: exRpe !== '' ? exRpe : inRpe } : {}),
+      ...((exRir !== '' ? exRir : inRir) ? { rir: exRir !== '' ? exRir : inRir } : {}),
+    };
+  });
+
+  const firstPopulated = mergedSets.find(s => s.weight || s.reps || s.rpe || s.rir);
+  const preservedNote = (existingEntry.notes || '').trim();
+  const incomingNote = (weekNote || '').trim();
+  const finalNote = overwriteExisting ? (incomingNote || preservedNote) : (preservedNote || incomingNote);
+
+  return {
+    ...existingEntry,
+    sets: String(mergedSets.length),
+    weight: firstPopulated?.weight || existingEntry.weight || '',
+    unit: firstPopulated?.unit || existingEntry.unit || fallbackUnit,
+    reps: firstPopulated?.reps || existingEntry.reps || '',
+    setEntries: mergedSets,
+    ...(finalNote ? { notes: finalNote, noteEnabled: existingEntry.noteEnabled ?? true } : {}),
+    updatedAt: nowIso,
+  };
 }
 
 function applyParsedSheetDataForExercise(
@@ -234,8 +323,16 @@ function applyParsedSheetDataForExercise(
       const hasWeekNote = Boolean(weekData.weekNote?.trim());
 
       if (wk === 0) {
-        if ((populated.length > 0 || hasWeekNote) && (overwriteExisting || !entryHasData(previousLogs[exId]))) {
-          previousLogs[exId] = buildEntryFromSheetEntries(weekData.entries, targetCount, wkUnit, nowIso, weekData.weekNote);
+        if (populated.length > 0 || hasWeekNote) {
+          previousLogs[exId] = mergeLogEntryWithSheet(
+            previousLogs[exId],
+            weekData.entries,
+            targetCount,
+            wkUnit,
+            nowIso,
+            overwriteExisting,
+            weekData.weekNote
+          );
         }
         continue;
       }
@@ -244,8 +341,16 @@ function applyParsedSheetDataForExercise(
         highestWeek = Math.max(highestWeek, wk);
         const wKey = `w${wk}`;
         if (!exerciseLogs[wKey]) exerciseLogs[wKey] = {};
-        if ((populated.length > 0 || hasWeekNote) && (overwriteExisting || !entryHasData(exerciseLogs[wKey][exId]))) {
-          exerciseLogs[wKey][exId] = buildEntryFromSheetEntries(weekData.entries, targetCount, wkUnit, nowIso, weekData.weekNote);
+        if (populated.length > 0 || hasWeekNote) {
+          exerciseLogs[wKey][exId] = mergeLogEntryWithSheet(
+            exerciseLogs[wKey][exId],
+            weekData.entries,
+            targetCount,
+            wkUnit,
+            nowIso,
+            overwriteExisting,
+            weekData.weekNote
+          );
         }
         if (weekData.completed) {
           const list = progress[wKey] || [];
@@ -257,15 +362,20 @@ function applyParsedSheetDataForExercise(
     highestWeek = Math.max(highestWeek, 1);
     const wKey = 'w1';
     if (!exerciseLogs[wKey]) exerciseLogs[wKey] = {};
-    if (overwriteExisting || !entryHasData(exerciseLogs[wKey][exId])) {
-      const synth = Array.from({ length: targetCount }, (_, idx) => ({
-        setNumber: idx + 1,
-        weight: (row.loggedWeight || '').trim(),
-        unit: rowUnit,
-        reps: (row.loggedReps || '').trim(),
-      }));
-      exerciseLogs[wKey][exId] = buildEntryFromSheetEntries(synth, targetCount, rowUnit, nowIso);
-    }
+    const synth = Array.from({ length: targetCount }, (_, idx) => ({
+      setNumber: idx + 1,
+      weight: (row.loggedWeight || '').trim(),
+      unit: rowUnit,
+      reps: (row.loggedReps || '').trim(),
+    }));
+    exerciseLogs[wKey][exId] = mergeLogEntryWithSheet(
+      exerciseLogs[wKey][exId],
+      synth,
+      targetCount,
+      rowUnit,
+      nowIso,
+      overwriteExisting
+    );
   }
 
   if (row.completed) {
@@ -368,6 +478,7 @@ export interface MergeWorksheetUpdatesInput {
   hasRirColumn?: boolean;
   sourceFileName?: string;
   importSheetData?: boolean; // Defaults to true: fills missing week/exercise logs from sheet without overwriting saved logs
+  replaceExistingWeekLogs?: boolean; // When true during update-sheet, replaces matching week set values with updated sheet values
   exercises: Array<
     Partial<WorkoutExercise> &
       Partial<ParsedExerciseRow> & {
@@ -390,6 +501,7 @@ export function mergeUpdatedWorksheetIntoPlan(
   const usedIds = new Set<string>();
   const defaultUnit: WeightUnit = updates.defaultWeightUnit || existing.defaultWeightUnit || 'kg';
   const shouldImportSheetData = updates.importSheetData !== false;
+  const shouldOverwriteWeeks = Boolean(updates.replaceExistingWeekLogs);
 
   const nextExerciseLogs: { [weekKey: string]: { [exerciseId: string]: ExerciseLogEntry } } = {};
   Object.entries(existing.exerciseLogs || {}).forEach(([wk, map]) => {
@@ -445,7 +557,7 @@ export function mergeUpdatedWorksheetIntoPlan(
           nextPreviousLogs,
           nextProgress,
           now,
-          false // NEVER overwrite already-saved app logs!
+          shouldOverwriteWeeks
         );
         if (wk > maxSheetWeek) maxSheetWeek = wk;
       }

@@ -8,7 +8,7 @@ import {
   ChevronDown, ChevronUp, Plus, Minus, Zap, Pencil,
   FileSpreadsheet, Maximize2, ShieldCheck, Loader2, Download,
   User, KeyRound, Eye, EyeOff, Send, ShieldAlert, AlertCircle, Bell,
-  Droplets, RotateCcw, Clock, Timer, Volume2, Scale
+  Droplets, RotateCcw, Clock, Timer, Volume2, Scale, Image as ImageIcon
 } from 'lucide-react';
 import {
   ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip
@@ -25,7 +25,7 @@ import {
   planHasRpeColumn,
   planHasRirColumn,
 } from '../../lib/gymService';
-import { saveUserAccountDoc, saveAdminSettingDoc, logActivity } from '../../lib/syncService';
+import { saveUserAccountDoc, saveAdminSettingDoc, logActivity, getFirestoreUserAccounts } from '../../lib/syncService';
 import { hashPassword, verifyPassword } from '../../utils/crypto';
 import {
   getTelegramConfig,
@@ -187,6 +187,80 @@ function saveStoredBodyWeight(username: string, entries: BodyWeightEntry[]) {
   } catch {
     // ignore storage errors
   }
+}
+
+function getUserBgStorageKey(username: string): string {
+  return `gymworkout_bg_${(username || 'member').toLowerCase().trim()}`;
+}
+
+function readStoredUserBg(username: string): { imageUrl: string; dimPercent: number } {
+  try {
+    const raw = localStorage.getItem(getUserBgStorageKey(username));
+    if (!raw) return { imageUrl: '', dimPercent: 72 };
+    const parsed = JSON.parse(raw);
+    const dim = Number(parsed?.dimPercent);
+    return {
+      imageUrl: typeof parsed?.imageUrl === 'string' ? parsed.imageUrl : '',
+      dimPercent: Number.isFinite(dim) && dim >= 20 && dim <= 95 ? Math.round(dim) : 72,
+    };
+  } catch {
+    return { imageUrl: '', dimPercent: 72 };
+  }
+}
+
+function saveStoredUserBg(username: string, imageUrl: string, dimPercent: number) {
+  try {
+    if (!imageUrl) {
+      localStorage.removeItem(getUserBgStorageKey(username));
+      return;
+    }
+    localStorage.setItem(
+      getUserBgStorageKey(username),
+      JSON.stringify({ imageUrl, dimPercent })
+    );
+  } catch {
+    // ignore storage errors
+  }
+}
+
+async function compressBackgroundImageToDataUrl(file: File): Promise<string> {
+  const rawDataUrl: string = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error('Failed to read image file'));
+    reader.readAsDataURL(file);
+  });
+
+  if (file.type === 'image/gif' && file.size <= 4 * 1024 * 1024) {
+    return rawDataUrl;
+  }
+
+  return await new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const maxDim = 1920;
+      let { width, height } = img;
+      if (width > maxDim || height > maxDim) {
+        const scale = Math.min(maxDim / width, maxDim / height);
+        width = Math.max(1, Math.round(width * scale));
+        height = Math.max(1, Math.round(height * scale));
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        resolve(rawDataUrl);
+        return;
+      }
+      ctx.drawImage(img, 0, 0, width, height);
+      const mime = file.type === 'image/png' ? 'image/webp' : 'image/jpeg';
+      const encoded = canvas.toDataURL(mime, 0.85);
+      resolve(encoded.startsWith('data:image/') ? encoded : rawDataUrl);
+    };
+    img.onerror = () => resolve(rawDataUrl);
+    img.src = rawDataUrl;
+  });
 }
 
 function formatTimerClock(totalSeconds: number): string {
@@ -794,8 +868,9 @@ export const GymApp: React.FC<GymAppProps> = ({
   const [sessionNoteDrafts, setSessionNoteDrafts] = useState<Record<string, string>>({});
   const [savedNoticeId, setSavedNoticeId] = useState<string | null>(null);
 
-  // Auto-complete exercise celebration animation state & manual uncheck override tracking
+  // Auto-complete exercise celebration animation state & manual check/uncheck override tracking
   const manuallyUncheckedRef = useRef<Set<string>>(new Set());
+  const manuallyCheckedRef = useRef<Set<string>>(new Set());
   const autoSaveTimerRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const celebrationClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [justCompletedExKey, setJustCompletedExKey] = useState<string | null>(null);
@@ -821,6 +896,7 @@ export const GymApp: React.FC<GymAppProps> = ({
   const activeTelegramConfigRef = useRef<ReturnType<typeof getTelegramConfig> | null>(null);
   const memberWhitelistStatusRef = useRef<'active' | 'paused' | 'not_whitelisted'>('not_whitelisted');
   const resolvedMemberChatIdRef = useRef<string>('');
+  const hasTelegramUsernameRef = useRef<boolean>(false);
   const [isSendingWaterAlert, setIsSendingWaterAlert] = useState(false);
   const [waterAlertNotice, setWaterAlertNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
@@ -834,6 +910,16 @@ export const GymApp: React.FC<GymAppProps> = ({
   const [bodyWeightChartUnit, setBodyWeightChartUnit] = useState<WeightUnit>(() => matchedAccount?.weightUnitPreference || 'kg');
   const [bodyWeightNoteInput, setBodyWeightNoteInput] = useState<string>('');
   const [bodyWeightNotice, setBodyWeightNotice] = useState<string | null>(null);
+  const [quickWaterWeightInput, setQuickWaterWeightInput] = useState<string>('');
+  const [quickWaterWeightUnit, setQuickWaterWeightUnit] = useState<WeightUnit>(() => matchedAccount?.weightUnitPreference || 'kg');
+
+  // Per-User Custom Website Background Image state
+  const [userBgImageUrl, setUserBgImageUrl] = useState<string>(() => readStoredUserBg(currentUser).imageUrl);
+  const [userBgDimPercent, setUserBgDimPercent] = useState<number>(() => readStoredUserBg(currentUser).dimPercent);
+  const [isUploadingBg, setIsUploadingBg] = useState(false);
+  const [bgFeedback, setBgFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const bgFileInputRef = useRef<HTMLInputElement>(null);
+  const bgDimSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Per-set Rest Timer state (user-controlled countdown + sound variety + background persistence)
   const [defaultRestSeconds, setDefaultRestSeconds] = useState<number>(() => readStoredRestSeconds(currentUser));
@@ -864,6 +950,7 @@ export const GymApp: React.FC<GymAppProps> = ({
 
   // Re-initialize per-user local caches on username switch
   useEffect(() => {
+    setLocalAccountOverride(null);
     const storedWater = readStoredWaterCount(currentUser);
     waterGlassesRef.current = storedWater.count;
     setWaterGlasses(storedWater.count);
@@ -880,7 +967,28 @@ export const GymApp: React.FC<GymAppProps> = ({
     setSetRestTimer(readStoredActiveRestTimer(currentUser));
     setBodyWeightEntries(readStoredBodyWeight(currentUser).entries);
 
+    const localBg = readStoredUserBg(currentUser);
+    setUserBgImageUrl(localBg.imageUrl);
+    setUserBgDimPercent(localBg.dimPercent);
+    setBgFeedback(null);
+
     if (currentUser) {
+      fetch(`/api/profile/background?username=${encodeURIComponent(currentUser)}`)
+        .then(r => (r.ok ? r.json() : null))
+        .then((res) => {
+          if (!res?.success) return;
+          if (res.background?.imageUrl) {
+            const dim = typeof res.background.dimPercent === 'number' ? res.background.dimPercent : 72;
+            setUserBgImageUrl(res.background.imageUrl);
+            setUserBgDimPercent(dim);
+            saveStoredUserBg(currentUser, res.background.imageUrl, dim);
+          } else if (res.background === null) {
+            setUserBgImageUrl('');
+            saveStoredUserBg(currentUser, '', 72);
+          }
+        })
+        .catch(() => {});
+
       fetch('/api/water-intake/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1002,6 +1110,7 @@ export const GymApp: React.FC<GymAppProps> = ({
     sourceFileName?: string;
     hasRpeColumn?: boolean;
     hasRirColumn?: boolean;
+    replaceExistingWeekLogs?: boolean;
     exercises: Array<{
       id?: string;
       day: string;
@@ -1062,7 +1171,7 @@ export const GymApp: React.FC<GymAppProps> = ({
       if (!btn || typeof window === 'undefined') return;
       const rect = btn.getBoundingClientRect();
       const menuWidth = 264;
-      const estMenuHeight = 236;
+      const estMenuHeight = hasTelegramUsernameRef.current ? 236 : 124;
       const left = Math.max(12, Math.min(rect.right - menuWidth, window.innerWidth - menuWidth - 12));
       const spaceBelow = window.innerHeight - rect.bottom;
       const placeAbove = spaceBelow < estMenuHeight && rect.top > estMenuHeight;
@@ -1179,6 +1288,9 @@ export const GymApp: React.FC<GymAppProps> = ({
     };
   }, []);
 
+  const areExerciseInputsComplete = (entries: SetLogEntry[]) =>
+    entries.length > 0 && entries.every(s => (s.weight || '').trim() !== '' && (s.reps || '').trim() !== '');
+
   const updateSetField = (
     plan: WorkoutPlan,
     wk: number,
@@ -1190,6 +1302,7 @@ export const GymApp: React.FC<GymAppProps> = ({
     const dKey = draftKey(plan.id, wk, ex.id);
     if (field === 'weight' || field === 'reps') {
       manuallyUncheckedRef.current.delete(dKey);
+      manuallyCheckedRef.current.delete(dKey);
     }
     const current = getCurrentSetEntries(plan, wk, ex);
     const updated = current.map((s, idx) =>
@@ -1204,13 +1317,16 @@ export const GymApp: React.FC<GymAppProps> = ({
       saveExerciseSets(plan, wk, ex, updated);
       return;
     }
-    // Once all set rows have non-empty reps, auto-commit after a short pause (still instant on blur/Enter)
-    const allRepsEntered = updated.length > 0 && updated.every(s => (s.reps || '').trim() !== '');
-    if (allRepsEntered) {
+    const wKey = weekKey(wk - 1);
+    const wasCompleted = (plan.progress?.[wKey] || []).includes(ex.id);
+    const allComplete = areExerciseInputsComplete(updated);
+    // Auto-commit cleanly when all inputs are filled (triggers check + motivation animation)
+    // OR when inputs return incomplete on an already-checked card (triggers auto-uncheck)
+    if (allComplete || (wasCompleted && !allComplete)) {
       autoSaveTimerRef.current[dKey] = setTimeout(() => {
         delete autoSaveTimerRef.current[dKey];
         saveExerciseSets(plan, wk, ex, updated);
-      }, 800);
+      }, 650);
     }
   };
 
@@ -1218,6 +1334,7 @@ export const GymApp: React.FC<GymAppProps> = ({
     if (!isOwnPlan(plan)) return;
     const dKey = draftKey(plan.id, wk, ex.id);
     manuallyUncheckedRef.current.delete(dKey);
+    manuallyCheckedRef.current.delete(dKey);
     const current = getCurrentSetEntries(plan, wk, ex);
     const planUnit: WeightUnit = plan.defaultWeightUnit || 'kg';
     let next = current;
@@ -1298,10 +1415,11 @@ export const GymApp: React.FC<GymAppProps> = ({
 
     const existingDoneList = plan.progress?.[wKey] || [];
     const wasCompleted = existingDoneList.includes(ex.id);
-    const allSetsAndRepsDone = cleanedEntries.length > 0 && cleanedEntries.every(s => s.reps.trim() !== '');
-    const shouldAutoCheck = allSetsAndRepsDone && !wasCompleted && !manuallyUncheckedRef.current.has(dKey);
+    const allInputsComplete = areExerciseInputsComplete(cleanedEntries);
+    const shouldAutoCheck = allInputsComplete && !wasCompleted && !manuallyUncheckedRef.current.has(dKey);
+    const shouldAutoUncheck = !allInputsComplete && wasCompleted && !manuallyCheckedRef.current.has(dKey);
 
-    if (prevNormalized === nextNormalized && prevLogged?.setEntries && !shouldAutoCheck) {
+    if (prevNormalized === nextNormalized && prevLogged?.setEntries && !shouldAutoCheck && !shouldAutoUncheck) {
       return;
     }
 
@@ -1329,6 +1447,11 @@ export const GymApp: React.FC<GymAppProps> = ({
           ...(plan.progress || {}),
           [wKey]: [...existingDoneList, ex.id],
         }
+      : shouldAutoUncheck
+      ? {
+          ...(plan.progress || {}),
+          [wKey]: existingDoneList.filter(id => id !== ex.id),
+        }
       : plan.progress;
 
     const nextPlan: WorkoutPlan = {
@@ -1347,6 +1470,8 @@ export const GymApp: React.FC<GymAppProps> = ({
       setTimeout(() => setSavedNoticeId(prev => (prev === ex.id ? null : prev)), 2000);
       if (shouldAutoCheck) {
         triggerExerciseCompleteCelebration(dKey);
+      } else if (shouldAutoUncheck) {
+        setJustCompletedExKey(prev => (prev === dKey ? null : prev));
       }
     } catch (err) {
       console.warn('Failed to save exercise sets:', err);
@@ -1505,6 +1630,7 @@ export const GymApp: React.FC<GymAppProps> = ({
     totalSec: number;
     endAtMs: number;
   }) => {
+    if (!hasTelegramUsernameRef.current) return;
     fetch('/api/rest-timer/schedule', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1553,9 +1679,10 @@ export const GymApp: React.FC<GymAppProps> = ({
   }, [setRestTimer?.finished, setRestTimer?.timerKey]);
 
   const persistRestPrefsToProfile = (nextSeconds: number, nextSound: RestSoundType) => {
-    if (!matchedAccount) return;
+    const baseAccount = matchedAccountRef.current;
+    if (!baseAccount || baseAccount.username?.toLowerCase().trim() === 'admin' || !baseAccount.password) return;
     const nextAccount: UserAccount = {
-      ...matchedAccount,
+      ...baseAccount,
       restTimerPrefs: {
         seconds: nextSeconds,
         sound: nextSound,
@@ -2126,7 +2253,7 @@ export const GymApp: React.FC<GymAppProps> = ({
     }).catch(() => {});
 
     const baseAccount = matchedAccountRef.current;
-    if (!baseAccount) return;
+    if (!baseAccount || baseAccount.username?.toLowerCase().trim() === 'admin' || !baseAccount.password) return;
     const nextAccount: UserAccount = {
       ...baseAccount,
       waterIntake: {
@@ -2219,9 +2346,10 @@ export const GymApp: React.FC<GymAppProps> = ({
     setBodyWeightNotice(existingIdx >= 0 ? `Updated ${cleanDate} (${rounded} ${bodyWeightUnitInput})` : `Saved ${rounded} ${bodyWeightUnitInput} for ${cleanDate}`);
     setTimeout(() => setBodyWeightNotice(null), 3500);
 
-    if (matchedAccount) {
+    const baseBwAccount = matchedAccountRef.current;
+    if (baseBwAccount && baseBwAccount.username?.toLowerCase().trim() !== 'admin' && baseBwAccount.password) {
       const nextAccount: UserAccount = {
-        ...matchedAccount,
+        ...baseBwAccount,
         bodyWeightHistory: nextList,
       };
       setLocalAccountOverride(nextAccount);
@@ -2233,9 +2361,10 @@ export const GymApp: React.FC<GymAppProps> = ({
     const nextList = bodyWeightEntries.filter(item => item.id !== entryId);
     setBodyWeightEntries(nextList);
     saveStoredBodyWeight(currentUser, nextList);
-    if (matchedAccount) {
+    const baseBwAccount = matchedAccountRef.current;
+    if (baseBwAccount && baseBwAccount.username?.toLowerCase().trim() !== 'admin' && baseBwAccount.password) {
       const nextAccount: UserAccount = {
-        ...matchedAccount,
+        ...baseBwAccount,
         bodyWeightHistory: nextList,
       };
       setLocalAccountOverride(nextAccount);
@@ -2243,8 +2372,152 @@ export const GymApp: React.FC<GymAppProps> = ({
     }
   };
 
+  const latestBodyWeightInfo = useMemo(() => {
+    if (!bodyWeightEntries || bodyWeightEntries.length === 0) return null;
+    const sorted = [...bodyWeightEntries].sort((a, b) => {
+      const dCmp = a.date.localeCompare(b.date);
+      if (dCmp !== 0) return dCmp;
+      return (a.updatedAt || '').localeCompare(b.updatedAt || '');
+    });
+    const latest = sorted[sorted.length - 1];
+    const weightKg = latest.unit === 'lbs' ? latest.weight * 0.45359237 : latest.weight;
+    return {
+      entry: latest,
+      weightKg: Math.round(weightKg * 10) / 10,
+    };
+  }, [bodyWeightEntries]);
+
+  const waterGoalSummary = useMemo(() => {
+    const GLASS_LITERS = 0.25; // 250 ml per glass
+    if (latestBodyWeightInfo && latestBodyWeightInfo.weightKg > 0) {
+      // Standard hydration baseline: 35 ml (0.035 L) per kg of body weight
+      const targetLiters = Math.min(6.0, Math.max(1.2, Math.round(latestBodyWeightInfo.weightKg * 0.035 * 10) / 10));
+      const targetGlasses = Math.max(4, Math.round(targetLiters / GLASS_LITERS));
+      return {
+        hasWeight: true,
+        weightDisplay: `${latestBodyWeightInfo.entry.weight} ${latestBodyWeightInfo.entry.unit}`,
+        weightKg: latestBodyWeightInfo.weightKg,
+        targetLiters,
+        targetGlasses,
+      };
+    }
+    const defaultLiters = Number((WATER_DAILY_GOAL * GLASS_LITERS).toFixed(1));
+    return {
+      hasWeight: false,
+      weightDisplay: '',
+      weightKg: null as number | null,
+      targetLiters: defaultLiters,
+      targetGlasses: WATER_DAILY_GOAL,
+    };
+  }, [latestBodyWeightInfo]);
+
+  const handleQuickWaterWeightSave = (e: React.FormEvent) => {
+    e.preventDefault();
+    const numeric = parseFloat(quickWaterWeightInput.replace(',', '.'));
+    if (!Number.isFinite(numeric) || numeric <= 0 || numeric > 600) return;
+    const today = getTodayDateKey();
+    const rounded = Math.round(numeric * 10) / 10;
+    const existingIdx = bodyWeightEntries.findIndex(item => item.date === today);
+    const nextEntry: BodyWeightEntry = {
+      id: existingIdx >= 0 ? bodyWeightEntries[existingIdx].id : `bw_${today}_${Date.now().toString(36)}`,
+      date: today,
+      weight: rounded,
+      unit: quickWaterWeightUnit,
+      updatedAt: new Date().toISOString(),
+    };
+    const nextList = (
+      existingIdx >= 0
+        ? bodyWeightEntries.map((item, idx) => (idx === existingIdx ? nextEntry : item))
+        : [...bodyWeightEntries, nextEntry]
+    ).sort((a, b) => a.date.localeCompare(b.date));
+    setBodyWeightEntries(nextList);
+    saveStoredBodyWeight(currentUser, nextList);
+    setQuickWaterWeightInput('');
+
+    const baseBwAccount = matchedAccountRef.current;
+    if (baseBwAccount && baseBwAccount.username?.toLowerCase().trim() !== 'admin' && baseBwAccount.password) {
+      const nextAccount: UserAccount = {
+        ...baseBwAccount,
+        bodyWeightHistory: nextList,
+      };
+      setLocalAccountOverride(nextAccount);
+      saveUserAccountDoc(nextAccount).catch(() => {});
+    }
+  };
+
+  const handleUploadBgFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setBgFeedback(null);
+    if (!file.type.startsWith('image/')) {
+      setBgFeedback({ type: 'error', text: 'Please select an image file (PNG, JPG, WEBP, GIF).' });
+      return;
+    }
+    setIsUploadingBg(true);
+    try {
+      const dataUrl = await compressBackgroundImageToDataUrl(file);
+      const res = await fetch('/api/profile/background', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: currentUser,
+          fileName: file.name,
+          dataUrl,
+          dimPercent: userBgDimPercent,
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok || !json?.success || !json.background?.imageUrl) {
+        throw new Error(json?.error || 'Upload failed');
+      }
+      setUserBgImageUrl(json.background.imageUrl);
+      const nextDim = typeof json.background.dimPercent === 'number' ? json.background.dimPercent : userBgDimPercent;
+      setUserBgDimPercent(nextDim);
+      saveStoredUserBg(currentUser, json.background.imageUrl, nextDim);
+      setBgFeedback({ type: 'success', text: 'Your personal website background has been updated!' });
+      setTimeout(() => setBgFeedback(null), 4000);
+    } catch (err: any) {
+      setBgFeedback({ type: 'error', text: err?.message || 'Failed to upload background image.' });
+    } finally {
+      setIsUploadingBg(false);
+      if (bgFileInputRef.current) bgFileInputRef.current.value = '';
+    }
+  };
+
+  const handleBgDimChange = (nextDim: number) => {
+    const clamped = Math.min(95, Math.max(20, Math.round(nextDim)));
+    setUserBgDimPercent(clamped);
+    saveStoredUserBg(currentUser, userBgImageUrl, clamped);
+    if (bgDimSaveTimerRef.current) clearTimeout(bgDimSaveTimerRef.current);
+    bgDimSaveTimerRef.current = setTimeout(() => {
+      if (!userBgImageUrl) return;
+      fetch('/api/profile/background', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: currentUser, dimPercent: clamped }),
+      }).catch(() => {});
+    }, 350);
+  };
+
+  const handleRemoveUserBg = async () => {
+    setBgFeedback(null);
+    setUserBgImageUrl('');
+    saveStoredUserBg(currentUser, '', 72);
+    try {
+      await fetch(`/api/profile/background?username=${encodeURIComponent(currentUser)}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: currentUser }),
+      });
+      setBgFeedback({ type: 'success', text: 'Background reset to default dark theme.' });
+      setTimeout(() => setBgFeedback(null), 3500);
+    } catch {
+      // local state already cleared
+    }
+  };
+
   const dispatchWaterTelegramAlert = async (manual = false) => {
-    if (isSendingWaterAlert) return;
+    if (isSendingWaterAlert || !hasTelegramUsernameRef.current) return;
     const tgCfg = activeTelegramConfigRef.current || activeTelegramConfig;
     const wlStatus = memberWhitelistStatusRef.current;
     const targetChat = resolvedMemberChatIdRef.current || resolvedMemberChatId;
@@ -2282,14 +2555,15 @@ export const GymApp: React.FC<GymAppProps> = ({
 
     setIsSendingWaterAlert(true);
     try {
+      const targetGlasses = waterGoalSummary.targetGlasses;
       const note =
-        liveGlasses >= WATER_DAILY_GOAL
+        liveGlasses >= targetGlasses
           ? 'Great work staying hydrated!'
           : 'Time for another glass of water to fuel your recovery!';
       const msg = formatWaterIntakeTelegramMessage(
         displayName,
         liveGlasses,
-        WATER_DAILY_GOAL,
+        targetGlasses,
         note
       );
       const res = await sendDirectTelegramMessage(tgCfg.botToken, targetChat, msg);
@@ -2439,8 +2713,10 @@ export const GymApp: React.FC<GymAppProps> = ({
     const wasChecked = current.includes(exerciseId);
     if (wasChecked) {
       manuallyUncheckedRef.current.add(dKey);
+      manuallyCheckedRef.current.delete(dKey);
     } else {
       manuallyUncheckedRef.current.delete(dKey);
+      manuallyCheckedRef.current.add(dKey);
     }
     const updated = wasChecked
       ? current.filter((id) => id !== exerciseId)
@@ -2499,7 +2775,7 @@ export const GymApp: React.FC<GymAppProps> = ({
   };
 
   const handleSendSheetToTelegram = async (plan: WorkoutPlan, format: 'pdf' | 'excel') => {
-    if (!isOwnPlan(plan) || isSendingSheetToBot) return;
+    if (!isOwnPlan(plan) || isSendingSheetToBot || !hasTelegramUsername) return;
     setOpenExportMenu(null);
     const botToken = activeTelegramConfig.botToken?.trim();
     if (!botToken) {
@@ -2624,34 +2900,36 @@ export const GymApp: React.FC<GymAppProps> = ({
                 </div>
               </button>
 
-              <div className="border-t border-white/10 my-1 pt-1 space-y-1">
-                <button
-                  type="button"
-                  role="menuitem"
-                  disabled={isSendingSheetToBot !== null}
-                  onClick={() => handleSendSheetToTelegram(plan, 'pdf')}
-                  className="w-full flex items-start gap-2.5 px-3 py-2 rounded-lg hover:bg-sky-500/15 disabled:opacity-50 text-left transition-colors cursor-pointer"
-                >
-                  <Send className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
-                  <div className="min-w-0">
-                    <div className="text-xs font-bold text-white">Send PDF to Telegram Bot</div>
-                    <div className="text-[11px] text-neutral-400 leading-snug">Delivers .pdf file to your bot chat</div>
-                  </div>
-                </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  disabled={isSendingSheetToBot !== null}
-                  onClick={() => handleSendSheetToTelegram(plan, 'excel')}
-                  className="w-full flex items-start gap-2.5 px-3 py-2 rounded-lg hover:bg-sky-500/15 disabled:opacity-50 text-left transition-colors cursor-pointer"
-                >
-                  <Send className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
-                  <div className="min-w-0">
-                    <div className="text-xs font-bold text-white">Send Excel to Telegram Bot</div>
-                    <div className="text-[11px] text-neutral-400 leading-snug">Delivers .xlsx sheet to your bot chat</div>
-                  </div>
-                </button>
-              </div>
+              {hasTelegramUsername && (
+                <div className="border-t border-white/10 my-1 pt-1 space-y-1">
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={isSendingSheetToBot !== null}
+                    onClick={() => handleSendSheetToTelegram(plan, 'pdf')}
+                    className="w-full flex items-start gap-2.5 px-3 py-2 rounded-lg hover:bg-sky-500/15 disabled:opacity-50 text-left transition-colors cursor-pointer"
+                  >
+                    <Send className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold text-white">Send PDF to Telegram Bot</div>
+                      <div className="text-[11px] text-neutral-400 leading-snug">Delivers .pdf file to your bot chat</div>
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={isSendingSheetToBot !== null}
+                    onClick={() => handleSendSheetToTelegram(plan, 'excel')}
+                    className="w-full flex items-start gap-2.5 px-3 py-2 rounded-lg hover:bg-sky-500/15 disabled:opacity-50 text-left transition-colors cursor-pointer"
+                  >
+                    <Send className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold text-white">Send Excel to Telegram Bot</div>
+                      <div className="text-[11px] text-neutral-400 leading-snug">Delivers .xlsx sheet to your bot chat</div>
+                    </div>
+                  </button>
+                </div>
+              )}
             </div>,
             document.body
           )
@@ -2669,7 +2947,11 @@ export const GymApp: React.FC<GymAppProps> = ({
           aria-haspopup="menu"
           aria-label={`Export ${plan.title} as PDF or Excel`}
           className={buttonClasses}
-          title="Export workout plan as PDF or Excel (.xlsx), or send directly to Telegram Bot"
+          title={
+            hasTelegramUsername
+              ? 'Export workout plan as PDF or Excel (.xlsx), or send directly to Telegram Bot'
+              : 'Export workout plan as PDF or Excel (.xlsx)'
+          }
         >
           {busy ? (
             <Loader2 className={`w-3.5 h-3.5 animate-spin ${variant === 'hero' ? 'text-white' : 'text-red-400'}`} />
@@ -2685,16 +2967,24 @@ export const GymApp: React.FC<GymAppProps> = ({
     );
   };
 
-  // Helper to get or build the writable UserAccount document for currentUser
-  const getWritableAccount = (): UserAccount => {
-    if (matchedAccount) return { ...matchedAccount };
-    return {
-      id: `user_${currentUser.toLowerCase().trim().replace(/[^a-z0-9_-]+/g, '_')}`,
-      username: currentUser,
-      displayName: resolvedDisplayName,
-      role: 'user',
-      gender: profileGender,
-    };
+  // Helper to resolve the canonical writable UserAccount document for currentUser
+  const resolveWritableAccount = async (): Promise<UserAccount | null> => {
+    if (matchedAccountRef.current) return { ...matchedAccountRef.current };
+    const clean = (currentUser || '').toLowerCase().trim();
+    if (!clean || clean === 'admin') return null;
+    try {
+      const fsUsers = await getFirestoreUserAccounts();
+      const found = fsUsers.find(
+        u =>
+          u.username?.toLowerCase().trim() === clean ||
+          u.id?.toLowerCase().trim() === clean ||
+          u.id?.toLowerCase().trim() === `user_${clean}`
+      );
+      if (found) return { ...found };
+    } catch {
+      // ignore lookup error
+    }
+    return null;
   };
 
   const handleSaveProfileDetails = async (e: React.FormEvent) => {
@@ -2707,8 +2997,13 @@ export const GymApp: React.FC<GymAppProps> = ({
     }
     setIsSavingProfile(true);
     try {
+      const baseAccount = await resolveWritableAccount();
+      if (!baseAccount) {
+        setProfileFeedback({ type: 'error', text: 'Account profile is still syncing. Please wait a moment and try again.' });
+        return;
+      }
       const nextAccount: UserAccount = {
-        ...getWritableAccount(),
+        ...baseAccount,
         displayName: trimmedName,
         gender: profileGender,
         weightUnitPreference: profileWeightUnit,
@@ -2750,7 +3045,11 @@ export const GymApp: React.FC<GymAppProps> = ({
       return;
     }
 
-    const baseAccount = getWritableAccount();
+    const baseAccount = await resolveWritableAccount();
+    if (!baseAccount) {
+      setPasswordFeedback({ type: 'error', text: 'Account profile is still syncing. Please wait a moment and try again.' });
+      return;
+    }
     if (baseAccount.password) {
       const oldMatches = await verifyPassword(oldPasswordInput, baseAccount.password);
       if (!oldMatches) {
@@ -2772,11 +3071,13 @@ export const GymApp: React.FC<GymAppProps> = ({
       setNewPasswordInput('');
       setConfirmPasswordInput('');
       await logActivity(currentUser, 'password_changed', `Member "${currentUser}" changed their account password.`).catch(() => {});
-      sendTelegramAlert(
-        formatSecurityAlertTelegramMessage(currentUser, 'password_changed', `Password updated for member "${resolvedDisplayName}" (@${currentUser}).`),
-        'security',
-        { targetUsername: currentUser, adminSettings, userAccounts: [...userAccounts.filter(u => u.id !== updatedAccount.id), updatedAccount] }
-      ).catch(() => {});
+      if (hasTelegramUsername) {
+        sendTelegramAlert(
+          formatSecurityAlertTelegramMessage(currentUser, 'password_changed', `Password updated for member "${resolvedDisplayName}" (@${currentUser}).`),
+          'security',
+          { targetUsername: currentUser, adminSettings, userAccounts: [...userAccounts.filter(u => u.id !== updatedAccount.id), updatedAccount] }
+        ).catch(() => {});
+      }
       setPasswordFeedback({ type: 'success', text: 'Password updated securely!' });
       setTimeout(() => setPasswordFeedback(null), 5000);
     } catch (err: any) {
@@ -2836,12 +3137,15 @@ export const GymApp: React.FC<GymAppProps> = ({
     return matchingAuth?.chatId?.trim() || '';
   }, [tgChatIdInput, matchedAccount?.telegramChatId, activeTelegramConfig.authorizedUsers, currentUser, tgUsernameInput]);
 
+  const hasTelegramUsername = Boolean((matchedAccount?.telegramUsername || '').trim());
+
   activeTelegramConfigRef.current = activeTelegramConfig;
   memberWhitelistStatusRef.current = memberWhitelistStatus;
   resolvedMemberChatIdRef.current = resolvedMemberChatId;
+  hasTelegramUsernameRef.current = hasTelegramUsername;
 
   useEffect(() => {
-    if (!waterReminderEnabled) return;
+    if (!hasTelegramUsername || !waterReminderEnabled) return;
     if (memberWhitelistStatus !== 'active' || !resolvedMemberChatId) return;
     if (!activeTelegramConfig.enabled || activeTelegramConfig.notifyWater === false || !activeTelegramConfig.botToken.trim()) return;
 
@@ -2851,6 +3155,7 @@ export const GymApp: React.FC<GymAppProps> = ({
     }, intervalMs);
     return () => window.clearInterval(timer);
   }, [
+    hasTelegramUsername,
     waterReminderEnabled,
     waterReminderIntervalMinutes,
     memberWhitelistStatus,
@@ -2870,8 +3175,13 @@ export const GymApp: React.FC<GymAppProps> = ({
 
     setIsSavingTelegram(true);
     try {
+      const baseAccount = await resolveWritableAccount();
+      if (!baseAccount) {
+        setTelegramFeedback({ type: 'error', text: 'Account profile is still syncing. Please wait a moment and try again.' });
+        return;
+      }
       const nextAccount: UserAccount = {
-        ...getWritableAccount(),
+        ...baseAccount,
         telegramUsername: cleanHandle || undefined,
         telegramChatId: cleanChatId || undefined,
         telegramNotificationsEnabled: tgNotificationsEnabled,
@@ -3007,8 +3317,12 @@ export const GymApp: React.FC<GymAppProps> = ({
   };
 
   const handleSaveMember2FA = async (secret: string, backupCodes: string[]) => {
+    const baseAccount = await resolveWritableAccount();
+    if (!baseAccount) {
+      throw new Error('Account profile is still syncing. Please try again in a moment.');
+    }
     const nextAccount: UserAccount = {
-      ...getWritableAccount(),
+      ...baseAccount,
       twoFactorEnabled: true,
       twoFactorSecret: secret,
       twoFactorBackupCodes: backupCodes,
@@ -3020,8 +3334,12 @@ export const GymApp: React.FC<GymAppProps> = ({
   };
 
   const handleDisableMember2FA = async () => {
+    const baseAccount = await resolveWritableAccount();
+    if (!baseAccount) {
+      throw new Error('Account profile is still syncing. Please try again in a moment.');
+    }
     const nextAccount: UserAccount = {
-      ...getWritableAccount(),
+      ...baseAccount,
       twoFactorEnabled: false,
       twoFactorSecret: '',
       twoFactorBackupCodes: [],
@@ -3154,13 +3472,14 @@ export const GymApp: React.FC<GymAppProps> = ({
               sourceFileName: file.name,
               hasRpeColumn: bestWorkoutTab.hasRpeColumn,
               hasRirColumn: bestWorkoutTab.hasRirColumn,
+              replaceExistingWeekLogs: prev.replaceExistingWeekLogs ?? false,
               instructions: infoText || prev.instructions,
               exercises: mappedExercises,
             }
           : prev
       );
       setWorksheetImportNotice(
-        `Loaded ${mappedExercises.length} exercises from "${file.name}" (${usedExistingIds.size} matched to keep saved data${prefilledCount > 0 ? `, ${prefilledCount} rows with sheet data ready to fill empty slots` : ''}). Click Save Worksheet to apply.`
+        `Loaded ${mappedExercises.length} exercises from "${file.name}" (${usedExistingIds.size} matched to keep saved data${prefilledCount > 0 ? `, ${prefilledCount} rows with sheet data ready to import` : ''}). Click Save Worksheet to apply.`
       );
     } catch (err: any) {
       setWorksheetImportNotice(`Failed to read file: ${err?.message || String(err)}`);
@@ -3182,8 +3501,9 @@ export const GymApp: React.FC<GymAppProps> = ({
         sourceFileName: worksheetDraft.sourceFileName,
         hasRpeColumn: worksheetDraft.hasRpeColumn,
         hasRirColumn: worksheetDraft.hasRirColumn,
+        replaceExistingWeekLogs: Boolean(worksheetDraft.replaceExistingWeekLogs),
         exercises: worksheetDraft.exercises.map(row => {
-          const split = splitSetsAndReps(row.sets);
+          const split = splitSetsAndReps(row.sets, false);
           return {
             id: row.id,
             day: row.day,
@@ -3459,8 +3779,19 @@ export const GymApp: React.FC<GymAppProps> = ({
             </div>
 
             {worksheetImportNotice && (
-              <div className="text-xs text-sky-200 bg-sky-950/40 border border-sky-500/30 rounded-xl px-3 py-2">
-                {worksheetImportNotice}
+              <div className="text-xs text-sky-200 bg-sky-950/40 border border-sky-500/30 rounded-xl px-3 py-2 flex flex-wrap items-center justify-between gap-2">
+                <span>{worksheetImportNotice}</span>
+                {worksheetDraft.exercises.some(m => m.weeklyLogs || m.loggedWeight || m.loggedReps || m.completed) && (
+                  <label className="inline-flex items-center gap-2 text-[11px] font-semibold text-amber-200 bg-black/40 border border-amber-400/30 rounded-lg px-2.5 py-1 cursor-pointer shrink-0">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(worksheetDraft.replaceExistingWeekLogs)}
+                      onChange={(e) => setWorksheetDraft({ ...worksheetDraft, replaceExistingWeekLogs: e.target.checked })}
+                      className="accent-amber-500 w-3.5 h-3.5 cursor-pointer"
+                    />
+                    Overwrite existing week logs from file
+                  </label>
+                )}
               </div>
             )}
 
@@ -3537,7 +3868,7 @@ export const GymApp: React.FC<GymAppProps> = ({
                     <th className="px-2 py-2 w-20">Sets</th>
                     <th className="px-2 py-2 w-24">Reps</th>
                     <th className="px-2 py-2 w-20">RPE</th>
-                    <th className="px-2 py-2 w-20">RIR</th>
+                    <th className="px-2 py-2 w-20">RIR / RIP</th>
                     <th className="px-2 py-2">Notes</th>
                     <th className="px-2 py-2 w-56">Video URL</th>
                     <th className="px-2 py-2 w-10"></th>
@@ -5396,8 +5727,15 @@ export const GymApp: React.FC<GymAppProps> = ({
         </div>
       </div>
 
-      {/* WORKOUT HYDRATION / WATER INTAKE TRACKER + TELEGRAM WATER ALERTS */}
-      <div className="rounded-2xl border border-white/10 bg-neutral-900/70 p-4 sm:p-5 space-y-3">
+      {/* WORKOUT HYDRATION / WATER INTAKE TRACKER + BODY-WEIGHT LITERS CALCULATION */}
+      {(() => {
+        const targetGlasses = waterGoalSummary.targetGlasses;
+        const targetLiters = waterGoalSummary.targetLiters;
+        const consumedLiters = Number((waterGlasses * 0.25).toFixed(2));
+        const remainingLiters = Math.max(0, Number((targetLiters - consumedLiters).toFixed(2)));
+        const pct = Math.min(100, Math.round((waterGlasses / Math.max(1, targetGlasses)) * 100));
+        return (
+      <div className="rounded-2xl border border-white/10 bg-neutral-900/75 backdrop-blur-sm p-4 sm:p-5 space-y-3">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div className="flex items-start gap-3 min-w-0">
             <div className="p-2.5 rounded-xl bg-sky-500/15 border border-sky-500/25 text-sky-400 shrink-0">
@@ -5406,22 +5744,60 @@ export const GymApp: React.FC<GymAppProps> = ({
             <div className="min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
                 <h2 className="text-sm font-bold text-white">Water Intake</h2>
+                <span className="text-xs font-mono font-bold text-sky-300 bg-sky-500/15 border border-sky-500/25 px-2 py-0.5 rounded-md tabular-nums">
+                  {consumedLiters} / {targetLiters} L
+                </span>
                 <span className="text-xs text-neutral-400">
-                  Today <span aria-hidden="true">·</span> {waterGlasses >= WATER_DAILY_GOAL ? 'Daily goal reached' : `Goal: ${WATER_DAILY_GOAL} glasses`}
+                  {waterGlasses >= targetGlasses ? 'Daily target reached!' : `${remainingLiters} L left`}
                 </span>
               </div>
-              <div className="mt-2 flex items-center gap-3">
+              <div className="mt-2 flex items-center gap-3 flex-wrap">
                 <div className="h-2 w-40 sm:w-56 rounded-full bg-neutral-800 overflow-hidden">
                   <div
                     className={`h-full transition-all duration-200 ${
-                      waterGlasses >= WATER_DAILY_GOAL ? 'bg-emerald-500' : 'bg-sky-500'
+                      waterGlasses >= targetGlasses ? 'bg-emerald-500' : 'bg-sky-500'
                     }`}
-                    style={{ width: `${Math.min(100, Math.round((waterGlasses / WATER_DAILY_GOAL) * 100))}%` }}
+                    style={{ width: `${pct}%` }}
                   />
                 </div>
                 <span className="text-xs font-mono tabular-nums text-sky-300 font-semibold">
-                  {waterGlasses} / {WATER_DAILY_GOAL} glasses
+                  {waterGlasses} / {targetGlasses} glasses <span className="text-neutral-500">(250ml)</span>
                 </span>
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-neutral-400">
+                {waterGoalSummary.hasWeight ? (
+                  <span className="inline-flex items-center gap-1.5 text-sky-200/90 bg-sky-950/40 border border-sky-500/25 rounded-lg px-2 py-0.5">
+                    <Scale className="w-3 h-3 text-sky-400" />
+                    Calculated from body weight ({waterGoalSummary.weightDisplay} × 35 ml/kg = <strong className="text-white">{targetLiters} L/day</strong>)
+                  </span>
+                ) : (
+                  <form onSubmit={handleQuickWaterWeightSave} className="inline-flex flex-wrap items-center gap-1.5">
+                    <span className="text-neutral-400">Enter weight to auto-calculate L/day:</span>
+                    <input
+                      type="number"
+                      step="0.1"
+                      min="20"
+                      max="400"
+                      value={quickWaterWeightInput}
+                      onChange={(e) => setQuickWaterWeightInput(e.target.value)}
+                      placeholder="e.g. 75"
+                      className="w-20 h-7 bg-neutral-950 border border-white/15 focus:border-sky-500/60 rounded-lg px-2 text-xs text-white font-mono outline-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setQuickWaterWeightUnit(u => (u === 'kg' ? 'lbs' : 'kg'))}
+                      className="h-7 px-2 rounded-lg bg-white/10 hover:bg-white/20 text-[10px] font-bold uppercase text-neutral-200 cursor-pointer"
+                    >
+                      {quickWaterWeightUnit}
+                    </button>
+                    <button
+                      type="submit"
+                      className="h-7 px-2.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-bold cursor-pointer"
+                    >
+                      Calculate
+                    </button>
+                  </form>
+                )}
               </div>
             </div>
           </div>
@@ -5470,95 +5846,99 @@ export const GymApp: React.FC<GymAppProps> = ({
           </div>
         </div>
 
-        {/* Telegram Water Intake Alert Controls (Easy minutes including 5m + persistent ON/OFF) */}
-        <div className="pt-3 border-t border-white/10 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
-          <div className="flex flex-wrap items-center gap-1.5">
-            <button
-              type="button"
-              onClick={() => saveWaterReminderPrefs(!waterReminderEnabled, waterReminderIntervalMinutes)}
-              className={`h-8 px-3 rounded-lg border text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer transition-colors ${
-                waterReminderEnabled
-                  ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-200'
-                  : 'bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300'
-              }`}
-            >
-              <Bell className={`w-3.5 h-3.5 ${waterReminderEnabled ? 'text-emerald-400' : 'text-sky-400'}`} />
-              <span>Bot Reminder: {waterReminderEnabled ? 'ON' : 'OFF'}</span>
-            </button>
+        {/* Telegram Water Intake Alert Controls (only shown when member has a Telegram username) */}
+        {hasTelegramUsername && (
+          <div className="pt-3 border-t border-white/10 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => saveWaterReminderPrefs(!waterReminderEnabled, waterReminderIntervalMinutes)}
+                className={`h-8 px-3 rounded-lg border text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer transition-colors ${
+                  waterReminderEnabled
+                    ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-200'
+                    : 'bg-white/5 hover:bg-white/10 border-white/10 text-neutral-300'
+                }`}
+              >
+                <Bell className={`w-3.5 h-3.5 ${waterReminderEnabled ? 'text-emerald-400' : 'text-sky-400'}`} />
+                <span>Bot Reminder: {waterReminderEnabled ? 'ON' : 'OFF'}</span>
+              </button>
 
-            <div className="flex flex-wrap items-center gap-1">
-              {WATER_REMINDER_PRESETS.map((mins) => {
-                const isSelected = waterReminderIntervalMinutes === mins;
-                return (
-                  <button
-                    key={mins}
-                    type="button"
-                    onClick={() => saveWaterReminderPrefs(waterReminderEnabled, mins)}
-                    className={`h-7 px-2 rounded-lg text-[11px] font-mono tabular-nums font-bold border cursor-pointer transition-colors ${
-                      isSelected
-                        ? 'bg-sky-500/25 border-sky-400/60 text-sky-200'
-                        : 'bg-neutral-950 border-white/10 text-neutral-400 hover:text-white'
-                    }`}
-                  >
-                    {mins}m
-                  </button>
-                );
-              })}
+              <div className="flex flex-wrap items-center gap-1">
+                {WATER_REMINDER_PRESETS.map((mins) => {
+                  const isSelected = waterReminderIntervalMinutes === mins;
+                  return (
+                    <button
+                      key={mins}
+                      type="button"
+                      onClick={() => saveWaterReminderPrefs(waterReminderEnabled, mins)}
+                      className={`h-7 px-2 rounded-lg text-[11px] font-mono tabular-nums font-bold border cursor-pointer transition-colors ${
+                        isSelected
+                          ? 'bg-sky-500/25 border-sky-400/60 text-sky-200'
+                          : 'bg-neutral-950 border-white/10 text-neutral-400 hover:text-white'
+                      }`}
+                    >
+                      {mins}m
+                    </button>
+                  );
+                })}
 
-              <div className="flex items-center gap-1 ml-1">
-                <input
-                  type="number"
-                  min={1}
-                  max={1440}
-                  value={customWaterIntervalInput}
-                  onChange={(e) => {
-                    const raw = e.target.value;
-                    setCustomWaterIntervalInput(raw);
-                    const n = parseInt(raw, 10);
-                    if (Number.isFinite(n) && n >= 1 && n <= 1440) {
-                      saveWaterReminderPrefs(waterReminderEnabled, n);
-                    }
-                  }}
-                  onBlur={() => {
-                    const n = parseInt(customWaterIntervalInput, 10);
-                    if (!Number.isFinite(n) || n < 1) {
-                      setCustomWaterIntervalInput(String(waterReminderIntervalMinutes));
-                    } else {
-                      saveWaterReminderPrefs(waterReminderEnabled, n);
-                    }
-                  }}
-                  aria-label="Custom water reminder interval in minutes"
-                  className="w-14 h-7 bg-neutral-950 border border-white/15 focus:border-sky-500/70 rounded-lg px-1.5 text-[11px] font-mono tabular-nums text-sky-200 text-center outline-none"
-                />
-                <span className="text-[10px] font-mono text-neutral-500">min</span>
+                <div className="flex items-center gap-1 ml-1">
+                  <input
+                    type="number"
+                    min={1}
+                    max={1440}
+                    value={customWaterIntervalInput}
+                    onChange={(e) => {
+                      const raw = e.target.value;
+                      setCustomWaterIntervalInput(raw);
+                      const n = parseInt(raw, 10);
+                      if (Number.isFinite(n) && n >= 1 && n <= 1440) {
+                        saveWaterReminderPrefs(waterReminderEnabled, n);
+                      }
+                    }}
+                    onBlur={() => {
+                      const n = parseInt(customWaterIntervalInput, 10);
+                      if (!Number.isFinite(n) || n < 1) {
+                        setCustomWaterIntervalInput(String(waterReminderIntervalMinutes));
+                      } else {
+                        saveWaterReminderPrefs(waterReminderEnabled, n);
+                      }
+                    }}
+                    aria-label="Custom water reminder interval in minutes"
+                    className="w-14 h-7 bg-neutral-950 border border-white/15 focus:border-sky-500/70 rounded-lg px-1.5 text-[11px] font-mono tabular-nums text-sky-200 text-center outline-none"
+                  />
+                  <span className="text-[10px] font-mono text-neutral-500">min</span>
+                </div>
               </div>
             </div>
-          </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            {waterReminderEnabled && (
-              <span className="text-[10px] font-mono text-emerald-300/90">
-                Active every {waterReminderIntervalMinutes}m (even when closed)
-              </span>
-            )}
-            {waterAlertNotice && (
-              <span className={`text-[11px] font-mono ${waterAlertNotice.type === 'success' ? 'text-emerald-300' : 'text-rose-300'}`}>
-                {waterAlertNotice.text}
-              </span>
-            )}
-            <button
-              type="button"
-              disabled={isSendingWaterAlert}
-              onClick={() => dispatchWaterTelegramAlert(true)}
-              className="h-8 px-3 rounded-lg bg-sky-600/20 hover:bg-sky-600/35 disabled:opacity-50 border border-sky-500/35 text-sky-200 text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
-              title="Send your water intake progress & hydration reminder to your Telegram bot chat"
-            >
-              {isSendingWaterAlert ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
-              <span>Send Alert to Bot</span>
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              {waterReminderEnabled && (
+                <span className="text-[10px] font-mono text-emerald-300/90">
+                  Active every {waterReminderIntervalMinutes}m (even when closed)
+                </span>
+              )}
+              {waterAlertNotice && (
+                <span className={`text-[11px] font-mono ${waterAlertNotice.type === 'success' ? 'text-emerald-300' : 'text-rose-300'}`}>
+                  {waterAlertNotice.text}
+                </span>
+              )}
+              <button
+                type="button"
+                disabled={isSendingWaterAlert}
+                onClick={() => dispatchWaterTelegramAlert(true)}
+                className="h-8 px-3 rounded-lg bg-sky-600/20 hover:bg-sky-600/35 disabled:opacity-50 border border-sky-500/35 text-sky-200 text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                title="Send your water intake progress & hydration reminder to your Telegram bot chat"
+              >
+                {isSendingWaterAlert ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+                <span>Send Alert to Bot</span>
+              </button>
+            </div>
           </div>
-        </div>
+        )}
       </div>
+        );
+      })()}
 
       {/* ACTIVE WORKOUT DIRECTLY IN DASHBOARD FOR EASY TRAINING (MODIFICATIONS HIDDEN — USE MY WORKOUTS TO EDIT) */}
       {myPlans.length === 0 ? (
@@ -5659,6 +6039,27 @@ export const GymApp: React.FC<GymAppProps> = ({
               {minVal !== null && maxVal !== null ? `${minVal}–${maxVal} ${bodyWeightChartUnit}` : 'No entries'}
             </div>
             <div className="text-[10px] text-neutral-500 mt-0.5">{chartData.length} check-in{chartData.length === 1 ? '' : 's'}</div>
+          </div>
+        </div>
+
+        {/* Daily Hydration Target calculated from body weight */}
+        <div className="rounded-2xl border border-sky-500/25 bg-sky-950/20 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <div className="p-2 rounded-xl bg-sky-500/15 border border-sky-500/30 text-sky-400 shrink-0">
+              <Droplets className="w-4 h-4" />
+            </div>
+            <div>
+              <div className="text-xs font-bold text-white">Daily Water Target (Based on Body Weight)</div>
+              <div className="text-[11px] text-neutral-400">
+                {waterGoalSummary.hasWeight
+                  ? `${waterGoalSummary.weightDisplay} × 35 ml/kg = ${waterGoalSummary.targetLiters} L/day (${waterGoalSummary.targetGlasses} × 250ml glasses)`
+                  : `Default ${waterGoalSummary.targetLiters} L/day — log your body weight below to personalize your liter target`}
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 font-mono tabular-nums">
+            <span className="text-base font-black text-sky-300">{waterGoalSummary.targetLiters} L</span>
+            <span className="text-[11px] text-neutral-400">/ day</span>
           </div>
         </div>
 
@@ -6312,15 +6713,144 @@ export const GymApp: React.FC<GymAppProps> = ({
               {is2FAEnabled ? 'Manage 2FA & Backup Codes' : 'Enable Two-Factor Authentication'}
             </button>
           </div>
+
+          {/* 5. Custom Website Background Image (Isolated Per User) */}
+          <div className="lg:col-span-2 rounded-2xl border border-white/10 bg-neutral-900/70 p-5 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 rounded-xl bg-fuchsia-500/15 border border-fuchsia-500/25 text-fuchsia-400">
+                  <ImageIcon className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white">Website Background Image</h3>
+                  <p className="text-[11px] text-neutral-400">
+                    Customize the website background exclusively for <span className="text-neutral-200 font-mono">@{currentUser}</span>
+                  </p>
+                </div>
+              </div>
+              {userBgImageUrl && (
+                <span className="text-[10px] font-mono px-2.5 py-0.5 rounded-full bg-fuchsia-500/15 border border-fuchsia-500/30 text-fuchsia-200">
+                  Custom Background Active
+                </span>
+              )}
+            </div>
+
+            {bgFeedback && (
+              <div className={`p-3 rounded-xl text-xs flex items-center gap-2 border ${
+                bgFeedback.type === 'success'
+                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                  : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+              }`}>
+                {bgFeedback.type === 'success' ? <CheckCircle2 className="w-4 h-4 shrink-0" /> : <AlertCircle className="w-4 h-4 shrink-0" />}
+                <span>{bgFeedback.text}</span>
+              </div>
+            )}
+
+            <input
+              ref={bgFileInputRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp,image/gif,image/*"
+              onChange={handleUploadBgFile}
+              className="hidden"
+            />
+
+            <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-center">
+              <div className="md:col-span-5">
+                <div className="relative h-36 rounded-xl overflow-hidden border border-white/15 bg-neutral-950 flex items-center justify-center">
+                  {userBgImageUrl ? (
+                    <>
+                      <div
+                        className="absolute inset-0 bg-cover bg-center bg-no-repeat"
+                        style={{ backgroundImage: `url("${userBgImageUrl}")` }}
+                      />
+                      <div
+                        className="absolute inset-0 bg-black"
+                        style={{ opacity: userBgDimPercent / 100 }}
+                      />
+                      <div className="relative z-10 px-3 py-1 rounded-lg bg-black/60 border border-white/15 text-[11px] font-semibold text-white">
+                        Preview ({userBgDimPercent}% dim overlay)
+                      </div>
+                    </>
+                  ) : (
+                    <div className="text-center px-4 space-y-1">
+                      <ImageIcon className="w-6 h-6 text-neutral-600 mx-auto" />
+                      <p className="text-xs font-semibold text-neutral-400">Default Dark Theme</p>
+                      <p className="text-[10px] text-neutral-500">Only visible to your account when uploaded</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="md:col-span-7 space-y-3.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={isUploadingBg}
+                    onClick={() => bgFileInputRef.current?.click()}
+                    className="py-2.5 px-4 rounded-xl bg-fuchsia-600 hover:bg-fuchsia-500 disabled:opacity-50 text-white text-xs font-bold inline-flex items-center gap-2 cursor-pointer shadow-lg shadow-fuchsia-950/30"
+                  >
+                    {isUploadingBg ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+                    {userBgImageUrl ? 'Change Background Image' : 'Upload Background Image'}
+                  </button>
+
+                  {userBgImageUrl && (
+                    <button
+                      type="button"
+                      disabled={isUploadingBg}
+                      onClick={handleRemoveUserBg}
+                      className="py-2.5 px-4 rounded-xl bg-white/5 hover:bg-red-500/20 border border-white/15 hover:border-red-500/40 text-neutral-300 hover:text-red-200 text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      Remove Background
+                    </button>
+                  )}
+                </div>
+
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="uppercase tracking-wider text-neutral-400 font-semibold">
+                      Background Dim / Readability Overlay
+                    </span>
+                    <span className="font-mono text-fuchsia-300 font-bold">{userBgDimPercent}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={20}
+                    max={95}
+                    step={5}
+                    value={userBgDimPercent}
+                    onChange={(e) => handleBgDimChange(Number(e.target.value))}
+                    aria-label="Background overlay darkness percentage"
+                    className="w-full accent-fuchsia-500 cursor-pointer"
+                  />
+                  <p className="text-[11px] text-neutral-500">
+                    Supports PNG, JPG, WEBP, or GIF. Automatically optimized for crisp display while keeping cards easy to read.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     );
   };
 
   return (
-    <div className="h-[100dvh] flex flex-col bg-black text-white overflow-hidden selection:bg-red-900 selection:text-red-100 font-sans">
+    <div className="relative h-[100dvh] flex flex-col bg-black text-white overflow-hidden selection:bg-red-900 selection:text-red-100 font-sans">
+      {userBgImageUrl && (
+        <div className="pointer-events-none fixed inset-0 z-0 overflow-hidden" aria-hidden="true">
+          <div
+            className="absolute inset-0 bg-cover bg-center bg-no-repeat transition-opacity duration-300"
+            style={{ backgroundImage: `url("${userBgImageUrl}")` }}
+          />
+          <div
+            className="absolute inset-0 bg-black transition-opacity duration-200"
+            style={{ opacity: Math.min(0.95, Math.max(0.2, userBgDimPercent / 100)) }}
+          />
+        </div>
+      )}
       {/* Header */}
-        <header className="border-b border-red-500/20 bg-black/90 backdrop-blur-xl sticky top-0 z-40 shrink-0 pt-[env(safe-area-inset-top)]">
+        <header className="relative z-40 border-b border-red-500/20 bg-black/80 backdrop-blur-xl sticky top-0 shrink-0 pt-[env(safe-area-inset-top)]">
         <div className="max-w-5xl mx-auto px-3 sm:px-4 h-14 flex items-center justify-between gap-2">
           <button onClick={() => setActiveTab('dashboard')} className="flex items-center gap-2.5 group cursor-pointer min-w-0">
             <div className="p-2 rounded-xl bg-gradient-to-tr from-red-700 to-red-500 text-white shadow-lg shadow-red-950/50 shrink-0">
@@ -6387,7 +6917,7 @@ export const GymApp: React.FC<GymAppProps> = ({
       </header>
 
       {/* Content */}
-        <main className="flex-1 overflow-y-auto overscroll-contain">
+        <main className="relative z-10 flex-1 overflow-y-auto overscroll-contain">
           <div className="max-w-5xl mx-auto px-3 sm:px-4 py-4 sm:py-5 pb-[calc(5.5rem+env(safe-area-inset-bottom))] sm:pb-8">
           {activeTab === 'dashboard' && renderDashboard()}
           {activeTab === 'workouts' && renderWorkoutsWorkspace(true, true)}
@@ -6420,7 +6950,7 @@ export const GymApp: React.FC<GymAppProps> = ({
       </main>
 
       {/* Mobile bottom nav */}
-      <nav className="sm:hidden fixed bottom-0 inset-x-0 z-40 bg-black/90 backdrop-blur-xl border-t border-red-500/20 pb-[env(safe-area-inset-bottom)]">
+      <nav className="sm:hidden fixed bottom-0 inset-x-0 z-40 bg-black/85 backdrop-blur-xl border-t border-red-500/20 pb-[env(safe-area-inset-bottom)]">
         <div className="grid grid-cols-6 px-1">
           {GYM_TABS.map((tab) => {
             const active = activeTab === tab.id;

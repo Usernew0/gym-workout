@@ -96,6 +96,7 @@ export default function App() {
   // Data — hydrated from Firestore + Supabase via the realtime subscriptions below.
   const [userAccounts, setUserAccounts] = useState<UserAccount[]>([]);
   const [adminSettings, setAdminSettings] = useState<AdminSetting[]>([]);
+  const [adminSettingsHydrated, setAdminSettingsHydrated] = useState(false);
 
   // Dynamic favicon & document title
   useEffect(() => {
@@ -193,14 +194,29 @@ export default function App() {
 
     let unsubUserAccounts = () => {};
     let unsubAdminSettings = () => {};
+    let hydratedOnce = false;
+
+    const hydrationFallbackTimer = setTimeout(() => {
+      if (!hydratedOnce) {
+        hydratedOnce = true;
+        setAdminSettingsHydrated(true);
+      }
+    }, 2500);
 
     const timer = setTimeout(() => {
       unsubUserAccounts = subscribeToUserAccounts((data) => setUserAccounts(data));
-      unsubAdminSettings = subscribeToAdminSettings((data) => setAdminSettings(data));
+      unsubAdminSettings = subscribeToAdminSettings((data) => {
+        setAdminSettings(data);
+        if (!hydratedOnce && data.length > 0) {
+          hydratedOnce = true;
+          setAdminSettingsHydrated(true);
+        }
+      });
     }, 50);
 
     return () => {
       clearTimeout(timer);
+      clearTimeout(hydrationFallbackTimer);
       unsubUserAccounts();
       unsubAdminSettings();
     };
@@ -231,6 +247,10 @@ export default function App() {
 
   if (!isLoggedIn) {
     return <Login onLoginSuccess={handleLoginSuccess} userAccounts={userAccounts} adminSettings={adminSettings} logoutMessage={logoutMessage} />;
+  }
+
+  if (!adminSettingsHydrated && adminSettings.length === 0) {
+    return <ViewLoadingFallback />;
   }
 
   // Intercept and render AdminPanel if the user matches any admin username from the database

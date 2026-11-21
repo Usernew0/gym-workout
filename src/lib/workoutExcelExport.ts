@@ -1065,3 +1065,103 @@ export async function exportWorkoutPlanToExcel(
   setTimeout(() => URL.revokeObjectURL(url), 1000);
   return filename;
 }
+
+/**
+ * Generates and downloads the Standard Upload Sheet template:
+ * Col 1: Exercises (with Day header rows inside Column 1 above each day's exercises)
+ * Col 2: Sets | Col 3: Reps | Col 4: RPE | Col 5: RIP | Col 6: Weight (kg) | Col 7: Actual Reps | Col 8: Notes | Col 9: Video URL
+ */
+export async function downloadStandardWorkoutTemplateExcel(unit: WeightUnit = 'kg'): Promise<string> {
+  const ExcelJSMod: any = await import('exceljs');
+  const ExcelJS = ExcelJSMod.default || ExcelJSMod;
+
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Gym Workout Tracker';
+  wb.created = new Date();
+
+  const ws = wb.addWorksheet('Workout Plan', {
+    views: [{ state: 'frozen', ySplit: 2 }],
+  });
+
+  const headers = [
+    'Exercises',
+    'Sets',
+    'Reps',
+    'RPE',
+    'RIP',
+    `Weight (${unit})`,
+    'Actual Reps',
+    'Notes',
+    'Video URL',
+  ];
+  const colCount = headers.length;
+
+  const titleRow = ws.addRow(['STANDARD WORKOUT SHEET — Column 1: Exercises + Day Headers | Col 2: Sets | Col 3: Reps']);
+  ws.mergeCells(1, 1, 1, colCount);
+  styleBannerRow(titleRow, colCount, 'FF111827', 'FFFFFFFF');
+
+  const headerRow = ws.addRow(headers);
+  styleHeaderRow(headerRow, colCount, 'FF1E293B');
+
+  const templateRows: Array<{ isDay?: boolean; values: Array<string | number> }> = [
+    { isDay: true, values: ['Day 1 - Push'] },
+    { values: ['Barbell Bench Press', 4, '8-10', '8', '2', unit === 'lbs' ? '175 / 185' : '80 / 85', '8 / 8', 'Control eccentric, pause on chest', 'https://www.youtube.com/watch?v=rT7DgCr-3pg'] },
+    { values: ['Incline Dumbbell Press', 3, '10-12', '8.5', '1-2', unit === 'lbs' ? '65' : '30', '10', '30° bench angle', 'https://www.youtube.com/watch?v=8iPEnn-ltC8'] },
+    { values: ['Lateral Raises', 4, '12-15', '9', '1', unit === 'lbs' ? '25' : '12', '', 'Strict form, no swinging', ''] },
+    { isDay: true, values: ['Day 2 - Pull'] },
+    { values: ['Lat Pulldown', 4, '10-12', '8', '2', unit === 'lbs' ? '130' : '60', '10', 'Full stretch at top', 'https://www.youtube.com/watch?v=CAwf7n6Luuc'] },
+    { values: ['Seated Cable Row', 3, '10-12', '8', '2', unit === 'lbs' ? '140' : '65', '', 'Squeeze shoulder blades', ''] },
+    { isDay: true, values: ['Day 3 - Legs'] },
+    { values: ['Barbell Squat', 4, '6-8', '8.5', '1-2', unit === 'lbs' ? '225' : '100', '6', 'Break parallel with brace', 'https://www.youtube.com/watch?v=ultWZbUMPL8'] },
+    { values: ['Romanian Deadlift', 3, '8-10', '8', '2', unit === 'lbs' ? '185' : '85', '', 'Hinge at hips, soft knees', ''] },
+  ];
+
+  const allRows: Array<Array<string | number>> = [headers];
+  let dataIdx = 0;
+
+  templateRows.forEach((item) => {
+    const r = ws.addRow(item.values);
+    if (item.isDay) {
+      r.height = 24;
+      ws.mergeCells(r.number, 1, r.number, colCount);
+      for (let c = 1; c <= colCount; c++) {
+        const cell = r.getCell(c);
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEF2F2' } };
+        cell.font = { name: 'Calibri', size: 11, bold: true, color: { argb: 'FF991B1B' } };
+        cell.border = {
+          top: { style: 'medium', color: { argb: 'FFEF4444' } },
+          bottom: { style: 'thin', color: { argb: 'FFFCA5A5' } },
+          left: THIN_BORDER.left,
+          right: THIN_BORDER.right,
+        };
+        cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+      }
+      allRows.push([item.values[0]]);
+    } else {
+      r.height = 22;
+      styleDataRow(r, colCount, dataIdx % 2 === 1);
+      r.getCell(1).font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FF0F172A' } };
+      dataIdx++;
+      allRows.push(item.values);
+    }
+  });
+
+  applySheetColumnWidths(ws, allRows, 11, 44, 0);
+  styleAllWorksheetCellsCentered(ws);
+
+  const filename = 'gym-standard-workout-template.xlsx';
+  const rawBuffer = await wb.xlsx.writeBuffer();
+  const blob = new Blob([new Uint8Array(rawBuffer)], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return filename;
+}
+

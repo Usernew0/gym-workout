@@ -417,6 +417,7 @@ Return a structured JSON object containing:
     if (!tgConfig?.enabled || user.telegramNotificationsEnabled === false) return null;
     const unameLower = (user.username || '').trim().toLowerCase();
     const uHandleBare = (user.telegramUsername || '').trim().replace(/^@/, '').toLowerCase();
+    if (!uHandleBare) return null;
     const directChat = (user.telegramChatId || '').trim();
 
     const authEntry = (tgConfig.authorizedUsers || []).find((a: any) => {
@@ -1195,8 +1196,159 @@ Return a structured JSON object containing:
     }
   });
 
-  // Explicit static route for audio assets
+  // Explicit static route for audio assets & uploaded user assets
   app.use('/audio', express.static(path.join(projectRoot, 'public', 'audio')));
+  app.use('/uploads', express.static(path.join(projectRoot, 'public', 'uploads')));
+
+  // Per-User Website Background Image Storage (file-backed + disk JSON registry so each user keeps their own bg)
+  const bgRegistryPath = path.join(projectRoot, 'tmp', 'user_backgrounds.json');
+  const bgUploadsDir = path.join(projectRoot, 'public', 'uploads', 'backgrounds');
+
+  interface StoredUserBackground {
+    imageUrl: string;
+    dimPercent: number;
+    updatedAt: string;
+  }
+
+  function readUserBackgroundsMap(): Record<string, StoredUserBackground> {
+    try {
+      if (fs.existsSync(bgRegistryPath)) {
+        const parsed = JSON.parse(fs.readFileSync(bgRegistryPath, 'utf-8'));
+        if (parsed && typeof parsed === 'object') return parsed;
+      }
+    } catch {
+      // ignore corrupted file
+    }
+    return {};
+  }
+
+  function writeUserBackgroundsMap(map: Record<string, StoredUserBackground>) {
+    const tmpDir = path.join(projectRoot, 'tmp');
+    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+    fs.writeFileSync(bgRegistryPath, JSON.stringify(map, null, 2));
+  }
+
+  function removeOldBackgroundFile(imageUrl?: string) {
+    if (!imageUrl || !imageUrl.startsWith('/uploads/backgrounds/')) return;
+    const baseName = path.basename(imageUrl);
+    if (!baseName) return;
+    const target = path.join(bgUploadsDir, baseName);
+    try {
+      if (fs.existsSync(target)) fs.unlinkSync(target);
+    } catch {
+      // ignore unlink error
+    }
+  }
+
+  app.get('/api/profile/background', (req, res) => {
+    const rawUser = String(req.query.username || '').trim().toLowerCase();
+    if (!rawUser) {
+      return res.status(400).json({ success: false, error: 'Username is required.' });
+    }
+    const map = readUserBackgroundsMap();
+    const record = map[rawUser] || null;
+    if (record?.imageUrl?.startsWith('/uploads/backgrounds/')) {
+      const fileOnDisk = path.join(bgUploadsDir, path.basename(record.imageUrl));
+      if (!fs.existsSync(fileOnDisk)) {
+        return res.json({ success: true, background: null });
+      }
+    }
+    return res.json({ success: true, background: record });
+  });
+
+  app.post('/api/profile/background', (req, res) => {
+    try {
+      const { username, dataUrl, dimPercent } = req.body || {};
+      const normUser = String(username || '').trim().toLowerCase();
+      if (!normUser) {
+        return res.status(400).json({ success: false, error: 'Username is required.' });
+      }
+
+      const map = readUserBackgroundsMap();
+      const existing = map[normUser];
+      const clampedDim =
+        typeof dimPercent === 'number' && Number.isFinite(dimPercent)
+          ? Math.min(95, Math.max(20, Math.round(dimPercent)))
+          : existing?.dimPercent ?? 72;
+
+      if (!dataUrl) {
+        if (!existing) {
+          return res.status(404).json({ success: false, error: 'No background image saved for this user.' });
+        }
+        const updated: StoredUserBackground = {
+          ...existing,
+          dimPercent: clampedDim,
+          updatedAt: new Date().toISOString(),
+        };
+        map[normUser] = updated;
+        writeUserBackgroundsMap(map);
+        return res.json({ success: true, background: updated });
+      }
+
+      const match = String(dataUrl).match(/^data:image\/(png|jpeg|jpg|webp|gif);base64,([A-Za-z0-9+/=]+)$/i);
+      if (!match) {
+        return res.status(400).json({ success: false, error: 'Please upload a valid PNG, JPG, WEBP, or GIF image.' });
+      }
+
+      const extMap: Record<string, string> = {
+        png: 'png',
+        jpeg: 'jpg',
+        jpg: 'jpg',
+        webp: 'webp',
+        gif: 'gif',
+      };
+      const ext = extMap[match[1].toLowerCase()] || 'jpg';
+      const buffer = Buffer.from(match[2], 'base64');
+      if (buffer.length === 0 || buffer.length > 10 * 1024 * 1024) {
+        return res.status(400).json({ success: false, error: 'Background image must be smaller than 10 MB.' });
+      }
+
+      if (!fs.existsSync(bgUploadsDir)) {
+        fs.mkdirSync(bgUploadsDir, { recursive: true });
+      }
+
+      const safeUserSlug = normUser.replace(/[^a-z0-9_-]/g, '_').slice(0, 48) || 'user';
+      const safeFileName = `${safeUserSlug}_${Date.now()}.${ext}`;
+      const targetPath = path.join(bgUploadsDir, safeFileName);
+      fs.writeFileSync(targetPath, buffer);
+
+      if (existing?.imageUrl) {
+        removeOldBackgroundFile(existing.imageUrl);
+      }
+
+      const nextRecord: StoredUserBackground = {
+        imageUrl: `/uploads/backgrounds/${safeFileName}`,
+        dimPercent: clampedDim,
+        updatedAt: new Date().toISOString(),
+      };
+      map[normUser] = nextRecord;
+      writeUserBackgroundsMap(map);
+      return res.json({ success: true, background: nextRecord });
+    } catch (err: any) {
+      console.error('Background upload error:', err);
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to save background image.' });
+    }
+  });
+
+  app.delete('/api/profile/background', (req, res) => {
+    try {
+      const normUser = String(req.body?.username || req.query.username || '').trim().toLowerCase();
+      if (!normUser) {
+        return res.status(400).json({ success: false, error: 'Username is required.' });
+      }
+      const map = readUserBackgroundsMap();
+      const existing = map[normUser];
+      if (existing?.imageUrl) {
+        removeOldBackgroundFile(existing.imageUrl);
+      }
+      delete map[normUser];
+      writeUserBackgroundsMap(map);
+      return res.json({ success: true });
+    } catch (err: any) {
+      console.error('Background delete error:', err);
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to remove background image.' });
+    }
+  });
 
   if (!isProduction) {
     // Use Vite dev server as middleware in non-production mode

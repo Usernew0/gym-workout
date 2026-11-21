@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Upload, FileSpreadsheet, Loader2, Trash2, Plus, Check,
   AlertTriangle, Video, User as UserIcon, Dumbbell, FileText,
-  Layers, Eye, Ban, CalendarDays, Tag, Zap
+  Layers, Eye, Ban, CalendarDays, Tag, Zap, Download
 } from 'lucide-react';
 import { UserAccount, WeightUnit, WorkoutPlan } from '../../types';
 import {
@@ -15,6 +15,7 @@ import {
   splitSetsAndReps,
 } from '../../lib/sheetParser';
 import { buildWorkoutPlan, mergeUpdatedWorksheetIntoPlan, saveWorkoutPlanDoc } from '../../lib/gymService';
+import { downloadStandardWorkoutTemplateExcel } from '../../lib/workoutExcelExport';
 
 interface SheetUploaderProps {
   mode: 'user' | 'admin';
@@ -171,6 +172,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
   );
   const [autoMatchReason, setAutoMatchReason] = useState<string | null>(null);
   const [importSheetData, setImportSheetData] = useState(true);
+  const [replaceExistingWeekLogs, setReplaceExistingWeekLogs] = useState(false);
   const [manualShowRpe, setManualShowRpe] = useState(false);
   const [manualShowRir, setManualShowRir] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -210,6 +212,22 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
     [candidateExistingPlans, targetPlanIdToUpdate]
   );
 
+  const isCombinedMultiDayPlan = (plan?: WorkoutPlan | null): boolean => {
+    if (!plan) return false;
+    const distinctDays = new Set((plan.exercises || []).map(e => (e.day || '').trim()).filter(Boolean));
+    return distinctDays.size > 1;
+  };
+
+  const hasSeparateExistingPlansForDays = (daysOrTitles: string[]): boolean => {
+    if (daysOrTitles.length < 2) return false;
+    const normTitles = new Set(candidateExistingPlans.map(p => p.title.trim().toLowerCase()).filter(Boolean));
+    let matchedCount = 0;
+    for (const d of daysOrTitles) {
+      if (normTitles.has(d.trim().toLowerCase())) matchedCount++;
+    }
+    return matchedCount >= 2;
+  };
+
   const selectTargetPlanToUpdate = (planId: string, manualReason: string | null = null) => {
     setTargetPlanIdToUpdate(planId);
     setAutoMatchReason(manualReason);
@@ -223,6 +241,14 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
       setWeightUnit(found.defaultWeightUnit || 'kg');
       if (!description.trim() && found.description) setDescription(found.description);
       if (!instructions.trim() && found.instructions) setInstructions(found.instructions);
+      // When updating one specific plan, keep all days combined inside it unless separate existing day plans exist
+      setSheets(prev =>
+        prev.map(s =>
+          s.role === 'workout' && (isCombinedMultiDayPlan(found) || !hasSeparateExistingPlansForDays(s.selectedDays))
+            ? { ...s, splitByDay: false }
+            : s
+        )
+      );
     }
   };
 
@@ -297,6 +323,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
       setManualRows([]);
       setInstructions(rebuildInstructionsFromSheets(entries));
       setImportSheetData(true);
+      setReplaceExistingWeekLogs(false);
 
       const maxDetectedWeeks = entries.reduce((mx, s) => Math.max(mx, s.detectedDataWeeks || 0), 0);
       if (maxDetectedWeeks > 1) {
@@ -311,11 +338,13 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
       setActiveWorkoutIdx(firstWorkoutIdx >= 0 ? firstWorkoutIdx : 0);
 
       // Auto-match against user's current workout or closest existing plan
+      let resolvedTargetPlan: WorkoutPlan | undefined;
       if (uploadTargetMode === 'update_current') {
         const preferred =
           (targetPlanIdToUpdate ? candidateExistingPlans.find(p => p.id === targetPlanIdToUpdate) : null) ||
           currentWorkoutPlan;
         if (preferred) {
+          resolvedTargetPlan = preferred;
           setTargetPlanIdToUpdate(preferred.id);
           setAutoMatchReason('Auto-updating current workout plan');
           setWeeks(prev => Math.max(prev, preferred.weeks || 1));
@@ -323,6 +352,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
       } else if (uploadTargetMode === 'smart' && candidateExistingPlans.length > 0) {
         const matched = findAutoMatchedPlan(entries, file.name, candidateExistingPlans, currentWorkoutPlan?.id);
         if (matched) {
+          resolvedTargetPlan = matched.plan;
           setTargetPlanIdToUpdate(matched.plan.id);
           setAutoMatchReason(`Auto-matched (${matched.reason})`);
           setWeeks(prev => Math.max(prev, matched.plan.weeks || 1));
@@ -333,9 +363,8 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
             setDescription(matched.plan.description);
           }
         } else if (currentWorkoutPlan && entries.filter(s => s.role === 'workout' && s.exercises.length > 0).length === 1) {
-          // If the user has an active workout and uploaded a single-plan update sheet, pre-select Create New unless they choose Update Current,
-          // UNLESS initialTargetPlanId was passed
           if (initialTargetPlanId) {
+            resolvedTargetPlan = currentWorkoutPlan;
             setTargetPlanIdToUpdate(currentWorkoutPlan.id);
             setAutoMatchReason('Targeted workout plan');
           } else {
@@ -343,6 +372,18 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
             setAutoMatchReason(null);
           }
         }
+      }
+
+      // When updating a single target plan, keep splitByDay = false so ALL days & exercises update inside that plan
+      if (resolvedTargetPlan) {
+        setSheets(prev =>
+          prev.map(s =>
+            s.role === 'workout' &&
+            (isCombinedMultiDayPlan(resolvedTargetPlan) || !hasSeparateExistingPlansForDays(s.selectedDays))
+              ? { ...s, splitByDay: false }
+              : s
+          )
+        );
       }
 
       if (entries.every(s => s.exercises.length === 0)) {
@@ -432,7 +473,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
   const updateRow = (rowIdx: number, key: keyof ParsedExerciseRow, value: string) => {
     const applyPatch = (r: ParsedExerciseRow): ParsedExerciseRow => {
       if (key === 'sets') {
-        const split = splitSetsAndReps(value);
+        const split = splitSetsAndReps(value, false);
         if (split) {
           return { ...r, sets: split.sets, reps: r.reps || split.reps };
         }
@@ -581,66 +622,108 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
         hasRirColumn: boolean;
       }> = [];
 
-      for (const ws of selectedWorkouts) {
-        if (!ws.customTitle.trim()) {
-          setError(`Please enter a title for sheet "${ws.name}".`);
+      // If updating a single target plan from a multi-tab workbook (and there aren't separate existing plans per tab),
+      // combine all selected workout tabs with their day/tab labels so EVERY day updates into that target plan.
+      const shouldCombineMultiTabIntoTarget =
+        Boolean(targetPlanIdToUpdate) &&
+        selectedWorkouts.length > 1 &&
+        !hasSeparateExistingPlansForDays(selectedWorkouts.map(ws => ws.customTitle.trim() || ws.name));
+
+      if (shouldCombineMultiTabIntoTarget) {
+        const combinedExercises: ParsedExerciseRow[] = [];
+        let combinedRpe = false;
+        let combinedRir = false;
+        for (const ws of selectedWorkouts) {
+          if (ws.detectedDays.length > 0 && ws.selectedDays.length === 0) {
+            setError(`Please select at least one Day header inside "${ws.name}" to link its exercises.`);
+            return;
+          }
+          const filtered = getFilteredExercisesForSheet(ws);
+          if (filtered.length === 0) continue;
+          const fallbackDay = ws.customTitle.trim() || ws.name;
+          filtered.forEach(ex => {
+            combinedExercises.push({
+              ...ex,
+              day: ex.day?.trim() || fallbackDay,
+            });
+          });
+          if (ws.hasRpeColumn || filtered.some(ex => Boolean(ex.rpe?.trim()))) combinedRpe = true;
+          if (ws.hasRirColumn || filtered.some(ex => Boolean(ex.rir?.trim()))) combinedRir = true;
+        }
+        if (combinedExercises.length === 0) {
+          setError('No exercises matched the selected Day(s) inside the uploaded workbook.');
           return;
         }
-        if (ws.detectedDays.length > 0 && ws.selectedDays.length === 0) {
-          setError(`Please select at least one Day header inside "${ws.name}" to link its exercises.`);
-          return;
-        }
+        const targetObj = candidateExistingPlans.find(p => p.id === targetPlanIdToUpdate);
+        plansToCreate.push({
+          title: targetObj?.title || selectedWorkouts[0].customTitle.trim() || selectedWorkouts[0].name,
+          sheetName: selectedWorkouts.map(w => w.name).join(', '),
+          exercises: combinedExercises,
+          hasRpeColumn: combinedRpe,
+          hasRirColumn: combinedRir,
+        });
+      } else {
+        for (const ws of selectedWorkouts) {
+          if (!ws.customTitle.trim()) {
+            setError(`Please enter a title for sheet "${ws.name}".`);
+            return;
+          }
+          if (ws.detectedDays.length > 0 && ws.selectedDays.length === 0) {
+            setError(`Please select at least one Day header inside "${ws.name}" to link its exercises.`);
+            return;
+          }
 
-        const filtered = getFilteredExercisesForSheet(ws);
-        if (filtered.length === 0) {
-          setError(`No exercises matched the selected Day(s) inside "${ws.name}".`);
-          return;
-        }
+          const filtered = getFilteredExercisesForSheet(ws);
+          if (filtered.length === 0) {
+            setError(`No exercises matched the selected Day(s) inside "${ws.name}".`);
+            return;
+          }
 
-        const sheetHasRpe = Boolean(
-          ws.hasRpeColumn ||
-            filtered.some(ex => Boolean(ex.rpe?.trim()) || Object.values(ex.weeklyLogs || {}).some(w => w.entries?.some(e => Boolean(e.rpe?.trim()))))
-        );
-        const sheetHasRir = Boolean(
-          ws.hasRirColumn ||
-            filtered.some(ex => Boolean(ex.rir?.trim()) || Object.values(ex.weeklyLogs || {}).some(w => w.entries?.some(e => Boolean(e.rir?.trim()))))
-        );
+          const sheetHasRpe = Boolean(
+            ws.hasRpeColumn ||
+              filtered.some(ex => Boolean(ex.rpe?.trim()) || Object.values(ex.weeklyLogs || {}).some(w => w.entries?.some(e => Boolean(e.rpe?.trim()))))
+          );
+          const sheetHasRir = Boolean(
+            ws.hasRirColumn ||
+              filtered.some(ex => Boolean(ex.rir?.trim()) || Object.values(ex.weeklyLogs || {}).some(w => w.entries?.some(e => Boolean(e.rir?.trim()))))
+          );
 
-        if (ws.splitByDay && ws.selectedDays.length > 1) {
-          for (const dayName of ws.selectedDays) {
-            const dayExercises = filtered.filter(ex => ex.day === dayName);
-            if (dayExercises.length > 0) {
+          if (ws.splitByDay && ws.selectedDays.length > 1) {
+            for (const dayName of ws.selectedDays) {
+              const dayExercises = filtered.filter(ex => ex.day === dayName);
+              if (dayExercises.length > 0) {
+                plansToCreate.push({
+                  title: dayName,
+                  sheetName: `${ws.name} · ${dayName}`,
+                  exercises: dayExercises,
+                  hasRpeColumn: sheetHasRpe,
+                  hasRirColumn: sheetHasRir,
+                });
+              }
+            }
+            // Include any exercises without a day label if present
+            const untagged = filtered.filter(ex => !ex.day);
+            if (untagged.length > 0) {
               plansToCreate.push({
-                title: dayName,
-                sheetName: `${ws.name} · ${dayName}`,
-                exercises: dayExercises,
+                title: ws.customTitle.trim(),
+                sheetName: ws.name,
+                exercises: untagged,
                 hasRpeColumn: sheetHasRpe,
                 hasRirColumn: sheetHasRir,
               });
             }
-          }
-          // Include any exercises without a day label if present
-          const untagged = filtered.filter(ex => !ex.day);
-          if (untagged.length > 0) {
+          } else {
+            const singleDaySuffix = ws.selectedDays.length === 1 && ws.detectedDays.length > 1
+              ? `${ws.selectedDays[0]}`
+              : ws.customTitle.trim();
             plansToCreate.push({
-              title: ws.customTitle.trim(),
+              title: singleDaySuffix,
               sheetName: ws.name,
-              exercises: untagged,
+              exercises: filtered,
               hasRpeColumn: sheetHasRpe,
               hasRirColumn: sheetHasRir,
             });
           }
-        } else {
-          const singleDaySuffix = ws.selectedDays.length === 1 && ws.detectedDays.length > 1
-            ? `${ws.selectedDays[0]}`
-            : ws.customTitle.trim();
-          plansToCreate.push({
-            title: singleDaySuffix,
-            sheetName: ws.name,
-            exercises: filtered,
-            hasRpeColumn: sheetHasRpe,
-            hasRirColumn: sheetHasRir,
-          });
         }
       }
 
@@ -682,6 +765,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
               hasRirColumn: item.hasRirColumn,
               exercises: item.exercises,
               importSheetData,
+              replaceExistingWeekLogs,
               sourceFileName: fileName || existingMatch.sourceFileName,
             });
             if (!firstPlanId) firstPlanId = merged.id;
@@ -766,6 +850,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
             hasRirColumn: manualHasRir,
             exercises: manualRows,
             importSheetData,
+            replaceExistingWeekLogs,
             sourceFileName: fileName || existingMatch.sourceFileName,
           })
         : buildWorkoutPlan({
@@ -870,6 +955,35 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
 
   return (
     <div className="space-y-4">
+      {/* Standard Uploaded Sheet Format Guide + 1-Click Template Download */}
+      <div className="rounded-2xl border border-white/10 bg-neutral-900/60 p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="space-y-1 min-w-0">
+          <div className="text-[11px] font-bold uppercase tracking-wider text-neutral-200 flex items-center gap-1.5">
+            <FileSpreadsheet className="w-3.5 h-3.5 text-red-400 shrink-0" />
+            Standard Sheet Column Layout
+          </div>
+          <p className="text-[11px] text-neutral-400 leading-relaxed">
+            <strong className="text-white">Col 1:</strong> Exercises (put Day headers like <code className="text-amber-300">Day 1 - Push</code> inside Col 1 above each day) ·{' '}
+            <strong className="text-white">Col 2:</strong> Sets ·{' '}
+            <strong className="text-white">Col 3:</strong> Reps ·{' '}
+            <strong className="text-white">Col 4:</strong> RPE ·{' '}
+            <strong className="text-white">Col 5:</strong> RIP ·{' '}
+            <strong className="text-white">Col 6:</strong> Weight ({weightUnit}) ·{' '}
+            <strong className="text-white">Col 7:</strong> Actual Reps ·{' '}
+            <strong className="text-white">Col 8:</strong> Notes ·{' '}
+            <strong className="text-white">Col 9:</strong> Video URL
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => downloadStandardWorkoutTemplateExcel(weightUnit)}
+          className="h-9 px-3.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/15 text-xs font-bold text-white inline-flex items-center gap-1.5 shrink-0 cursor-pointer transition-colors"
+        >
+          <Download className="w-3.5 h-3.5 text-red-400" />
+          Download Standard Template (.xlsx)
+        </button>
+      </div>
+
       {/* Upload dropzone */}
       <div
         onClick={() => inputRef.current?.click()}
@@ -1399,15 +1513,28 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
               Weights, kg/lbs units, actual reps, Week 1..N logs, Set 1..N data, Previous columns, and Done flags will be saved directly into your history.
             </p>
           </div>
-          <label className="inline-flex items-center gap-2 text-xs font-semibold text-white bg-black/40 border border-indigo-400/30 rounded-xl px-3 py-1.5 cursor-pointer shrink-0">
-            <input
-              type="checkbox"
-              checked={importSheetData}
-              onChange={(e) => setImportSheetData(e.target.checked)}
-              className="accent-indigo-500 w-4 h-4 cursor-pointer"
-            />
-            Import sheet weights &amp; reps
-          </label>
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="inline-flex items-center gap-2 text-xs font-semibold text-white bg-black/40 border border-indigo-400/30 rounded-xl px-3 py-1.5 cursor-pointer shrink-0">
+              <input
+                type="checkbox"
+                checked={importSheetData}
+                onChange={(e) => setImportSheetData(e.target.checked)}
+                className="accent-indigo-500 w-4 h-4 cursor-pointer"
+              />
+              Import sheet weights &amp; reps
+            </label>
+            {selectedExistingPlan && importSheetData && (
+              <label className="inline-flex items-center gap-2 text-xs font-semibold text-amber-200 bg-black/40 border border-amber-400/30 rounded-xl px-3 py-1.5 cursor-pointer shrink-0">
+                <input
+                  type="checkbox"
+                  checked={replaceExistingWeekLogs}
+                  onChange={(e) => setReplaceExistingWeekLogs(e.target.checked)}
+                  className="accent-amber-500 w-4 h-4 cursor-pointer"
+                />
+                Overwrite existing week logs from sheet
+              </label>
+            )}
+          </div>
         </div>
       )}
 
@@ -1466,7 +1593,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
                         : 'bg-neutral-900 border-white/10 text-neutral-400 hover:text-white'
                     }`}
                   >
-                    {showRirCol ? '✓ RIR Col' : '+ RIR Col'}
+                    {showRirCol ? '✓ RIR / RIP Col' : '+ RIR / RIP Col'}
                   </button>
                 </>
               )}
@@ -1489,7 +1616,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
                   <th className="px-2 py-2 font-semibold w-24">Sets (Auto)</th>
                   <th className="px-2 py-2 font-semibold w-24">Reps Range</th>
                   {showRpeCol && <th className="px-2 py-2 font-semibold w-20 text-amber-300">RPE</th>}
-                  {showRirCol && <th className="px-2 py-2 font-semibold w-20 text-sky-300">RIR</th>}
+                  {showRirCol && <th className="px-2 py-2 font-semibold w-20 text-sky-300">RIR / RIP</th>}
                   {displayedRows.some(r => r.weeklyLogs || r.loggedWeight || r.loggedReps || r.completed) && (
                     <th className="px-2 py-2 font-semibold w-52 text-indigo-300">Prefilled Sheet Data</th>
                   )}

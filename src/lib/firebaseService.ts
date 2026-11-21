@@ -255,7 +255,78 @@ export function subscribeToFirestoreUserAccounts(callback: (data: UserAccount[])
 
 export async function saveFirestoreUserAccountDoc(user: UserAccount) {
   try {
-    await setDoc(doc(db, 'userAccounts', user.id), sanitizeForFirestore(user));
+    const cleanUsername = (user?.username || '').trim();
+    if (cleanUsername.length < 2) {
+      throw new Error('Username must be at least 2 characters.');
+    }
+    // Admin credentials belong in adminSettings; firestore.rules intentionally blocks 'admin' inside userAccounts.
+    if (cleanUsername.toLowerCase() === 'admin') {
+      return;
+    }
+
+    const sanitized = sanitizeForFirestore({
+      ...user,
+      username: cleanUsername,
+    }) as UserAccount;
+
+    let targetId = (sanitized.id || '').trim();
+    let existingData: Record<string, any> | null = null;
+
+    if (targetId) {
+      try {
+        const directSnap = await getDoc(doc(db, 'userAccounts', targetId));
+        if (directSnap.exists()) {
+          existingData = directSnap.data() as Record<string, any>;
+        }
+      } catch {
+        // ignore read lookup fallback
+      }
+    }
+
+    // If direct doc wasn't found (e.g. fallback user_<name> id) or password is missing, look up canonical doc by username
+    if (!existingData || typeof sanitized.password !== 'string' || sanitized.password.length < 4) {
+      try {
+        const allSnap = await getDocs(collection(db, 'userAccounts'));
+        for (const d of allSnap.docs) {
+          const data = d.data() as Record<string, any>;
+          const docUser = typeof data?.username === 'string' ? data.username.trim().toLowerCase() : '';
+          if (d.id === targetId || (docUser && docUser === cleanUsername.toLowerCase())) {
+            targetId = d.id;
+            existingData = data;
+            break;
+          }
+        }
+      } catch {
+        // ignore lookup errors
+      }
+    }
+
+    if (!targetId) {
+      targetId = `user_${cleanUsername.toLowerCase().replace(/[^a-z0-9_-]+/g, '_')}`;
+    }
+
+    const resolvedPassword =
+      typeof sanitized.password === 'string' && sanitized.password.length >= 4
+        ? sanitized.password
+        : typeof existingData?.password === 'string' && existingData.password.length >= 4
+          ? existingData.password
+          : undefined;
+
+    if (!existingData && !resolvedPassword) {
+      throw new Error(`Account "${cleanUsername}" does not exist in Firestore yet or is missing a valid password.`);
+    }
+
+    const finalPayload: Record<string, any> = sanitizeForFirestore({
+      ...(existingData || {}),
+      ...sanitized,
+      id: targetId,
+      username: typeof existingData?.username === 'string' && existingData.username.trim()
+        ? existingData.username
+        : cleanUsername,
+      ...(resolvedPassword ? { password: resolvedPassword } : {}),
+    });
+
+    await setDoc(doc(db, 'userAccounts', targetId), finalPayload);
   } catch (err) {
     console.warn("Firestore saveUserAccountDoc error:", err);
     throw err;

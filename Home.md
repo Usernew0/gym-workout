@@ -1087,3 +1087,49 @@ Expanded and fixed the event trigger architecture to ensure 100% of security eve
   - Added server water-intake override tracking (`hydrateServerWaterIntakeOverrides`, `upsertServerWaterIntakeOverride`, `exportServerWaterIntakeOverrides`, `resolveEffectiveUserWaterIntake`) persisted inside `tmp/telegram_bot_state.json`, merging Firestore vs. live synced updates by newest `updatedAt`.
   - Added `POST /api/water-intake/sync` (invoked on initial load, hydration hydration, `+`/`-`/`Reset`, and reminder toggle/interval edits) and `POST /api/water-intake/mark-sent` (called after successful client-side reminder sends to prevent duplicate server reminders in the same interval).
   - Unified `/water` command replies and scheduled `runScheduledWaterRemindersPass` messages via `formatWaterIntakeTelegramMessageHtml` so bot commands, browser alerts, and closed-tab server reminders share identical progress bar formatting and live counts.
+
+---
+
+## 36. Firestore `userAccounts` Permissions & Account Sync Hardening
+
+1. **Canonical Account Resolution & Password Preservation (`src/lib/firebaseService.ts`, `src/components/gym/GymApp.tsx`)**:
+   - Hardened `saveFirestoreUserAccountDoc` to normalize usernames, skip reserved `'admin'` writes to `userAccounts` (admin accounts belong in `adminSettings`), look up existing Firestore documents by ID or case-insensitive username, and preserve canonical `id` and `password` fields across partial profile/tracker updates so writes never violate `firestore.rules` schema validation.
+   - Replaced synchronous passwordless `getWritableAccount()` fallback in `GymApp.tsx` with async `resolveWritableAccount()` (reading live Firestore accounts when `matchedAccount` is still hydrating), cleared `localAccountOverride` on account switches, and guarded background water/weight/rest-timer profile writes against incomplete or admin sessions.
+2. **Initial Admin Hydration Guard (`src/App.tsx`)**:
+   - Added `adminSettingsHydrated` tracking so restored sessions wait for the initial `adminSettings` snapshot before routing between `AdminPanel` and `GymApp`, preventing admin logins from transiently mounting `GymApp`.
+3. **Synchronized Blueprint, Security Rules & Workout Diagnostics (`firestore.rules`, `firebase-blueprint.json`, `src/lib/gymService.ts`)**:
+   - Cleaned `firestore.rules` and `firebase-blueprint.json` down to the active Gym Workout collections (`userAccounts`, `workoutPlans`, `adminSettings`, `activityLogs`, `_connection_test_metadata_`), enforced `isValidId` regex guards (`^[a-zA-Z0-9_\-]+$`) and strict `hasOnly` field allowlists across `UserAccount`, `WorkoutPlan`, and `UserActivityLog`, enforced `password` on `userAccounts` `create` and preserved existing `password` on `update`, and wired `handleFirestoreError` permission diagnostics into `subscribeToWorkoutPlans`, `saveWorkoutPlanDoc`, and `deleteWorkoutPlanDoc`.
+
+---
+
+## 37. Profile-Gated Telegram Visibility, Tolerant Sheet Header Matching & Worksheet Update Merge
+
+1. **Profile-Only Telegram Visibility When No Telegram Username Is Set (`src/components/gym/GymApp.tsx`, `server.ts`)**:
+   - Added `hasTelegramUsername` / `hasTelegramUsernameRef` in `GymApp.tsx` derived from the member's saved `matchedAccount?.telegramUsername`.
+   - When `telegramUsername` is empty, **only** the Profile -> **Telegram Bot & Alerts** card remains visible so members can configure their `@username`; all other Telegram UI and dispatches (Dashboard Water Intake Telegram reminder toggle/interval/send button/notices, Export dropdown Telegram PDF/Excel actions, Rest Timer backend Telegram scheduling, and password-change Telegram alerts) are hidden and guarded.
+   - Hardened `resolveMemberChatId` in `server.ts` to return `null` when a member has no saved `telegramUsername`, blocking server-side water reminder and rest-timer dispatches even if stale `telegramChatId` or reminder toggles exist.
+2. **Tolerant Header Matching (`Excercises`, `Sets x Reps`, `RIP`, `Weight x Reps`) & Re-Import Fixes (`src/lib/sheetParser.ts`)**:
+   - Expanded `HEADER_HINTS` and `isHeaderRowMatch` in `src/lib/sheetParser.ts` to match common spelling variants (`Excercises`, `Excersice`, `Exersice`), day/superset/notes/video headers before exercise name, combined `Sets x Reps` (`4 x 10`, `4 / 10`, `4 sets of 10`) split automatically into separate `sets` and `reps` fields, secondary `Reps` columns mapped to `actual_reps` when paired with `Sets x Reps`, and `RIP` / `R.I.P` aliases mapped alongside `RIR` in `TARGET_RIR_HEADER_HINT`, `classifyExtraDataHeader`, and `buildMergedDualHeaderRow`.
+   - Removed the blind positional column fallback (`notes: 3`, `video: 4`, `reps: 2`) when `isHeaderRowMatch` succeeds so absent header columns never hijack `Weight`, `Reps`, `RIP`, or `RPE` columns; widened `detectColumnMap` header scan to 30 rows.
+   - Fixed `parseLoggedCellEntries` to handle pure weight `/` splitting (`"80 / 85 / 90"` across sets), combined `(RPE 8 · RIR 2)` annotations, `Weight x Reps` columns, and automatic Week 1 set reps backfill when numeric target `Reps` accompanies prefilled `Weight`.
+3. **Reliable Prefilled & Updated Worksheet Merging (`src/lib/gymService.ts`, `src/components/gym/SheetUploader.tsx`, `src/components/gym/GymApp.tsx`)**:
+   - Upgraded `mergeUpdatedWorksheetIntoPlan` (`src/lib/gymService.ts`) with per-field `mergeLogEntryWithSheet` backfilling (keeping user-logged numbers intact while filling empty `weight`, `reps`, `rpe`, `rir` slots even if notes exist) and an optional `replaceExistingWeekLogs` flag to overwrite matching week logs directly from an updated sheet while preserving notes, warmups, and other weeks.
+   - Fixed combined multi-day plan updates in `src/components/gym/SheetUploader.tsx` (`isCombinedMultiDayPlan`) so updating an existing combined plan preserves `splitByDay: false` instead of spawning duplicate per-day plans, added the `"Overwrite existing week logs from sheet"` toggle in both `SheetUploader.tsx` and the `GymApp.tsx` Modify Worksheet modal, and aligned worksheet `RIR / RIP` labeling.
+
+---
+
+## 38. Standard Upload Sheet Template, Exercise Completion Sync, Per-User Profile Background & Body-Weight Hydration Calculation
+
+1. **Standard Upload Sheet Format, Template Download & Full-Day Update Merge (`src/lib/sheetParser.ts`, `src/lib/workoutExcelExport.ts`, `src/components/gym/SheetUploader.tsx`)**:
+   - Defined the canonical **Standard Sheet Column Layout** (1st Column: **Exercises** with inline Day banner rows like `Day 1 - Push` in Column 1; 2nd Column: **Sets**; 3rd Column: **Reps**; followed by `RPE`, `RIP`, `Weight`, `Actual Reps`, `Notes`, and `Video URL`) and added `downloadStandardWorkoutTemplateExcel` (`workoutExcelExport.ts`) with a **Download Standard Template (.xlsx)** button inside `SheetUploader.tsx`.
+   - Fixed `isHeaderRowMatch` and `looksLikeDayBanner` in `src/lib/sheetParser.ts` so video/link columns never hijack the exercise name column, multi-cell Day banners with coach notes stay recognized as Day section headers, and URLs found inside `rawNameVal` or wrapped URL-only rows are stripped from `name` and routed strictly to the exercise's `video` URL.
+   - Fixed single-plan updating in `SheetUploader.tsx` (`hasSeparateExistingPlansForDays`) so updating a target plan from a multi-day or multi-tab workbook merges all selected tabs cleanly into the target plan without dropping days.
+2. **Exercise Input Auto-Check Motivation & Auto-Uncheck on Incomplete (`src/components/gym/GymApp.tsx`)**:
+   - Added `areExerciseInputsComplete` (`weight` and `reps` filled across every active set row) and live debounced/commit evaluation in `updateSetField`, `saveExerciseSets`, `adjustSetCount`, and `toggleExercise` (using `manuallyCheckedRef` to preserve explicit manual toggles): when every set input is completed, the exercise automatically checks off and triggers the motivational celebration; when any required input is cleared or an empty set is added to an auto-checked exercise, the exercise card automatically unchecks.
+3. **Per-User Custom Website Background Image (`server.ts`, `src/components/gym/GymApp.tsx`)**:
+   - Mounted `/uploads` static serving and added `GET /api/profile/background`, `POST /api/profile/background`, and `DELETE /api/profile/background` in `server.ts`, persisting uploaded PNG/JPG/WEBP/GIF files under `public/uploads/backgrounds/` and per-user settings (`imageUrl`, `dimPercent`, `updatedAt`) in `tmp/user_backgrounds.json` isolated by `username` (keeping Firestore `userAccounts` strict schema untouched).
+   - Added the **Website Background Image** card inside **Profile** (`GymApp.tsx`) with live preview, upload button (with client-side resizing via `compressBackgroundImageToDataUrl`), adjustable dim overlay slider (`20–95%`), remove/reset button, and fixed root background layer rendering synced via both `/api/profile/background` and per-user `localStorage` (`gymworkout_bg_<username>`).
+4. **Body-Weight-Based Water Intake Liters Calculation (`src/components/gym/GymApp.tsx`)**:
+   - Added `latestBodyWeightInfo` and `waterGoalSummary` computing daily hydration target directly from the user's latest logged body weight (`0.035 L × weightKg`, clamped `1.2–6.0 L`, converted cleanly when logged in `lbs`), translating to `250 ml` glasses and remaining liters (`{consumedLiters} / {targetLiters} L`).
+   - Updated the Dashboard **Daily Water Intake** card (including an inline quick weight entry when no scale check-in exists yet), Telegram water alert dispatches, and the **Body Weight** tab's Daily Hydration Target summary banner.
+

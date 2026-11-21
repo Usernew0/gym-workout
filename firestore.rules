@@ -1,7 +1,7 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    
+
     // Global safety net catch-all: default-deny all unmatched paths
     match /{document=**} {
       allow read, write: if false;
@@ -9,7 +9,7 @@ service cloud.firestore {
 
     // Common sanitization and validation helper functions
     function isValidId(id) {
-      return id is string && id.size() > 0 && id.size() <= 128;
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
     function incoming() {
@@ -20,310 +20,137 @@ service cloud.firestore {
       return resource.data;
     }
 
-    // Entity validation functions
-    function isValidMilestone(data) {
-      return data.keys().hasAll(['id', 'category', 'title', 'date', 'description', 'sweetMessage', 'photos', 'themeColor'])
-        && data.id is string && data.id.size() > 0 && data.id.size() <= 128
-        && data.category is string && data.category.size() <= 64
-        && data.title is string && data.title.size() <= 200
-        && data.date is string && data.date.size() <= 32
-        && data.description is string && data.description.size() <= 2000
-        && data.sweetMessage is string && data.sweetMessage.size() <= 2000
-        && data.photos is list && data.photos.size() <= 50
-        && data.themeColor is string && data.themeColor.size() <= 100
-        && (!('coupleId' in data) || (data.coupleId is string && data.coupleId.size() <= 128))
-        && (!('couple_id' in data) || (data.couple_id is string && data.couple_id.size() <= 128));
-    }
-
-    function isValidDatePlan(data) {
-      return data.keys().hasAll(['id', 'title', 'category', 'dateTime', 'location', 'description', 'checklist', 'status'])
-        && data.id is string && data.id.size() > 0 && data.id.size() <= 128
-        && data.title is string && data.title.size() <= 200
-        && data.category is string && data.category.size() <= 64
-        && data.dateTime is string && data.dateTime.size() <= 64
-        && data.location is string && data.location.size() <= 200
-        && data.description is string && data.description.size() <= 2000
-        && data.checklist is list && data.checklist.size() <= 100
-        && data.status is string && data.status.size() <= 32
-        && (!('coupleId' in data) || (data.coupleId is string && data.coupleId.size() <= 128))
-        && (!('couple_id' in data) || (data.couple_id is string && data.couple_id.size() <= 128));
-    }
-
-    function isValidMemory(data) {
-      return data.keys().hasAll(['id', 'title', 'type', 'url', 'description', 'date', 'category'])
-        && data.id is string && data.id.size() > 0 && data.id.size() <= 128
-        && data.title is string && data.title.size() <= 200
-        && data.type is string && (data.type == 'image' || data.type == 'video')
-        && data.url is string && data.url.size() <= 5000000
-        && data.description is string && data.description.size() <= 1000
-        && data.date is string && data.date.size() <= 32
-        && data.category is string && data.category.size() <= 64
-        && (!('coupleId' in data) || (data.coupleId is string && data.coupleId.size() <= 128))
-        && (!('couple_id' in data) || (data.couple_id is string && data.couple_id.size() <= 128));
-    }
-
-    function isValidLoveLetter(data) {
-      return data.keys().hasAll(['id', 'sender', 'recipient', 'subject', 'content', 'template', 'isOpened', 'date'])
-        && data.id is string && data.id.size() > 0 && data.id.size() <= 128
-        && data.sender is string && data.sender.size() <= 100
-        && data.recipient is string && data.recipient.size() <= 100
-        && data.subject is string && data.subject.size() <= 200
-        && data.content is string && data.content.size() <= 10000
-        && data.template is string && data.template.size() <= 32
-        && data.isOpened is bool
-        && data.date is string && data.date.size() <= 32
-        && (!('coupleId' in data) || (data.coupleId is string && data.coupleId.size() <= 128))
-        && (!('couple_id' in data) || (data.couple_id is string && data.couple_id.size() <= 128));
-    }
-
-    function isValidChatMessage(data) {
-      return data.keys().hasAll(['id', 'sender', 'content', 'timestamp'])
-        && data.id is string && data.id.size() > 0 && data.id.size() <= 128
-        && data.sender is string && data.sender.size() <= 100
-        && data.content is string && data.content.size() <= 10000
-        && data.timestamp is string && data.timestamp.size() <= 64
-        && (!('audioUrl' in data) || (data.audioUrl is string && data.audioUrl.size() <= 5000000))
-        && (!('imageUrl' in data) || (data.imageUrl is string && data.imageUrl.size() <= 5000000))
-        && (!('coupleId' in data) || (data.coupleId is string && data.coupleId.size() <= 128))
-        && (!('couple_id' in data) || (data.couple_id is string && data.couple_id.size() <= 128));
-    }
-
-    function isValidPresence(data) {
-      return data.keys().hasAll(['username', 'lastActive'])
-        && data.username is string && data.username.size() > 0 && data.username.size() <= 100
-        && data.lastActive is string && data.lastActive.size() <= 64
-        && (!('isOnline' in data) || data.isOnline is bool)
-        && (!('lastReadChatTime' in data) || data.lastReadChatTime == null || data.lastReadChatTime is number)
-        && (!('typingIn' in data) || data.typingIn == null || (data.typingIn is string && data.typingIn.size() <= 128))
-        && (!('typingAt' in data) || data.typingAt == null || (data.typingAt is string && data.typingAt.size() <= 64));
-    }
-
-    function isValidTypingStatus(data) {
-      return data.keys().hasAll(['username', 'isTyping'])
-        && data.username is string && data.username.size() > 0 && data.username.size() <= 100
-        && data.isTyping is bool
-        && (!('timestamp' in data) || data.timestamp is number || (data.timestamp is string && data.timestamp.size() <= 64));
-    }
-
-    function isValidNotification(data) {
-      return data.keys().hasAll(['id', 'type', 'sender'])
-        && data.id is string && data.id.size() > 0 && data.id.size() <= 128
-        && data.type is string && data.type.size() <= 64
-        && data.sender is string && data.sender.size() <= 100
-        && (!('timestamp' in data) || (data.timestamp is string && data.timestamp.size() <= 64))
-        && (!('coupleId' in data) || (data.coupleId is string && data.coupleId.size() <= 128));
-    }
-
-    function isValidChatGroup(data) {
-      return data.keys().hasAll(['id', 'name', 'createdBy', 'members'])
-        && data.id is string && data.id.size() > 0 && data.id.size() <= 128
-        && data.name is string && data.name.size() > 0 && data.name.size() <= 200
-        && data.createdBy is string && data.createdBy.size() <= 100
-        && data.members is list && data.members.size() <= 500;
-    }
-
-    function isValidCoupleQuestion(data) {
-      return data.keys().hasAll(['id', 'text', 'category', 'createdAt', 'answers'])
-        && data.id is string && data.id.size() > 0 && data.id.size() <= 128
-        && data.text is string && data.text.size() <= 1000
-        && data.category is string && data.category.size() <= 64
-        && data.createdAt is string && data.createdAt.size() <= 64
-        && data.answers is list && data.answers.size() <= 100
-        && (!('coupleId' in data) || (data.coupleId is string && data.coupleId.size() <= 128))
-        && (!('couple_id' in data) || (data.couple_id is string && data.couple_id.size() <= 128));
-    }
+    // ==========================================
+    // ENTITY VALIDATION BLUEPRINTS (GYM WORKOUT)
+    // ==========================================
 
     function isValidUserAccount(data) {
-      return data.keys().hasAll(['id', 'username', 'password'])
+      return data.keys().hasAll(['id', 'username'])
+        && data.keys().hasOnly([
+          'id', 'username', 'displayName', 'password', 'role', 'gender',
+          'weightUnitPreference', 'telegramUsername', 'telegramChatId',
+          'telegramNotificationsEnabled', 'waterIntake', 'bodyWeightHistory',
+          'restTimerPrefs', 'twoFactorEnabled', 'twoFactorSecret',
+          'twoFactorBackupCodes', 'twoFactorCreatedAt', 'visibleTabs',
+          'coupleId', 'createdAt', 'updatedAt'
+        ])
         && data.id is string && data.id.size() > 0 && data.id.size() <= 128
         && data.username is string && data.username.size() >= 2 && data.username.size() <= 128
-        && data.password is string && data.password.size() >= 4 && data.password.size() <= 256
+        && (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 128))
+        && (!('password' in data) || (data.password is string && data.password.size() <= 256))
+        && (!('role' in data) || (data.role is string && data.role.size() <= 32))
+        && (!('gender' in data) || (data.gender is string && data.gender.size() <= 32))
+        && (!('weightUnitPreference' in data) || (data.weightUnitPreference is string && (data.weightUnitPreference == 'kg' || data.weightUnitPreference == 'lbs')))
+        && (!('telegramUsername' in data) || (data.telegramUsername is string && data.telegramUsername.size() <= 128))
+        && (!('telegramChatId' in data) || (data.telegramChatId is string && data.telegramChatId.size() <= 64))
+        && (!('telegramNotificationsEnabled' in data) || data.telegramNotificationsEnabled is bool)
+        && (!('waterIntake' in data) || data.waterIntake is map)
+        && (!('bodyWeightHistory' in data) || (data.bodyWeightHistory is list && data.bodyWeightHistory.size() <= 2000))
+        && (!('restTimerPrefs' in data) || data.restTimerPrefs is map)
+        && (!('twoFactorEnabled' in data) || data.twoFactorEnabled is bool)
+        && (!('twoFactorSecret' in data) || (data.twoFactorSecret is string && data.twoFactorSecret.size() <= 256))
+        && (!('twoFactorBackupCodes' in data) || (data.twoFactorBackupCodes is list && data.twoFactorBackupCodes.size() <= 50))
+        && (!('twoFactorCreatedAt' in data) || (data.twoFactorCreatedAt is string && data.twoFactorCreatedAt.size() <= 64))
+        && (!('visibleTabs' in data) || (data.visibleTabs is list && data.visibleTabs.size() <= 20))
         && (!('coupleId' in data) || (data.coupleId is string && data.coupleId.size() <= 128))
-        && (!('role' in data) || (data.role is string && data.role.size() <= 32));
+        && (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64))
+        && (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
     }
 
     function isValidAdminSetting(data) {
       return data.id is string && data.id.size() > 0 && data.id.size() <= 128;
     }
 
-    function isValidCoupleTenant(data) {
-      return data.coupleId is string && data.coupleId.size() > 0 && data.coupleId.size() <= 128
-        && (!('partner1' in data) || (data.partner1 is string && data.partner1.size() <= 100))
-        && (!('partner2' in data) || (data.partner2 is string && data.partner2.size() <= 100))
-        && (!('plan' in data) || (data.plan is string && data.plan.size() <= 64));
-    }
-
     function isValidActivityLog(data) {
       return data.keys().hasAll(['id', 'username', 'action', 'details', 'timestamp'])
+        && data.keys().hasOnly(['id', 'username', 'action', 'details', 'timestamp', 'coupleId', 'couple_id'])
         && data.id is string && data.id.size() > 0 && data.id.size() <= 128
         && data.username is string && data.username.size() <= 100
         && data.action is string && data.action.size() <= 100
-        && data.details is string && data.details.size() <= 1000
+        && data.details is string && data.details.size() <= 2000
         && data.timestamp is string && data.timestamp.size() <= 64
-        && (!('coupleId' in data) || (data.coupleId is string && data.coupleId.size() <= 128))
-        && (!('couple_id' in data) || (data.couple_id is string && data.couple_id.size() <= 128));
-    }
-
-    function isValidCelebrationCard(data) {
-      return data.keys().hasAll(['id', 'type', 'title', 'targetDate'])
-        && data.id is string && data.id.size() > 0 && data.id.size() <= 128
-        && data.type is string && data.type.size() <= 64
-        && data.title is string && data.title.size() <= 200
-        && data.targetDate is string && data.targetDate.size() <= 64
-        && (!('coupleId' in data) || (data.coupleId is string && data.coupleId.size() <= 128))
-        && (!('couple_id' in data) || (data.couple_id is string && data.couple_id.size() <= 128));
-    }
-
-    function isValidMusicTrack(data) {
-      return data.keys().hasAll(['id', 'title', 'url', 'createdAt'])
-        && data.id is string && data.id.size() > 0 && data.id.size() <= 128
-        && data.title is string && data.title.size() <= 200
-        && data.url is string && data.url.size() <= 10000000
-        && data.createdAt is string && data.createdAt.size() <= 64
-        && (!('artist' in data) || (data.artist is string && data.artist.size() <= 200))
-        && (!('duration' in data) || (data.duration is string && data.duration.size() <= 32))
-        && (!('category' in data) || (data.category is string && data.category.size() <= 64))
-        && (!('dedication' in data) || (data.dedication is string && data.dedication.size() <= 2000))
-        && (!('userId' in data) || (data.userId is string && data.userId.size() <= 128))
-        && (!('uploadedBy' in data) || (data.uploadedBy is string && data.uploadedBy.size() <= 128))
-        && (!('fileName' in data) || (data.fileName is string && data.fileName.size() <= 256))
-        && (!('fileSize' in data) || (data.fileSize is string && data.fileSize.size() <= 64))
-        && (!('isPreset' in data) || (data.isPreset is bool))
         && (!('coupleId' in data) || (data.coupleId is string && data.coupleId.size() <= 128))
         && (!('couple_id' in data) || (data.couple_id is string && data.couple_id.size() <= 128));
     }
 
     function isValidWorkoutPlan(data) {
       return data.keys().hasAll(['id', 'ownerUsername', 'title', 'weeks', 'exercises'])
+        && data.keys().hasOnly([
+          'id', 'ownerUsername', 'title', 'description', 'instructions',
+          'sheetName', 'defaultWeightUnit', 'weeks', 'hasRpeColumn',
+          'hasRirColumn', 'warmupExercises', 'warmupLogs', 'exercises',
+          'sourceFileName', 'createdBy', 'assignedByAdmin', 'progress',
+          'exerciseLogs', 'previousLogs', 'createdAt', 'updatedAt'
+        ])
         && data.id is string && data.id.size() > 0 && data.id.size() <= 128
         && data.ownerUsername is string && data.ownerUsername.size() <= 128
         && data.title is string && data.title.size() <= 200
-        && data.weeks is number
+        && data.weeks is number && data.weeks >= 1 && data.weeks <= 104
         && data.exercises is list && data.exercises.size() <= 500
-        && (!('description' in data) || data.description is string && data.description.size() <= 2000)
+        && (!('description' in data) || (data.description is string && data.description.size() <= 2000))
+        && (!('instructions' in data) || (data.instructions is string && data.instructions.size() <= 20000))
+        && (!('sheetName' in data) || (data.sheetName is string && data.sheetName.size() <= 256))
+        && (!('defaultWeightUnit' in data) || (data.defaultWeightUnit is string && (data.defaultWeightUnit == 'kg' || data.defaultWeightUnit == 'lbs')))
+        && (!('hasRpeColumn' in data) || data.hasRpeColumn is bool)
+        && (!('hasRirColumn' in data) || data.hasRirColumn is bool)
+        && (!('warmupExercises' in data) || (data.warmupExercises is list && data.warmupExercises.size() <= 100))
+        && (!('warmupLogs' in data) || data.warmupLogs is map)
         && (!('sourceFileName' in data) || (data.sourceFileName is string && data.sourceFileName.size() <= 256))
-        && (!('createdBy' in data) || (data.createdBy is string && data.createdBy.size() <= 128));
+        && (!('createdBy' in data) || (data.createdBy is string && data.createdBy.size() <= 128))
+        && (!('assignedByAdmin' in data) || data.assignedByAdmin is bool)
+        && (!('progress' in data) || data.progress is map)
+        && (!('exerciseLogs' in data) || data.exerciseLogs is map)
+        && (!('previousLogs' in data) || data.previousLogs is map)
+        && (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64))
+        && (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
     }
 
     // ==========================================
-    // HARDENED COLLECTION ACCESS RULES
+    // COLLECTION ACCESS RULES
     // ==========================================
 
-    match /presence/{username} {
-      allow read: if true;
-      allow create, update: if isValidId(username) && incoming().username.lower() == username.lower() && isValidPresence(incoming());
-      allow delete: if isValidId(username);
-    }
-
-    match /typingStatus/{username} {
-      allow read: if true;
-      allow create, update: if isValidId(username) && incoming().username.lower() == username.lower() && isValidTypingStatus(incoming());
-      allow delete: if isValidId(username);
-    }
-
-    match /notifications/{notificationId} {
-      allow read: if true;
-      allow create, update: if isValidId(notificationId) && incoming().id == notificationId && isValidNotification(incoming());
-      allow delete: if isValidId(notificationId);
-    }
-
-    match /chatGroups/{groupId} {
-      allow read: if true;
-      allow create, update: if isValidId(groupId) && incoming().id == groupId && isValidChatGroup(incoming());
-      allow delete: if isValidId(groupId);
-    }
-
-    match /chatMessages/{messageId} {
-      allow read: if true;
-      allow create, update: if isValidId(messageId) && incoming().id == messageId && isValidChatMessage(incoming());
-      allow delete: if isValidId(messageId);
-    }
-
-    match /milestones/{milestoneId} {
-      allow read: if true;
-      allow create, update: if isValidId(milestoneId) && incoming().id == milestoneId && isValidMilestone(incoming());
-      allow delete: if isValidId(milestoneId);
-    }
-
-    match /datePlans/{datePlanId} {
-      allow read: if true;
-      allow create, update: if isValidId(datePlanId) && incoming().id == datePlanId && isValidDatePlan(incoming());
-      allow delete: if isValidId(datePlanId);
-    }
-
-    match /memories/{memoryId} {
-      allow read: if true;
-      allow create, update: if isValidId(memoryId) && incoming().id == memoryId && isValidMemory(incoming());
-      allow delete: if isValidId(memoryId);
-    }
-
-    match /letters/{letterId} {
-      allow read: if true;
-      allow create, update: if isValidId(letterId) && incoming().id == letterId && isValidLoveLetter(incoming());
-      allow delete: if isValidId(letterId);
-    }
-
-    match /coupleQuestions/{questionId} {
-      allow read: if true;
-      allow create, update: if isValidId(questionId) && incoming().id == questionId && isValidCoupleQuestion(incoming());
-      allow delete: if isValidId(questionId);
-    }
-
-    // User accounts: Prevents account takeover, username hijacking, and impersonation of admin
+    // Member accounts: Prevents account takeover, username hijacking, and 'admin' impersonation
     match /userAccounts/{userId} {
       allow read: if true;
       allow create: if isValidId(userId)
         && incoming().id == userId
         && isValidUserAccount(incoming())
+        && ('password' in incoming() && incoming().password is string && incoming().password.size() >= 4 && incoming().password.size() <= 256)
         && incoming().username.lower() != 'admin';
       allow update: if isValidId(userId)
         && incoming().id == userId
-        && incoming().id == existing().id
+        && (!('id' in existing()) || incoming().id == existing().id)
         && incoming().username.lower() == existing().username.lower()
         && isValidUserAccount(incoming())
+        && (!('password' in existing()) || ('password' in incoming() && incoming().password is string && incoming().password.size() >= 4 && incoming().password.size() <= 256))
         && incoming().username.lower() != 'admin';
       allow delete: if isValidId(userId) && existing().username.lower() != 'admin';
     }
 
-    // Admin settings: Protected against unauthorized client deletion and ID poisoning
+    // Admin settings: Protected against client deletion and ID poisoning
     match /adminSettings/{settingId} {
       allow read: if true;
       allow create, update: if isValidId(settingId) && incoming().id == settingId && isValidAdminSetting(incoming());
-      allow delete: if false; // System admin configurations cannot be deleted by client
+      allow delete: if false;
     }
 
-    // Couple tenants: Protected against workspace destruction
-    match /coupleTenants/{coupleId} {
-      allow read: if true;
-      allow create, update: if isValidId(coupleId) && incoming().coupleId == coupleId && isValidCoupleTenant(incoming());
-      allow delete: if false; // Tenant spaces cannot be deleted by client
-    }
-
-    // Activity logs: Tamper-proof append-only audit trail
+    // Activity logs: Append-only immutable audit trail
     match /activityLogs/{logId} {
       allow read: if true;
       allow create: if isValidId(logId) && incoming().id == logId && isValidActivityLog(incoming());
-      allow update: if false; // Existing audit logs are strictly immutable
+      allow update: if false;
       allow delete: if isValidId(logId);
     }
 
-    match /celebrationCards/{cardId} {
-      allow read: if true;
-      allow create, update: if isValidId(cardId) && incoming().id == cardId && isValidCelebrationCard(incoming());
-      allow delete: if isValidId(cardId);
-    }
-
-    // Workout plans: gym training sheets uploaded by admins or members
+    // Workout plans: Gym training sheets, warm-ups, weekly logs, and progress
     match /workoutPlans/{planId} {
       allow read: if true;
-      allow create, update: if isValidId(planId) && incoming().id == planId && isValidWorkoutPlan(incoming());
+      allow create: if isValidId(planId) && incoming().id == planId && isValidWorkoutPlan(incoming());
+      allow update: if isValidId(planId)
+        && incoming().id == planId
+        && (!('id' in existing()) || incoming().id == existing().id)
+        && isValidWorkoutPlan(incoming());
       allow delete: if isValidId(planId);
-    }
-
-    match /musicTracks/{trackId} {
-      allow read: if true;
-      allow create, update: if isValidId(trackId) && incoming().id == trackId && isValidMusicTrack(incoming());
-      allow delete: if isValidId(trackId);
     }
 
     // Startup connection ping document (read-only)
