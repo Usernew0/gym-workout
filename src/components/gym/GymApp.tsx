@@ -8,7 +8,7 @@ import {
   ChevronDown, ChevronUp, Plus, Minus, Zap, Pencil,
   FileSpreadsheet, Maximize2, ShieldCheck, Loader2, Download,
   User, KeyRound, Eye, EyeOff, Send, ShieldAlert, AlertCircle, Bell,
-  Droplets, RotateCcw, Clock, Timer, Volume2, Scale, Image as ImageIcon
+  Droplets, RotateCcw, Clock, Timer, Volume2, Scale, Image as ImageIcon, Layers
 } from 'lucide-react';
 import {
   ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip
@@ -42,10 +42,12 @@ import {
   parseSetsCount,
   splitSetsAndReps,
   parseSheetFileAllSheets,
+  consolidateMultiTabWorkoutSheets,
+  normalizeExerciseMatchKey,
   ParsedWeekData,
 } from '../../lib/sheetParser';
-import { exportWorkoutPlanToPdf, exportWorkoutPlanToPdfBuffer } from '../../lib/workoutPdfExport';
-import { exportWorkoutPlanToExcel, exportWorkoutPlanToExcelBuffer } from '../../lib/workoutExcelExport';
+import { exportWorkoutPlanToPdf, exportWorkoutPlanToPdfBuffer, exportAllWorkoutPlansToPdf } from '../../lib/workoutPdfExport';
+import { exportWorkoutPlanToExcel, exportWorkoutPlanToExcelBuffer, exportAllWorkoutPlansToExcel } from '../../lib/workoutExcelExport';
 import { TwoFactorSetupModal } from '../TwoFactorSetupModal';
 import { SheetUploader } from './SheetUploader';
 
@@ -505,16 +507,20 @@ function normalizeSetEntries(
 ): SetLogEntry[] {
   const targetCount = parseSetsCount(ex.sets);
 
-  // Respect user-customized setEntries length if already saved
+  // Respect user-customized setEntries length AND expand if target sets increased from an updated sheet
   if (logged?.setEntries && logged.setEntries.length > 0) {
-    return logged.setEntries.map((existing, idx) => ({
-      setNumber: idx + 1,
-      weight: existing?.weight ?? '',
-      unit: existing?.unit || logged.unit || defaultUnit,
-      reps: existing?.reps ?? '',
-      rpe: existing?.rpe ?? '',
-      rir: existing?.rir ?? '',
-    }));
+    const count = Math.max(targetCount, logged.setEntries.length);
+    return Array.from({ length: count }, (_, idx) => {
+      const existing = logged.setEntries![idx];
+      return {
+        setNumber: idx + 1,
+        weight: existing?.weight ?? '',
+        unit: existing?.unit || logged.unit || defaultUnit,
+        reps: existing?.reps ?? '',
+        rpe: existing?.rpe ?? '',
+        rir: existing?.rir ?? '',
+      };
+    });
   }
 
   // Backward-compatible hydration for legacy single sets/reps entries
@@ -1280,6 +1286,75 @@ export const GymApp: React.FC<GymAppProps> = ({
       setJustCompletedMotivation(null);
     }, 3400);
   };
+
+  const planVersionMapRef = useRef<Record<string, string>>({});
+
+  const clearPlanDraftCaches = (planId: string) => {
+    const prefix = `${planId}__`;
+    setDraftSets(prev => {
+      let changed = false;
+      const next = { ...prev };
+      Object.keys(next).forEach(k => {
+        if (k.startsWith(prefix) && !autoSaveTimerRef.current[k]) {
+          delete next[k];
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+    setWarmupDraftSets(prev => {
+      let changed = false;
+      const next = { ...prev };
+      Object.keys(next).forEach(k => {
+        if (k.startsWith(prefix)) {
+          delete next[k];
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+    setExerciseNoteDrafts(prev => {
+      let changed = false;
+      const next = { ...prev };
+      Object.keys(next).forEach(k => {
+        if (k.startsWith(prefix)) {
+          delete next[k];
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+    setExerciseNoteEnabledOverrides(prev => {
+      let changed = false;
+      const next = { ...prev };
+      Object.keys(next).forEach(k => {
+        if (k.startsWith(prefix)) {
+          delete next[k];
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+    for (const k of Array.from(manuallyUncheckedRef.current)) {
+      if (k.startsWith(prefix)) manuallyUncheckedRef.current.delete(k);
+    }
+    for (const k of Array.from(manuallyCheckedRef.current)) {
+      if (k.startsWith(prefix)) manuallyCheckedRef.current.delete(k);
+    }
+  };
+
+  useEffect(() => {
+    const prevVersions = planVersionMapRef.current;
+    const nextVersions: Record<string, string> = {};
+    plans.forEach(p => {
+      const sig = `${p.updatedAt || p.createdAt || ''}|${p.weeks}|${p.exercises?.length || 0}`;
+      nextVersions[p.id] = sig;
+      if (prevVersions[p.id] && prevVersions[p.id] !== sig) {
+        clearPlanDraftCaches(p.id);
+      }
+    });
+    planVersionMapRef.current = nextVersions;
+  }, [plans]);
 
   useEffect(() => {
     return () => {
@@ -2774,6 +2849,37 @@ export const GymApp: React.FC<GymAppProps> = ({
     }
   };
 
+  const handleExportAllPlansPdf = () => {
+    const owned = myPlans.filter(p => isOwnPlan(p));
+    if (owned.length === 0) return;
+    setOpenExportMenu(null);
+    const filename = exportAllWorkoutPlansToPdf(owned, {
+      ownerName: resolvedDisplayName,
+      waterGlasses,
+    });
+    setExportNotice(`Exported all ${owned.length} workouts -> ${filename}`);
+    setTimeout(() => setExportNotice(prev => (prev?.includes(filename) ? null : prev)), 3500);
+  };
+
+  const handleExportAllPlansExcel = async () => {
+    const owned = myPlans.filter(p => isOwnPlan(p));
+    if (owned.length === 0 || isExportingExcel) return;
+    setOpenExportMenu(null);
+    setIsExportingExcel(true);
+    try {
+      const filename = await exportAllWorkoutPlansToExcel(owned, {
+        ownerName: resolvedDisplayName,
+        waterGlasses,
+      });
+      setExportNotice(`Exported all ${owned.length} workouts -> ${filename}`);
+      setTimeout(() => setExportNotice(prev => (prev?.includes(filename) ? null : prev)), 3500);
+    } catch (err) {
+      console.warn('Multi-workout Excel export failed:', err);
+    } finally {
+      setIsExportingExcel(false);
+    }
+  };
+
   const handleSendSheetToTelegram = async (plan: WorkoutPlan, format: 'pdf' | 'excel') => {
     if (!isOwnPlan(plan) || isSendingSheetToBot || !hasTelegramUsername) return;
     setOpenExportMenu(null);
@@ -2896,9 +3002,42 @@ export const GymApp: React.FC<GymAppProps> = ({
                 <FileSpreadsheet className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
                 <div className="min-w-0">
                   <div className="text-xs font-bold text-white">Export as Excel (.xlsx)</div>
-                  <div className="text-[11px] text-neutral-400 leading-snug">Redesigned 5-sheet workbook &amp; analytics</div>
+                  <div className="text-[11px] text-neutral-400 leading-snug">Full sheet, Previous, analytics &amp; weekly logs</div>
                 </div>
               </button>
+
+              {myPlans.filter(p => isOwnPlan(p)).length > 1 && (
+                <div className="border-t border-white/10 my-1 pt-1 space-y-1">
+                  <div className="px-3 pt-0.5 text-[10px] font-bold uppercase tracking-wider text-neutral-500">
+                    All Workouts ({myPlans.filter(p => isOwnPlan(p)).length} Splits)
+                  </div>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={handleExportAllPlansPdf}
+                    className="w-full flex items-start gap-2.5 px-3 py-2 rounded-lg hover:bg-amber-500/15 text-left transition-colors cursor-pointer"
+                  >
+                    <Layers className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold text-white">Export All Workouts (.pdf)</div>
+                      <div className="text-[11px] text-neutral-400 leading-snug">All uploaded splits combined in 1 PDF</div>
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={isExportingExcel}
+                    onClick={handleExportAllPlansExcel}
+                    className="w-full flex items-start gap-2.5 px-3 py-2 rounded-lg hover:bg-emerald-500/15 disabled:opacity-50 text-left transition-colors cursor-pointer"
+                  >
+                    <FileSpreadsheet className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold text-white">Export All Workouts (.xlsx)</div>
+                      <div className="text-[11px] text-neutral-400 leading-snug">1 tab per split + combined analytics</div>
+                    </div>
+                  </button>
+                </div>
+              )}
 
               {hasTelegramUsername && (
                 <div className="border-t border-white/10 my-1 pt-1 space-y-1">
@@ -3389,25 +3528,63 @@ export const GymApp: React.FC<GymAppProps> = ({
     try {
       const detected = await parseSheetFileAllSheets(file);
       const workoutTabs = detected.filter(s => s.suggestedRole === 'workout' && s.exercises.length > 0);
-      const bestWorkoutTab =
-        workoutTabs.find(s => plan.sheetName && plan.sheetName.toLowerCase().includes(s.name.toLowerCase())) ||
-        workoutTabs.find(s => s.name.trim().toLowerCase() === plan.title.trim().toLowerCase()) ||
-        workoutTabs[0] ||
-        detected.find(s => s.exercises.length > 0);
+      const fallbackTab = detected.find(s => s.exercises.length > 0);
+      const activeTabs = workoutTabs.length > 0 ? workoutTabs : fallbackTab ? [fallbackTab] : [];
 
-      if (!bestWorkoutTab || bestWorkoutTab.exercises.length === 0) {
+      if (activeTabs.length === 0) {
         setWorksheetImportNotice('No exercise rows found in the uploaded file.');
         return;
       }
 
-      // If plan only targets a specific day extracted in sheetName (e.g. "Workouts · Day 1"), filter if possible
-      let importedExercises = bestWorkoutTab.exercises;
-      if (bestWorkoutTab.detectedDays.length > 1) {
-        const matchingDay = bestWorkoutTab.detectedDays.find(
-          d =>
-            d.trim().toLowerCase() === plan.title.trim().toLowerCase() ||
-            (plan.sheetName && plan.sheetName.toLowerCase().includes(d.toLowerCase()))
-        );
+      // If this workbook splits days across separate tabs AND the target plan corresponds to one specific day tab,
+      // match that specific tab; otherwise consolidate ALL workout tabs (including Week 1..N tabs & multi-day tabs).
+      const matchingDayTab =
+        activeTabs.length > 1
+          ? activeTabs.find(
+              s =>
+                s.name.trim().toLowerCase() === plan.title.trim().toLowerCase() ||
+                (plan.sheetName &&
+                  !plan.sheetName.includes(',') &&
+                  plan.sheetName.toLowerCase().includes(s.name.toLowerCase()) &&
+                  !plan.exercises.some(e => e.day && e.day.trim().toLowerCase() !== plan.title.trim().toLowerCase()))
+            )
+          : undefined;
+
+      const tabsToMerge = matchingDayTab ? [matchingDayTab] : activeTabs;
+      const consolidated = consolidateMultiTabWorkoutSheets(
+        tabsToMerge.map(t => ({
+          name: t.name,
+          exercises: t.exercises,
+          hasRpeColumn: t.hasRpeColumn,
+          hasRirColumn: t.hasRirColumn,
+          detectedDataWeeks: t.detectedDataWeeks,
+        }))
+      );
+
+      let importedExercises = consolidated.exercises;
+      const importedDays = Array.from(
+        new Set(importedExercises.map(ex => (ex.day || '').trim()).filter(Boolean))
+      );
+
+      // If this plan only covers ONE day out of a multi-day sheet, filter to that day; otherwise keep ALL days
+      const existingPlanDays = new Set(
+        (plan.exercises || []).map(e => normalizeExerciseMatchKey(e.day, false)).filter(Boolean)
+      );
+      if (importedDays.length > 1 && existingPlanDays.size === 1) {
+        const planTitleKey = normalizeExerciseMatchKey(plan.title, false);
+        const sheetNameSegments = (plan.sheetName || '')
+          .split(/[·,]/)
+          .map(seg => normalizeExerciseMatchKey(seg, false))
+          .filter(Boolean);
+        const matchingDay = importedDays.find(d => {
+          const dayKey = normalizeExerciseMatchKey(d, false);
+          return (
+            Boolean(dayKey) &&
+            (dayKey === planTitleKey ||
+              existingPlanDays.has(dayKey) ||
+              sheetNameSegments.some(seg => seg === dayKey))
+          );
+        });
         if (matchingDay) {
           const dayFiltered = importedExercises.filter(ex => !ex.day || ex.day === matchingDay);
           if (dayFiltered.length > 0) importedExercises = dayFiltered;
@@ -3417,19 +3594,37 @@ export const GymApp: React.FC<GymAppProps> = ({
       // Preview matched existing IDs right inside the draft
       const usedExistingIds = new Set<string>();
       const mappedExercises = importedExercises.map((row) => {
-        const normName = (row.name || '').trim().toLowerCase();
-        const normDay = (row.day || '').trim().toLowerCase();
+        const strictName = normalizeExerciseMatchKey(row.name, false);
+        const looseName = normalizeExerciseMatchKey(row.name, true);
+        const normDay = normalizeExerciseMatchKey(row.day, false);
         const matched =
-          (normName && normDay
+          (strictName && normDay
             ? plan.exercises.find(
                 e =>
                   !usedExistingIds.has(e.id) &&
-                  e.name.trim().toLowerCase() === normName &&
-                  (e.day || '').trim().toLowerCase() === normDay
+                  normalizeExerciseMatchKey(e.name, false) === strictName &&
+                  normalizeExerciseMatchKey(e.day, false) === normDay
               )
             : undefined) ||
-          (normName
-            ? plan.exercises.find(e => !usedExistingIds.has(e.id) && e.name.trim().toLowerCase() === normName)
+          (strictName && normDay
+            ? plan.exercises.find(e => {
+                if (usedExistingIds.has(e.id) || normalizeExerciseMatchKey(e.name, false) !== strictName) return false;
+                const exDay = normalizeExerciseMatchKey(e.day, false);
+                return exDay !== '' && (exDay.includes(normDay) || normDay.includes(exDay));
+              })
+            : undefined) ||
+          (looseName && normDay
+            ? plan.exercises.find(e => {
+                if (usedExistingIds.has(e.id) || normalizeExerciseMatchKey(e.name, true) !== looseName) return false;
+                const exDay = normalizeExerciseMatchKey(e.day, false);
+                return exDay !== '' && (exDay === normDay || exDay.includes(normDay) || normDay.includes(exDay));
+              })
+            : undefined) ||
+          (strictName
+            ? plan.exercises.find(e => !usedExistingIds.has(e.id) && normalizeExerciseMatchKey(e.name, false) === strictName)
+            : undefined) ||
+          (looseName
+            ? plan.exercises.find(e => !usedExistingIds.has(e.id) && normalizeExerciseMatchKey(e.name, true) === looseName)
             : undefined);
 
         if (matched) usedExistingIds.add(matched.id);
@@ -3450,7 +3645,7 @@ export const GymApp: React.FC<GymAppProps> = ({
           ...(row.loggedUnit ? { loggedUnit: row.loggedUnit } : {}),
           ...(row.loggedReps ? { loggedReps: row.loggedReps } : {}),
           ...(row.weeklyLogs ? { weeklyLogs: row.weeklyLogs } : {}),
-          ...(row.completed ? { completed: row.completed } : {}),
+          ...(row.completed !== undefined ? { completed: row.completed } : {}),
         };
       });
 
@@ -3459,27 +3654,39 @@ export const GymApp: React.FC<GymAppProps> = ({
         .map(s => s.textContent.trim())
         .join('\n\n');
 
+      const detectedUnit = tabsToMerge.find(t => t.detectedWeightUnit)?.detectedWeightUnit;
       const prefilledCount = mappedExercises.filter(
         m => m.weeklyLogs || m.loggedWeight || m.loggedReps || m.targetRpe || m.targetRir || m.completed
       ).length;
+      const detectedWeekNumbers = new Set<number>();
+      mappedExercises.forEach(m => {
+        Object.keys(m.weeklyLogs || {}).forEach(k => {
+          const n = Number(k);
+          if (n >= 1 && n <= 52) detectedWeekNumbers.add(n);
+        });
+      });
+      const weekSummaryList = Array.from(detectedWeekNumbers)
+        .sort((a, b) => a - b)
+        .map(w => `W${w}`)
+        .join(', ');
 
       setWorksheetDraft((prev) =>
         prev
           ? {
               ...prev,
-              weeks: Math.max(prev.weeks, bestWorkoutTab.detectedDataWeeks || 0),
-              defaultWeightUnit: bestWorkoutTab.detectedWeightUnit || prev.defaultWeightUnit,
+              weeks: Math.max(prev.weeks, consolidated.highestWeek || 1),
+              defaultWeightUnit: detectedUnit || prev.defaultWeightUnit,
               sourceFileName: file.name,
-              hasRpeColumn: bestWorkoutTab.hasRpeColumn,
-              hasRirColumn: bestWorkoutTab.hasRirColumn,
-              replaceExistingWeekLogs: prev.replaceExistingWeekLogs ?? false,
+              hasRpeColumn: consolidated.hasRpeColumn,
+              hasRirColumn: consolidated.hasRirColumn,
+              replaceExistingWeekLogs: prefilledCount > 0 ? true : Boolean(prev.replaceExistingWeekLogs),
               instructions: infoText || prev.instructions,
               exercises: mappedExercises,
             }
           : prev
       );
       setWorksheetImportNotice(
-        `Loaded ${mappedExercises.length} exercises from "${file.name}" (${usedExistingIds.size} matched to keep saved data${prefilledCount > 0 ? `, ${prefilledCount} rows with sheet data ready to import` : ''}). Click Save Worksheet to apply.`
+        `Loaded ${mappedExercises.length} exercises from "${file.name}" (${usedExistingIds.size} matched${prefilledCount > 0 ? `, ${prefilledCount} rows with training data${weekSummaryList ? ` across ${weekSummaryList}` : ''}` : ''}). Click Save Worksheet to apply.`
       );
     } catch (err: any) {
       setWorksheetImportNotice(`Failed to read file: ${err?.message || String(err)}`);
@@ -6937,7 +7144,10 @@ export const GymApp: React.FC<GymAppProps> = ({
                   existingPlans={myPlans}
                   activePlanId={activePlan?.id || ''}
                   onSaved={(_, firstPlanId) => {
-                    if (firstPlanId) openPlan(firstPlanId);
+                    if (firstPlanId) {
+                      clearPlanDraftCaches(firstPlanId);
+                      openPlan(firstPlanId);
+                    }
                     setActiveTab('dashboard');
                   }}
                 />

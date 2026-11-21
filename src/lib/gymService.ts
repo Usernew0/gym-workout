@@ -14,7 +14,7 @@ import {
   supabaseDelete,
 } from './supabaseService';
 import { WorkoutPlan, WorkoutExercise, ExerciseLogEntry, SetLogEntry, WeightUnit } from '../types';
-import { ParsedExerciseRow, parseSetsCount } from './sheetParser';
+import { ParsedExerciseRow, parseSetsCount, normalizeExerciseMatchKey } from './sheetParser';
 
 export function newId(prefix = 'wp'): string {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -247,7 +247,10 @@ function mergeLogEntryWithSheet(
   }
 
   const existingSets = existingEntry.setEntries || [];
-  const totalCount = Math.max(existingSets.length, incoming.setEntries.length, targetSetCount, 1);
+  const totalCount =
+    overwriteExisting && rawEntries.length > 0
+      ? Math.max(incoming.setEntries.length, targetSetCount, 1)
+      : Math.max(existingSets.length, incoming.setEntries.length, targetSetCount, 1);
   const mergedSets: SetLogEntry[] = Array.from({ length: totalCount }, (_, idx) => {
     const exS = existingSets[idx];
     const inS = incoming.setEntries[idx];
@@ -341,7 +344,8 @@ function applyParsedSheetDataForExercise(
         highestWeek = Math.max(highestWeek, wk);
         const wKey = `w${wk}`;
         if (!exerciseLogs[wKey]) exerciseLogs[wKey] = {};
-        if (populated.length > 0 || hasWeekNote) {
+        const hasPopulatedOrNote = populated.length > 0 || hasWeekNote;
+        if (hasPopulatedOrNote) {
           exerciseLogs[wKey][exId] = mergeLogEntryWithSheet(
             exerciseLogs[wKey][exId],
             weekData.entries,
@@ -352,9 +356,22 @@ function applyParsedSheetDataForExercise(
             weekData.weekNote
           );
         }
-        if (weekData.completed) {
-          const list = progress[wKey] || [];
+
+        const list = progress[wKey] || [];
+        if (weekData.completed === true) {
           if (!list.includes(exId)) progress[wKey] = [...list, exId];
+        } else if (weekData.completed === false && overwriteExisting) {
+          if (list.includes(exId)) progress[wKey] = list.filter(id => id !== exId);
+        } else if (populated.length > 0) {
+          const mergedSets = exerciseLogs[wKey][exId]?.setEntries || [];
+          const allSetsComplete =
+            mergedSets.length > 0 &&
+            mergedSets.every(s => (s.weight || '').trim() !== '' && (s.reps || '').trim() !== '');
+          if (allSetsComplete) {
+            if (!list.includes(exId)) progress[wKey] = [...list, exId];
+          } else if (overwriteExisting && list.includes(exId)) {
+            progress[wKey] = list.filter(id => id !== exId);
+          }
         }
       }
     }
@@ -376,12 +393,24 @@ function applyParsedSheetDataForExercise(
       nowIso,
       overwriteExisting
     );
+    const mergedSets = exerciseLogs[wKey][exId]?.setEntries || [];
+    const list = progress[wKey] || [];
+    if (
+      mergedSets.length > 0 &&
+      mergedSets.every(s => (s.weight || '').trim() !== '' && (s.reps || '').trim() !== '') &&
+      row.completed !== false
+    ) {
+      if (!list.includes(exId)) progress[wKey] = [...list, exId];
+    }
   }
 
-  if (row.completed) {
+  if (row.completed === true) {
     highestWeek = Math.max(highestWeek, 1);
     const list = progress.w1 || [];
     if (!list.includes(exId)) progress.w1 = [...list, exId];
+  } else if (row.completed === false && overwriteExisting) {
+    const list = progress.w1 || [];
+    if (list.includes(exId)) progress.w1 = list.filter(id => id !== exId);
   }
 
   return highestWeek;
@@ -518,8 +547,9 @@ export function mergeUpdatedWorksheetIntoPlan(
   const mergedExercises: WorkoutExercise[] = updates.exercises
     .filter((e) => e.name || e.sets || e.reps || e.targetRpe || e.rpe || e.targetRir || e.rir || e.notes || e.videoUrl || e.video || e.loggedWeight || e.weeklyLogs)
     .map((e) => {
-      const normName = (e.name || '').trim().toLowerCase();
-      const normDay = (e.day || '').trim().toLowerCase();
+      const strictName = normalizeExerciseMatchKey(e.name, false);
+      const looseName = normalizeExerciseMatchKey(e.name, true);
+      const normDay = normalizeExerciseMatchKey(e.day, false);
 
       let matchedExisting: WorkoutExercise | undefined;
 
@@ -528,20 +558,47 @@ export function mergeUpdatedWorksheetIntoPlan(
         matchedExisting = existing.exercises.find((ex) => ex.id === e.id);
       }
 
-      // 2. Match by normalized name + same day header
-      if (!matchedExisting && normName && normDay) {
+      // 2. Match by strict canonical name + same normalized day header
+      if (!matchedExisting && strictName && normDay) {
         matchedExisting = existing.exercises.find(
           (ex) =>
             !usedIds.has(ex.id) &&
-            (ex.name || '').trim().toLowerCase() === normName &&
-            (ex.day || '').trim().toLowerCase() === normDay
+            normalizeExerciseMatchKey(ex.name, false) === strictName &&
+            normalizeExerciseMatchKey(ex.day, false) === normDay
         );
       }
 
-      // 3. Match by normalized name alone
-      if (!matchedExisting && normName) {
+      // 2b. Match by strict canonical name + fuzzy day overlap (e.g. "Push" vs "Day 1 - Push")
+      if (!matchedExisting && strictName && normDay) {
+        matchedExisting = existing.exercises.find((ex) => {
+          if (usedIds.has(ex.id)) return false;
+          if (normalizeExerciseMatchKey(ex.name, false) !== strictName) return false;
+          const exDay = normalizeExerciseMatchKey(ex.day, false);
+          return exDay !== '' && (exDay.includes(normDay) || normDay.includes(exDay));
+        });
+      }
+
+      // 3. Match by loose canonical name (ignoring NBSP/dashes/"1."/"[SS]") + exact/fuzzy day
+      if (!matchedExisting && looseName && normDay) {
+        matchedExisting = existing.exercises.find((ex) => {
+          if (usedIds.has(ex.id)) return false;
+          if (normalizeExerciseMatchKey(ex.name, true) !== looseName) return false;
+          const exDay = normalizeExerciseMatchKey(ex.day, false);
+          return exDay !== '' && (exDay === normDay || exDay.includes(normDay) || normDay.includes(exDay));
+        });
+      }
+
+      // 4. Match by strict canonical name alone
+      if (!matchedExisting && strictName) {
         matchedExisting = existing.exercises.find(
-          (ex) => !usedIds.has(ex.id) && (ex.name || '').trim().toLowerCase() === normName
+          (ex) => !usedIds.has(ex.id) && normalizeExerciseMatchKey(ex.name, false) === strictName
+        );
+      }
+
+      // 5. Match by loose canonical name alone
+      if (!matchedExisting && looseName) {
+        matchedExisting = existing.exercises.find(
+          (ex) => !usedIds.has(ex.id) && normalizeExerciseMatchKey(ex.name, true) === looseName
         );
       }
 
@@ -560,6 +617,38 @@ export function mergeUpdatedWorksheetIntoPlan(
           shouldOverwriteWeeks
         );
         if (wk > maxSheetWeek) maxSheetWeek = wk;
+      }
+
+      // If the updated sheet increased target sets count (e.g. 3 -> 4), expand existing saved setEntries for untouched weeks too
+      const newTargetSets = e.sets?.trim() ? parseSetsCount(e.sets) : 0;
+      if (newTargetSets > 1) {
+        Object.keys(nextExerciseLogs).forEach((wKey) => {
+          const exLog = nextExerciseLogs[wKey]?.[resolvedId];
+          if (exLog?.setEntries && exLog.setEntries.length > 0 && exLog.setEntries.length < newTargetSets) {
+            const expanded: SetLogEntry[] = [
+              ...exLog.setEntries,
+              ...Array.from({ length: newTargetSets - exLog.setEntries.length }, (_, offset) => ({
+                setNumber: exLog.setEntries!.length + offset + 1,
+                weight: '',
+                unit: exLog.unit || defaultUnit,
+                reps: '',
+              })),
+            ];
+            nextExerciseLogs[wKey][resolvedId] = {
+              ...exLog,
+              sets: String(expanded.length),
+              setEntries: expanded,
+              updatedAt: now,
+            };
+            // Re-evaluate completion checkmark since a new unfilled set was added
+            if (shouldOverwriteWeeks && Array.isArray(nextProgress[wKey])) {
+              const allFilled = expanded.every(s => (s.weight || '').trim() !== '' && (s.reps || '').trim() !== '');
+              if (!allFilled && nextProgress[wKey].includes(resolvedId)) {
+                nextProgress[wKey] = nextProgress[wKey].filter(id => id !== resolvedId);
+              }
+            }
+          }
+        });
       }
 
       const resolvedVideo = (e.videoUrl ?? e.video ?? '').trim();
@@ -634,5 +723,6 @@ export function mergeUpdatedWorksheetIntoPlan(
     exerciseLogs: nextExerciseLogs,
     previousLogs: nextPreviousLogs,
     createdAt: existing.createdAt,
+    updatedAt: now,
   };
 }

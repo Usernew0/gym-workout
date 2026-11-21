@@ -2,13 +2,19 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Upload, FileSpreadsheet, Loader2, Trash2, Plus, Check,
   AlertTriangle, Video, User as UserIcon, Dumbbell, FileText,
-  Layers, Eye, Ban, CalendarDays, Tag, Zap, Download
+  Layers, Eye, Ban, CalendarDays, Tag, Zap, Download, Columns3, ChevronDown, ChevronUp
 } from 'lucide-react';
 import { UserAccount, WeightUnit, WorkoutPlan } from '../../types';
 import {
   parseSheetFileAllSheets,
+  rowsToExercisesWithMeta,
+  consolidateMultiTabWorkoutSheets,
+  extractWeekNumberFromTabName,
   ParsedExerciseRow,
   SheetRole,
+  ManualColumnMappingRole,
+  AssignableColumnKey,
+  DetectedSheetColumnInfo,
   emptyRow,
   getVideoThumbnailInfo,
   parseSetsCount,
@@ -119,6 +125,7 @@ interface SheetEntry {
   name: string;
   role: SheetRole;
   rawRows: string[][];
+  linkGrid?: (string | undefined)[][];
   textContent: string;
   exercises: ParsedExerciseRow[];
   detectedDays: string[];
@@ -126,12 +133,75 @@ interface SheetEntry {
   splitByDay: boolean;    // Save each selected day as its own workout title vs 1 combined plan
   customTitle: string;
   headerMatched: boolean;
+  headerRowIndex: number;
+  detectedColumns: DetectedSheetColumnInfo[];
+  missingRequiredColumns: AssignableColumnKey[];
+  missingOptionalColumns: AssignableColumnKey[];
+  columnAssignments: Record<number, ManualColumnMappingRole>;
+  hasCustomColumnOverride?: boolean;
   detectedDataWeeks: number;
   detectedWeightUnit?: WeightUnit;
   prefilledRowCount: number;
   hasRpeColumn: boolean;
   hasRirColumn: boolean;
 }
+
+const BASE_COLUMN_ROLE_OPTIONS: Array<{ value: ManualColumnMappingRole; label: string }> = [
+  { value: 'ignore', label: '— Ignore / Unused —' },
+  { value: 'name', label: 'Exercises (Exercise Name)' },
+  { value: 'day', label: 'Day / Split Header' },
+  { value: 'setsReps', label: 'Sets × Reps (Combined)' },
+  { value: 'sets', label: 'Sets (Target)' },
+  { value: 'reps', label: 'Reps (Target)' },
+  { value: 'weight', label: 'Week 1 / Weight (Logged)' },
+  { value: 'actual_reps', label: 'Week 1 / Actual Reps (Logged)' },
+  { value: 'weight_reps', label: 'Week 1 / Weight × Reps (Logged)' },
+  { value: 'rpe', label: 'RPE (Target / Week 1)' },
+  { value: 'rir', label: 'RIP / RIR (Target / Week 1)' },
+  { value: 'w1_notes', label: 'Week 1 Notes' },
+  { value: 'w1_done', label: 'Week 1 Done / Status' },
+  { value: 'w1_combined', label: 'Week 1 Set Breakdown / Combined' },
+  { value: 'notes', label: 'Coach Notes / Tempo / Rest' },
+  { value: 'video', label: 'Video URL / Link' },
+  { value: 'superset', label: 'Superset Tag' },
+  { value: 'done', label: 'Done / Status' },
+  { value: 'prev_combined', label: 'Previous Session (Weight × Reps)' },
+  { value: 'prev_weight', label: 'Previous Weight' },
+  { value: 'prev_reps', label: 'Previous Reps' },
+  { value: 'prev_rpe', label: 'Previous RPE' },
+  { value: 'prev_rir', label: 'Previous RIR / RIP' },
+];
+
+function buildColumnRoleOptions(maxWeeks: number): Array<{ value: ManualColumnMappingRole; label: string }> {
+  const limit = Math.min(52, Math.max(8, maxWeeks));
+  const weekOpts: Array<{ value: ManualColumnMappingRole; label: string }> = [];
+  for (let w = 2; w <= limit; w++) {
+    weekOpts.push(
+      { value: `w${w}_weight`, label: `Week ${w} Weight (Logged)` },
+      { value: `w${w}_reps`, label: `Week ${w} Reps (Logged)` },
+      { value: `w${w}_rpe`, label: `Week ${w} RPE` },
+      { value: `w${w}_rir`, label: `Week ${w} RIP / RIR` },
+      { value: `w${w}_notes`, label: `Week ${w} Notes` },
+      { value: `w${w}_done`, label: `Week ${w} Done / Status` },
+      { value: `w${w}_combined`, label: `Week ${w} Combined / Set Breakdown` }
+    );
+  }
+  return [...BASE_COLUMN_ROLE_OPTIONS, ...weekOpts];
+}
+
+const FIELD_META: Record<AssignableColumnKey | 'setsReps', { label: string; role: ManualColumnMappingRole; hint: string }> = {
+  name: { label: 'Exercises Name', role: 'name', hint: 'Column containing movement names (and optional Day rows)' },
+  sets: { label: 'Sets', role: 'sets', hint: 'Column with target set count (e.g. 3 or 4)' },
+  reps: { label: 'Reps', role: 'reps', hint: 'Column with target rep range (e.g. 8-12)' },
+  setsReps: { label: 'Sets × Reps', role: 'setsReps', hint: 'Combined column like "4 × 10"' },
+  day: { label: 'Day Header', role: 'day', hint: 'Separate Day column if days are not inline banners' },
+  weight: { label: 'Weight', role: 'weight', hint: 'Pre-filled or logged weights (kg/lbs)' },
+  actual_reps: { label: 'Actual Reps', role: 'actual_reps', hint: 'Logged actual reps performed' },
+  rpe: { label: 'RPE', role: 'rpe', hint: 'Target or logged RPE effort scale' },
+  rir: { label: 'RIP / RIR', role: 'rir', hint: 'Reps in Reserve (RIR / RIP)' },
+  notes: { label: 'Notes', role: 'notes', hint: 'Coaching cues, tempo, or rest instructions' },
+  video: { label: 'Video URL', role: 'video', hint: 'Exercise demo link (YouTube, Vimeo, Drive, etc.)' },
+};
 
 const ACCEPTED = '.xlsx,.xls,.csv,.tsv,.txt,.pdf';
 
@@ -155,6 +225,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
   const [sheets, setSheets] = useState<SheetEntry[]>([]);
   const [activeWorkoutIdx, setActiveWorkoutIdx] = useState<number>(0);
   const [previewInfoSheetIdx, setPreviewInfoSheetIdx] = useState<number | null>(null);
+  const [showColumnMapperPanel, setShowColumnMapperPanel] = useState(false);
   const [newDayInput, setNewDayInput] = useState('');
 
   // Manual row builder when no workbook is loaded
@@ -177,15 +248,17 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
   const [manualShowRir, setManualShowRir] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [savedMsg, setSavedMsg] = useState<string | null>(null);
+  const initializedTargetRef = useRef<string>('');
 
   useEffect(() => {
     if (initialAssignTo) setAssignTo(initialAssignTo);
-    if (initialTargetPlanId) {
-      setTargetPlanIdToUpdate(initialTargetPlanId);
-      setUploadTargetMode('update_current');
+    if (initialTargetPlanId && initializedTargetRef.current !== initialTargetPlanId) {
       const found = existingPlans.find(p => p.id === initialTargetPlanId);
       if (found) {
-        setWeeks(Math.max(1, found.weeks || 1));
+        initializedTargetRef.current = initialTargetPlanId;
+        setTargetPlanIdToUpdate(initialTargetPlanId);
+        setUploadTargetMode('update_current');
+        setWeeks(prev => Math.max(prev, found.weeks || 1));
         setWeightUnit(found.defaultWeightUnit || 'kg');
         if (found.description) setDescription(found.description);
         if (found.instructions) setInstructions(found.instructions);
@@ -233,6 +306,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
     setAutoMatchReason(manualReason);
     if (!planId) {
       setUploadTargetMode('create_new');
+      setReplaceExistingWeekLogs(false);
       return;
     }
     const found = candidateExistingPlans.find(p => p.id === planId);
@@ -241,6 +315,16 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
       setWeightUnit(found.defaultWeightUnit || 'kg');
       if (!description.trim() && found.description) setDescription(found.description);
       if (!instructions.trim() && found.instructions) setInstructions(found.instructions);
+      const loadedHasTrainedWeeks = sheets.some(
+        s =>
+          s.role === 'workout' &&
+          ((s.prefilledRowCount || 0) > 0 ||
+            (s.detectedDataWeeks || 0) > 0 ||
+            Boolean(extractWeekNumberFromTabName(s.name)))
+      );
+      if (loadedHasTrainedWeeks) {
+        setReplaceExistingWeekLogs(true);
+      }
       // When updating one specific plan, keep all days combined inside it unless separate existing day plans exist
       setSheets(prev =>
         prev.map(s =>
@@ -301,31 +385,46 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
       const baseFileTitle = file.name.replace(/\.[^.]+$/, '');
       const hasMultiple = detected.length > 1;
 
-      const entries: SheetEntry[] = detected.map((s) => ({
-        name: s.name,
-        role: s.suggestedRole,
-        rawRows: s.rawRows,
-        textContent: s.textContent,
-        exercises: s.exercises,
-        detectedDays: s.detectedDays || [],
-        selectedDays: [...(s.detectedDays || [])],
-        splitByDay: (s.detectedDays || []).length > 1,
-        customTitle: hasMultiple ? s.name : (baseFileTitle || s.name),
-        headerMatched: s.headerMatched,
-        detectedDataWeeks: s.detectedDataWeeks || 0,
-        detectedWeightUnit: s.detectedWeightUnit,
-        prefilledRowCount: s.prefilledRowCount || 0,
-        hasRpeColumn: Boolean(s.hasRpeColumn),
-        hasRirColumn: Boolean(s.hasRirColumn),
-      }));
+      const entries: SheetEntry[] = detected.map((s) => {
+        const assignments: Record<number, ManualColumnMappingRole> = {};
+        (s.detectedColumns || []).forEach((col) => {
+          assignments[col.colIdx] = col.assignedRole;
+        });
+        return {
+          name: s.name,
+          role: s.suggestedRole,
+          rawRows: s.rawRows,
+          linkGrid: s.linkGrid,
+          textContent: s.textContent,
+          exercises: s.exercises,
+          detectedDays: s.detectedDays || [],
+          selectedDays: [...(s.detectedDays || [])],
+          splitByDay: (s.detectedDays || []).length > 1,
+          customTitle: hasMultiple ? s.name : (baseFileTitle || s.name),
+          headerMatched: s.headerMatched,
+          headerRowIndex: s.headerRowIndex ?? -1,
+          detectedColumns: s.detectedColumns || [],
+          missingRequiredColumns: s.missingRequiredColumns || [],
+          missingOptionalColumns: s.missingOptionalColumns || [],
+          columnAssignments: assignments,
+          hasCustomColumnOverride: false,
+          detectedDataWeeks: s.detectedDataWeeks || 0,
+          detectedWeightUnit: s.detectedWeightUnit,
+          prefilledRowCount: s.prefilledRowCount || 0,
+          hasRpeColumn: Boolean(s.hasRpeColumn),
+          hasRirColumn: Boolean(s.hasRirColumn),
+        };
+      });
 
       setSheets(entries);
       setManualRows([]);
       setInstructions(rebuildInstructionsFromSheets(entries));
       setImportSheetData(true);
-      setReplaceExistingWeekLogs(false);
 
-      const maxDetectedWeeks = entries.reduce((mx, s) => Math.max(mx, s.detectedDataWeeks || 0), 0);
+      const maxDetectedWeeks = entries.reduce((mx, s) => {
+        const tabWk = s.role === 'workout' ? extractWeekNumberFromTabName(s.name) || 0 : 0;
+        return Math.max(mx, s.detectedDataWeeks || 0, tabWk);
+      }, 0);
       if (maxDetectedWeeks > 1) {
         setWeeks(prev => Math.max(prev, maxDetectedWeeks));
       }
@@ -334,10 +433,24 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
         setWeightUnit(detectedUnit);
       }
 
+      const hasTrainedWeekData = entries.some(
+        s =>
+          s.role === 'workout' &&
+          ((s.prefilledRowCount || 0) > 0 ||
+            (s.detectedDataWeeks || 0) > 0 ||
+            Boolean(extractWeekNumberFromTabName(s.name)))
+      );
+
       const firstWorkoutIdx = entries.findIndex(s => s.role === 'workout');
       setActiveWorkoutIdx(firstWorkoutIdx >= 0 ? firstWorkoutIdx : 0);
 
-      // Auto-match against user's current workout or closest existing plan
+      // Automatically open column mapper whenever any workout sheet has missing required columns or unmatched headers
+      const hasMissingColumns = entries.some(
+        s => s.role === 'workout' && (!s.headerMatched || s.missingRequiredColumns.length > 0)
+      );
+      setShowColumnMapperPanel(hasMissingColumns);
+
+      // Auto-Update existing plan by default when candidate plans exist (unless user explicitly chose Create as New Plan)
       let resolvedTargetPlan: WorkoutPlan | undefined;
       if (uploadTargetMode === 'update_current') {
         const preferred =
@@ -346,8 +459,8 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
         if (preferred) {
           resolvedTargetPlan = preferred;
           setTargetPlanIdToUpdate(preferred.id);
-          setAutoMatchReason('Auto-updating current workout plan');
-          setWeeks(prev => Math.max(prev, preferred.weeks || 1));
+          setAutoMatchReason('Auto-updating active workout plan');
+          setWeeks(prev => Math.max(prev, preferred.weeks || 1, maxDetectedWeeks));
         }
       } else if (uploadTargetMode === 'smart' && candidateExistingPlans.length > 0) {
         const matched = findAutoMatchedPlan(entries, file.name, candidateExistingPlans, currentWorkoutPlan?.id);
@@ -355,39 +468,50 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
           resolvedTargetPlan = matched.plan;
           setTargetPlanIdToUpdate(matched.plan.id);
           setAutoMatchReason(`Auto-matched (${matched.reason})`);
-          setWeeks(prev => Math.max(prev, matched.plan.weeks || 1));
+          setWeeks(prev => Math.max(prev, matched.plan.weeks || 1, maxDetectedWeeks));
           if (!detectedUnit && matched.plan.defaultWeightUnit) {
             setWeightUnit(matched.plan.defaultWeightUnit);
           }
           if (!description.trim() && matched.plan.description) {
             setDescription(matched.plan.description);
           }
-        } else if (currentWorkoutPlan && entries.filter(s => s.role === 'workout' && s.exercises.length > 0).length === 1) {
-          if (initialTargetPlanId) {
-            resolvedTargetPlan = currentWorkoutPlan;
-            setTargetPlanIdToUpdate(currentWorkoutPlan.id);
-            setAutoMatchReason('Targeted workout plan');
-          } else {
-            setTargetPlanIdToUpdate('');
-            setAutoMatchReason(null);
+        } else if (currentWorkoutPlan) {
+          // Automatic fallback to current active workout so uploaded updated sheets auto-update without manual selection
+          resolvedTargetPlan = currentWorkoutPlan;
+          setTargetPlanIdToUpdate(currentWorkoutPlan.id);
+          setAutoMatchReason('Auto-updating current workout plan');
+          setWeeks(prev => Math.max(prev, currentWorkoutPlan.weeks || 1, maxDetectedWeeks));
+          if (!detectedUnit && currentWorkoutPlan.defaultWeightUnit) {
+            setWeightUnit(currentWorkoutPlan.defaultWeightUnit);
+          }
+          if (!description.trim() && currentWorkoutPlan.description) {
+            setDescription(currentWorkoutPlan.description);
           }
         }
       }
 
-      // When updating a single target plan, keep splitByDay = false so ALL days & exercises update inside that plan
+      // Default to replacing/updating matching week logs automatically when updating an existing plan with trained week data
+      setReplaceExistingWeekLogs(Boolean(resolvedTargetPlan && hasTrainedWeekData));
+
+      // When updating a single target plan, preserve its title (for single-tab uploads) and keep splitByDay = false so ALL days merge
       if (resolvedTargetPlan) {
+        const workoutCount = entries.filter(s => s.role === 'workout').length;
         setSheets(prev =>
-          prev.map(s =>
-            s.role === 'workout' &&
-            (isCombinedMultiDayPlan(resolvedTargetPlan) || !hasSeparateExistingPlansForDays(s.selectedDays))
-              ? { ...s, splitByDay: false }
-              : s
-          )
+          prev.map(s => {
+            if (s.role !== 'workout') return s;
+            const keepCombined =
+              isCombinedMultiDayPlan(resolvedTargetPlan) || !hasSeparateExistingPlansForDays(s.selectedDays);
+            return {
+              ...s,
+              ...(keepCombined ? { splitByDay: false } : {}),
+              ...(workoutCount === 1 && resolvedTargetPlan?.title ? { customTitle: resolvedTargetPlan.title } : {}),
+            };
+          })
         );
       }
 
       if (entries.every(s => s.exercises.length === 0)) {
-        setError('Sheets were detected, but no structured exercise rows were recognized automatically. Select the Workout sheet tab below or add exercises manually.');
+        setError('No exercises could be extracted yet — check the Uploaded Sheet Columns panel below and assign which column holds Exercises, Sets, and Reps.');
       }
     } catch (err: any) {
       console.error('Sheet parse failed:', err);
@@ -395,6 +519,85 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
     } finally {
       setIsParsing(false);
     }
+  };
+
+  const applySheetColumnOverride = (
+    sheetIdx: number,
+    nextHeaderRowIndex: number,
+    nextAssignments: Record<number, ManualColumnMappingRole>
+  ) => {
+    setError(null);
+    setSheets(prev => {
+      const next = prev.map((s, i) => {
+        if (i !== sheetIdx) return s;
+        const reparsed = rowsToExercisesWithMeta(s.rawRows, s.linkGrid, {
+          headerRowIndex: nextHeaderRowIndex,
+          assignments: nextAssignments,
+        });
+        const nextDetectedDays = reparsed.detectedDays || [];
+        return {
+          ...s,
+          exercises: reparsed.exercises,
+          detectedDays: nextDetectedDays,
+          selectedDays: nextDetectedDays.length > 0 ? [...nextDetectedDays] : [],
+          headerMatched: reparsed.headerMatched,
+          headerRowIndex: nextHeaderRowIndex,
+          detectedColumns: reparsed.detectedColumns,
+          missingRequiredColumns: reparsed.missingRequiredColumns,
+          missingOptionalColumns: reparsed.missingOptionalColumns,
+          columnAssignments: nextAssignments,
+          hasCustomColumnOverride: true,
+          detectedDataWeeks: reparsed.detectedDataWeeks || 0,
+          detectedWeightUnit: reparsed.detectedWeightUnit || s.detectedWeightUnit,
+          prefilledRowCount: reparsed.prefilledRowCount || 0,
+          hasRpeColumn: Boolean(reparsed.hasRpeColumn),
+          hasRirColumn: Boolean(reparsed.hasRirColumn),
+        };
+      });
+      const updatedTarget = next[sheetIdx];
+      if (updatedTarget) {
+        if ((updatedTarget.detectedDataWeeks || 0) > 1) {
+          setWeeks(w => Math.max(w, updatedTarget.detectedDataWeeks || 1));
+        }
+        if (updatedTarget.detectedWeightUnit) {
+          setWeightUnit(updatedTarget.detectedWeightUnit);
+        }
+        const nowHasTrainedData = next.some(
+          st =>
+            st.role === 'workout' &&
+            ((st.prefilledRowCount || 0) > 0 ||
+              (st.detectedDataWeeks || 0) > 0 ||
+              Boolean(extractWeekNumberFromTabName(st.name)))
+        );
+        if (targetPlanIdToUpdate && nowHasTrainedData) {
+          setReplaceExistingWeekLogs(true);
+        }
+      }
+      return next;
+    });
+  };
+
+  const assignMissingFieldToColumn = (
+    sheetIdx: number,
+    role: ManualColumnMappingRole,
+    chosenColIdx: number
+  ) => {
+    const target = sheets[sheetIdx];
+    if (!target) return;
+    const nextAssignments: Record<number, ManualColumnMappingRole> = { ...target.columnAssignments };
+    // Clear previous column holding the same singular role
+    if (role !== 'ignore') {
+      Object.keys(nextAssignments).forEach(k => {
+        const idxNum = Number(k);
+        if (nextAssignments[idxNum] === role) {
+          nextAssignments[idxNum] = 'ignore';
+        }
+      });
+    }
+    if (chosenColIdx >= 0) {
+      nextAssignments[chosenColIdx] = role;
+    }
+    applySheetColumnOverride(sheetIdx, target.headerRowIndex, nextAssignments);
   };
 
   const workoutSheets = useMemo(
@@ -620,19 +823,26 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
         exercises: ParsedExerciseRow[];
         hasRpeColumn: boolean;
         hasRirColumn: boolean;
+        planWeeks: number;
       }> = [];
 
-      // If updating a single target plan from a multi-tab workbook (and there aren't separate existing plans per tab),
-      // combine all selected workout tabs with their day/tab labels so EVERY day updates into that target plan.
-      const shouldCombineMultiTabIntoTarget =
-        Boolean(targetPlanIdToUpdate) &&
+      const weekTaggedWorkouts = selectedWorkouts.filter(ws => extractWeekNumberFromTabName(ws.name) !== null);
+      const isWeekByTabWorkbook =
         selectedWorkouts.length > 1 &&
-        !hasSeparateExistingPlansForDays(selectedWorkouts.map(ws => ws.customTitle.trim() || ws.name));
+        (weekTaggedWorkouts.length >= 2 ||
+          (weekTaggedWorkouts.length >= 1 &&
+            weekTaggedWorkouts.some(ws => (extractWeekNumberFromTabName(ws.name) || 0) >= 2)));
+
+      // If updating a single target plan from a multi-tab workbook (or consolidating Week 1..N tabs),
+      // merge all selected workout tabs cleanly into a unified plan.
+      const shouldCombineMultiTabIntoTarget =
+        isWeekByTabWorkbook ||
+        (Boolean(targetPlanIdToUpdate) &&
+          selectedWorkouts.length > 1 &&
+          !hasSeparateExistingPlansForDays(selectedWorkouts.map(ws => ws.customTitle.trim() || ws.name)));
 
       if (shouldCombineMultiTabIntoTarget) {
-        const combinedExercises: ParsedExerciseRow[] = [];
-        let combinedRpe = false;
-        let combinedRir = false;
+        const tabsForConsolidation = [];
         for (const ws of selectedWorkouts) {
           if (ws.detectedDays.length > 0 && ws.selectedDays.length === 0) {
             setError(`Please select at least one Day header inside "${ws.name}" to link its exercises.`);
@@ -640,27 +850,32 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
           }
           const filtered = getFilteredExercisesForSheet(ws);
           if (filtered.length === 0) continue;
-          const fallbackDay = ws.customTitle.trim() || ws.name;
-          filtered.forEach(ex => {
-            combinedExercises.push({
-              ...ex,
-              day: ex.day?.trim() || fallbackDay,
-            });
+          tabsForConsolidation.push({
+            name: ws.name,
+            customTitle: ws.customTitle,
+            exercises: filtered,
+            hasRpeColumn: ws.hasRpeColumn,
+            hasRirColumn: ws.hasRirColumn,
+            detectedDataWeeks: ws.detectedDataWeeks,
           });
-          if (ws.hasRpeColumn || filtered.some(ex => Boolean(ex.rpe?.trim()))) combinedRpe = true;
-          if (ws.hasRirColumn || filtered.some(ex => Boolean(ex.rir?.trim()))) combinedRir = true;
         }
-        if (combinedExercises.length === 0) {
+        const consolidated = consolidateMultiTabWorkoutSheets(tabsForConsolidation);
+        if (consolidated.exercises.length === 0) {
           setError('No exercises matched the selected Day(s) inside the uploaded workbook.');
           return;
+        }
+        const effectivePlanWeeks = Math.max(weeks, consolidated.highestWeek || 1);
+        if (effectivePlanWeeks > weeks) {
+          setWeeks(effectivePlanWeeks);
         }
         const targetObj = candidateExistingPlans.find(p => p.id === targetPlanIdToUpdate);
         plansToCreate.push({
           title: targetObj?.title || selectedWorkouts[0].customTitle.trim() || selectedWorkouts[0].name,
           sheetName: selectedWorkouts.map(w => w.name).join(', '),
-          exercises: combinedExercises,
-          hasRpeColumn: combinedRpe,
-          hasRirColumn: combinedRir,
+          exercises: consolidated.exercises,
+          hasRpeColumn: consolidated.hasRpeColumn,
+          hasRirColumn: consolidated.hasRirColumn,
+          planWeeks: effectivePlanWeeks,
         });
       } else {
         for (const ws of selectedWorkouts) {
@@ -678,6 +893,15 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
             setError(`No exercises matched the selected Day(s) inside "${ws.name}".`);
             return;
           }
+
+          const tabWeekNum = extractWeekNumberFromTabName(ws.name) || 0;
+          let maxExWeek = Math.max(weeks, ws.detectedDataWeeks || 0, tabWeekNum);
+          filtered.forEach(ex => {
+            Object.keys(ex.weeklyLogs || {}).forEach(k => {
+              const wn = Number(k);
+              if (wn >= 1 && wn <= 52 && wn > maxExWeek) maxExWeek = wn;
+            });
+          });
 
           const sheetHasRpe = Boolean(
             ws.hasRpeColumn ||
@@ -698,6 +922,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
                   exercises: dayExercises,
                   hasRpeColumn: sheetHasRpe,
                   hasRirColumn: sheetHasRir,
+                  planWeeks: maxExWeek,
                 });
               }
             }
@@ -710,6 +935,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
                 exercises: untagged,
                 hasRpeColumn: sheetHasRpe,
                 hasRirColumn: sheetHasRir,
+                planWeeks: maxExWeek,
               });
             }
           } else {
@@ -722,6 +948,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
               exercises: filtered,
               hasRpeColumn: sheetHasRpe,
               hasRirColumn: sheetHasRir,
+              planWeeks: maxExWeek,
             });
           }
         }
@@ -760,7 +987,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
               instructions: instructions.trim() !== '' ? instructions : existingMatch.instructions,
               sheetName: item.sheetName,
               defaultWeightUnit: weightUnit,
-              weeks,
+              weeks: Math.max(weeks, item.planWeeks, existingMatch.weeks || 1),
               hasRpeColumn: item.hasRpeColumn,
               hasRirColumn: item.hasRirColumn,
               exercises: item.exercises,
@@ -779,7 +1006,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
               instructions,
               sheetName: item.sheetName,
               defaultWeightUnit: weightUnit,
-              weeks,
+              weeks: Math.max(weeks, item.planWeeks),
               hasRpeColumn: item.hasRpeColumn,
               hasRirColumn: item.hasRirColumn,
               exercises: item.exercises,
@@ -911,9 +1138,16 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
   const mergePreviewSummary = useMemo(() => {
     if (!selectedExistingPlan) return null;
     const incoming = isMultiSheetMode
-      ? sheets
-          .filter(s => s.role === 'workout' && s.exercises.length > 0)
-          .flatMap(s => getFilteredExercisesForSheet(s))
+      ? consolidateMultiTabWorkoutSheets(
+          sheets
+            .filter(s => s.role === 'workout' && s.exercises.length > 0)
+            .map(s => ({
+              name: s.name,
+              customTitle: s.customTitle,
+              exercises: getFilteredExercisesForSheet(s),
+              detectedDataWeeks: s.detectedDataWeeks,
+            }))
+        ).exercises
       : manualRows;
     if (incoming.length === 0) return null;
 
@@ -963,11 +1197,11 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
             Standard Sheet Column Layout
           </div>
           <p className="text-[11px] text-neutral-400 leading-relaxed">
-            <strong className="text-white">Col 1:</strong> Exercises (put Day headers like <code className="text-amber-300">Day 1 - Push</code> inside Col 1 above each day) ·{' '}
+            <strong className="text-white">Col 1:</strong> Exercises (put split/day headers like <code className="text-amber-300">Day 1</code>, <code className="text-amber-300">Torso</code>, <code className="text-amber-300">Limbs</code>, <code className="text-amber-300">Chest</code>, or <code className="text-amber-300">Push</code> above each session) ·{' '}
             <strong className="text-white">Col 2:</strong> Sets ·{' '}
             <strong className="text-white">Col 3:</strong> Reps ·{' '}
             <strong className="text-white">Col 4:</strong> RPE ·{' '}
-            <strong className="text-white">Col 5:</strong> RIP ·{' '}
+            <strong className="text-white">Col 5:</strong> RIR / RIP ·{' '}
             <strong className="text-white">Col 6:</strong> Weight ({weightUnit}) ·{' '}
             <strong className="text-white">Col 7:</strong> Actual Reps ·{' '}
             <strong className="text-white">Col 8:</strong> Notes ·{' '}
@@ -1291,7 +1525,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
               value={newDayInput}
               onChange={(e) => setNewDayInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addCustomDayHeader(); } }}
-              placeholder="Add day header (e.g. Day 1 - Push)"
+              placeholder="Add day / split header (e.g. Day 1, Torso, Limbs, Chest)"
               className="bg-neutral-950 border border-white/10 focus:border-amber-500/60 rounded-lg px-2.5 py-1.5 text-xs text-white outline-none flex-1 min-w-[200px]"
             />
             <button
@@ -1320,7 +1554,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
                 setManualTitle(e.target.value);
               }
             }}
-            placeholder="e.g. Push / Pull / Legs — Week 1"
+            placeholder="e.g. Torso / Limbs — Week 1 (or any split)"
             className="bg-neutral-900 border border-white/10 focus:border-red-500/60 rounded-xl px-3 py-2 text-sm text-white outline-none"
           />
         </label>
@@ -1501,16 +1735,273 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
         />
       </label>
 
+      {/* UPLOADED SHEET COLUMNS & MISSING COLUMN ASSIGNMENT */}
+      {isMultiSheetMode && activeSheet && activeSheetIndex >= 0 && (
+        <div
+          className={`rounded-2xl border p-4 space-y-3 ${
+            activeSheet.missingRequiredColumns.length > 0 || !activeSheet.headerMatched
+              ? 'border-amber-500/45 bg-amber-950/15'
+              : 'border-white/10 bg-neutral-900/60'
+          }`}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="space-y-0.5 min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <Columns3
+                  className={`w-4 h-4 shrink-0 ${
+                    activeSheet.missingRequiredColumns.length > 0 ? 'text-amber-400' : 'text-emerald-400'
+                  }`}
+                />
+                <h4 className="text-xs font-bold uppercase tracking-wider text-white">
+                  Uploaded Sheet Columns ({activeSheet.detectedColumns.length} found in &ldquo;{activeSheet.name}&rdquo;)
+                </h4>
+                {activeSheet.missingRequiredColumns.length > 0 ? (
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-500/20 border border-amber-400/50 text-amber-200">
+                    Missing {activeSheet.missingRequiredColumns.length} required column{activeSheet.missingRequiredColumns.length === 1 ? '' : 's'} — Assign below
+                  </span>
+                ) : (
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300">
+                    Core Columns Matched
+                  </span>
+                )}
+              </div>
+              {activeSheet.detectedColumns.length > 0 && (
+                <p className="text-[11px] text-neutral-400 truncate">
+                  Sheet headers:{' '}
+                  <span className="text-neutral-200 font-mono">
+                    {activeSheet.detectedColumns.map(c => `${c.columnLetter}: "${c.headerName}"`).join(' · ')}
+                  </span>
+                </p>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setShowColumnMapperPanel(v => !v)}
+              className="px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/15 text-xs font-bold text-neutral-200 inline-flex items-center gap-1.5 cursor-pointer shrink-0"
+            >
+              {showColumnMapperPanel ? (
+                <>
+                  <ChevronUp className="w-3.5 h-3.5" /> Hide Column Mapper
+                </>
+              ) : (
+                <>
+                  <ChevronDown className="w-3.5 h-3.5" /> Assign / Inspect Columns
+                </>
+              )}
+            </button>
+          </div>
+
+          {/* Highlighted Missing Required Columns Quick-Assigner (always visible when any required column is missing) */}
+          {activeSheet.missingRequiredColumns.length > 0 && (
+            <div className="rounded-xl border border-amber-500/30 bg-black/40 p-3 space-y-2.5">
+              <div className="text-[11px] font-semibold text-amber-200 flex items-center gap-1.5">
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                Assign the missing column(s) below using the columns found in your uploaded sheet:
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                {activeSheet.missingRequiredColumns.map((missingKey) => {
+                  const meta = FIELD_META[missingKey];
+                  const assignedCol = activeSheet.detectedColumns.find(
+                    c => c.assignedRole === meta.role || (missingKey !== 'name' && c.assignedRole === 'setsReps')
+                  );
+                  return (
+                    <label key={missingKey} className="flex flex-col gap-1">
+                      <span className="text-[11px] font-bold text-amber-100">
+                        Missing: {meta.label} *
+                      </span>
+                      <select
+                        value={assignedCol ? String(assignedCol.colIdx) : ''}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          if (val === '') return;
+                          assignMissingFieldToColumn(activeSheetIndex, meta.role, Number(val));
+                        }}
+                        className="bg-neutral-950 border border-amber-500/40 focus:border-amber-400 rounded-xl px-2.5 py-2 text-xs text-white outline-none"
+                      >
+                        <option value="">— Select sheet column for {meta.label} —</option>
+                        {activeSheet.detectedColumns.map((col) => (
+                          <option key={col.colIdx} value={String(col.colIdx)}>
+                            Col {col.columnLetter}: {col.headerName}
+                            {col.sampleValues.length > 0 ? ` (e.g. "${col.sampleValues[0].slice(0, 28)}")` : ''}
+                          </option>
+                        ))}
+                      </select>
+                      <span className="text-[10px] text-neutral-400">{meta.hint}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Full Column Names & Mapping Panel */}
+          {showColumnMapperPanel && (
+            <div className="rounded-xl border border-white/10 bg-black/45 p-3 space-y-3">
+              {/* Header row selector */}
+              <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-white/10">
+                <span className="text-[11px] text-neutral-300 font-semibold">
+                  Which row in &ldquo;{activeSheet.name}&rdquo; contains your column headers?
+                </span>
+                <select
+                  value={String(activeSheet.headerRowIndex)}
+                  onChange={(e) => {
+                    const nextHdr = Number(e.target.value);
+                    applySheetColumnOverride(activeSheetIndex, nextHdr, activeSheet.columnAssignments);
+                  }}
+                  className="bg-neutral-950 border border-white/15 rounded-lg px-2.5 py-1 text-xs text-white outline-none"
+                >
+                  <option value="-1">No Header Row (Start from Row 1)</option>
+                  {activeSheet.rawRows.slice(0, 12).map((rowCells, rIdx) => {
+                    const preview = rowCells.filter(Boolean).slice(0, 4).join(' | ');
+                    return (
+                      <option key={rIdx} value={String(rIdx)}>
+                        Row {rIdx + 1}{preview ? `: ${preview.slice(0, 55)}` : ''}
+                      </option>
+                    );
+                  })}
+                </select>
+              </div>
+
+              {/* Optional Missing Columns Quick-Assigner (Weight, Actual Reps, RPE, RIP/RIR, Notes, Video URL) */}
+              {activeSheet.missingOptionalColumns.length > 0 && (
+                <div className="space-y-1.5">
+                  <div className="text-[10px] uppercase tracking-wider font-bold text-neutral-400">
+                    Optional / Data Columns Not Yet Assigned (Assign if your sheet uses custom names)
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                    {activeSheet.missingOptionalColumns.map((optKey) => {
+                      const meta = FIELD_META[optKey];
+                      const currentCol = activeSheet.detectedColumns.find(c => c.assignedRole === meta.role);
+                      return (
+                        <div key={optKey} className="flex items-center justify-between gap-2 rounded-lg bg-neutral-900/70 border border-white/10 px-2.5 py-1.5">
+                          <span className="text-[11px] font-semibold text-neutral-300 shrink-0">{meta.label}</span>
+                          <select
+                            value={currentCol ? String(currentCol.colIdx) : ''}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              assignMissingFieldToColumn(activeSheetIndex, meta.role, val === '' ? -1 : Number(val));
+                            }}
+                            className="bg-neutral-950 border border-white/10 rounded-lg px-2 py-1 text-[11px] text-white outline-none max-w-[170px]"
+                          >
+                            <option value="">Not in sheet</option>
+                            {activeSheet.detectedColumns.map((col) => (
+                              <option key={col.colIdx} value={String(col.colIdx)}>
+                                Col {col.columnLetter}: {col.headerName}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* All Uploaded Columns Table */}
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-white/10 text-[10px] uppercase tracking-wider text-neutral-500">
+                      <th className="py-1.5 pr-3">Col</th>
+                      <th className="py-1.5 pr-3">Uploaded Sheet Column Name</th>
+                      <th className="py-1.5 pr-3">Sample Data</th>
+                      <th className="py-1.5">Assigned Workout Field</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-white/5">
+                    {(() => {
+                      const roleOptions = buildColumnRoleOptions(Math.max(weeks, activeSheet.detectedDataWeeks || 0, 8));
+                      return activeSheet.detectedColumns.map((col) => {
+                        const assigned = activeSheet.columnAssignments[col.colIdx] ?? col.assignedRole;
+                        const hasOption = roleOptions.some(o => o.value === assigned);
+                        return (
+                          <tr key={col.colIdx} className="hover:bg-white/[0.02]">
+                            <td className="py-1.5 pr-3 font-mono text-[11px] text-neutral-400">
+                              {col.columnLetter}
+                            </td>
+                            <td className="py-1.5 pr-3 font-semibold text-white">
+                              {col.headerName}
+                            </td>
+                            <td className="py-1.5 pr-3 text-[11px] text-neutral-400 font-mono max-w-[200px] truncate">
+                              {col.sampleValues.length > 0 ? col.sampleValues.join(' · ') : '—'}
+                            </td>
+                            <td className="py-1.5">
+                              <select
+                                value={assigned}
+                                onChange={(e) => {
+                                  const nextRole = e.target.value as ManualColumnMappingRole;
+                                  assignMissingFieldToColumn(activeSheetIndex, nextRole, col.colIdx);
+                                }}
+                                className={`bg-neutral-950 border rounded-lg px-2 py-1 text-[11px] font-semibold outline-none ${
+                                  assigned === 'ignore'
+                                    ? 'border-white/10 text-neutral-400'
+                                    : 'border-emerald-500/40 text-emerald-200'
+                                }`}
+                              >
+                                {!hasOption && (
+                                  <option value={assigned}>{assigned.replace('_', ' ').toUpperCase()}</option>
+                                )}
+                                {roleOptions.map((opt) => (
+                                  <option key={opt.value} value={opt.value}>
+                                    {opt.label}
+                                  </option>
+                                ))}
+                              </select>
+                            </td>
+                          </tr>
+                        );
+                      });
+                    })()}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* PRE-FILLED DATA NOTICE & TOGGLE */}
-      {displayedRows.some(r => r.weeklyLogs || r.loggedWeight || r.loggedReps || r.completed) && (
+      {(() => {
+        const rowsToCheck = isMultiSheetMode
+          ? sheets.filter(s => s.role === 'workout').flatMap(s => s.exercises)
+          : displayedRows;
+        const prefilledExercises = rowsToCheck.filter(
+          r => r.weeklyLogs || r.loggedWeight || r.loggedReps || r.completed
+        );
+        if (prefilledExercises.length === 0) return null;
+
+        const detectedWeekNums = new Set<number>();
+        sheets.forEach((s) => {
+          if (s.role !== 'workout') return;
+          const tabWk = extractWeekNumberFromTabName(s.name);
+          if (tabWk && s.exercises.some(e => e.weeklyLogs || e.loggedWeight || e.loggedReps || e.completed)) {
+            detectedWeekNums.add(tabWk);
+          }
+          s.exercises.forEach(ex => {
+            Object.keys(ex.weeklyLogs || {}).forEach(k => {
+              const n = Number(k);
+              if (n >= 1 && n <= 52) detectedWeekNums.add(n);
+            });
+          });
+        });
+        const sortedWeeks = Array.from(detectedWeekNums).sort((a, b) => a - b);
+
+        return (
         <div className="rounded-2xl border border-indigo-500/35 bg-indigo-950/20 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
           <div className="text-xs text-indigo-100 space-y-0.5">
-            <p className="font-bold text-indigo-200">
-              Pre-filled training data detected inside this sheet (
-              {displayedRows.filter(r => r.weeklyLogs || r.loggedWeight || r.loggedReps || r.completed).length} exercises)
+            <p className="font-bold text-indigo-200 flex flex-wrap items-center gap-2">
+              <span>
+                Pre-filled training data detected ({prefilledExercises.length} exercises)
+              </span>
+              {sortedWeeks.length > 0 && (
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-indigo-500/25 border border-indigo-400/40 text-indigo-100">
+                  Weeks: {sortedWeeks.map(w => `W${w}`).join(', ')}
+                </span>
+              )}
             </p>
             <p className="text-[11px] text-indigo-300/85">
-              Weights, kg/lbs units, actual reps, Week 1..N logs, Set 1..N data, Previous columns, and Done flags will be saved directly into your history.
+              Weights, kg/lbs units, actual reps, Week 1..N logs, Set 1..N data, RPE/RIP, and Done flags import automatically into your weekly history.
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -1521,7 +2012,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
                 onChange={(e) => setImportSheetData(e.target.checked)}
                 className="accent-indigo-500 w-4 h-4 cursor-pointer"
               />
-              Import sheet weights &amp; reps
+              Import sheet weights &amp; weeks
             </label>
             {selectedExistingPlan && importSheetData && (
               <label className="inline-flex items-center gap-2 text-xs font-semibold text-amber-200 bg-black/40 border border-amber-400/30 rounded-xl px-3 py-1.5 cursor-pointer shrink-0">
@@ -1536,7 +2027,8 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
             )}
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* Preview / editor */}
       {displayedRows.length > 0 && (() => {

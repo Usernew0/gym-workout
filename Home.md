@@ -1133,3 +1133,87 @@ Expanded and fixed the event trigger architecture to ensure 100% of security eve
    - Added `latestBodyWeightInfo` and `waterGoalSummary` computing daily hydration target directly from the user's latest logged body weight (`0.035 L × weightKg`, clamped `1.2–6.0 L`, converted cleanly when logged in `lbs`), translating to `250 ml` glasses and remaining liters (`{consumedLiters} / {targetLiters} L`).
    - Updated the Dashboard **Daily Water Intake** card (including an inline quick weight entry when no scale check-in exists yet), Telegram water alert dispatches, and the **Body Weight** tab's Daily Hydration Target summary banner.
 
+---
+
+## 39. Automatic Sheet Updates & Interactive Missing Column Assignment
+
+1. **Always-Auto Sheet Update Targeting (`src/components/gym/SheetUploader.tsx`)**:
+   - Upgraded `handleFile` in `'smart'` mode so uploading an updated workbook automatically targets the best matching existing plan (`findAutoMatchedPlan`) OR automatically falls back to the user's `currentWorkoutPlan` (`Auto-updating current workout plan`), preserving the plan title for single-tab uploads and combining multi-day tabs unless separate day plans exist. Users can still switch to `"Create as New Plan"` in one click.
+2. **Uploaded Sheet Column Names Inspector & Missing Column Mapper (`src/lib/sheetParser.ts`, `src/components/gym/SheetUploader.tsx`)**:
+   - Added `DetectedSheetColumnInfo`, `ManualColumnMappingRole`, `AssignableColumnKey`, `SheetColumnOverride`, `buildColumnMapFromOverride`, and `summarizeColumnsAndMissing` inside `src/lib/sheetParser.ts`, exposing exact column headers (`Col A: "..."`), sample values, `headerRowIndex`, `missingRequiredColumns`, and `missingOptionalColumns` on every parsed sheet while keeping custom mappings intact across repeated Day headers.
+   - Added the **Uploaded Sheet Columns & Missing Column Assignment** UI panel in `SheetUploader.tsx`: automatically opens and highlights missing required fields (`Exercises`, `Sets`, `Reps` / `Sets × Reps`) with sheet-column dropdowns showing the exact uploaded sheet column names + sample cell values, plus an expandable full column mapper table, header row selector, and optional column assigners (`Day`, `Weight`, `Actual Reps`, `RPE`, `RIP / RIR`, `Notes`, `Video URL`) that re-parse the sheet live on change.
+
+---
+
+## 40. Multi-Week Trained Data Updates (`Week 1..N` Columns & Multi-Tab `Week N` Workbooks)
+
+1. **Per-Week Column Mapping Support (`src/lib/sheetParser.ts`, `src/components/gym/SheetUploader.tsx`)**:
+   - Extended `ManualColumnMappingRole` and `COLUMN_ROLE_OPTIONS` with `w2_weight`/`w2_reps`/`w2_rpe`/`w2_rir` through `w4_*` so users can manually map custom headers directly into Weeks 2–4 alongside auto-detected `Week 1..52` / `Wk N` / `W1..N` headers and dual-row headers (`Week N Performance`).
+2. **Multi-Tab Week Consolidation & Trained Week Summary (`src/lib/sheetParser.ts`, `src/components/gym/SheetUploader.tsx`, `src/lib/gymService.ts`)**:
+   - Added `extractWeekNumberFromTabName` so workbooks organized as separate tabs per week (`Week 1`, `Week 2`, `W3`, etc.) consolidate by `(day, exercise name)` into a single unified plan with each tab's trained weights/reps/RPE/RIP/notes/done flags mapped to `weeklyLogs[tabWeekNum]`.
+   - Upgraded the Pre-filled Data notice to list exact detected weeks (`Weeks: W1, W2, ...`) across all selected workout sheets alongside `"Import sheet weights & weeks"` (auto-fills empty/new weeks and expands `plan.weeks`) and `"Overwrite existing week logs from sheet"` (replaces matching logged sets cleanly inside `mergeUpdatedWorksheetIntoPlan`).
+
+---
+
+## 41. Complete Multi-Week Sheet Update Reliability, Stale Draft Cache Invalidation & Dual-Header Fixes
+
+1. **Parser Fixes for All Multi-Week Formats (`src/lib/sheetParser.ts`)**:
+   - **Exported Sheet Round-Trip Priority (`week_breakdown`)**: Separated `Week N Set Breakdown` / `Sets Summary` (`week_breakdown`) from freeform combined columns so Set Breakdown runs first as baseline while direct user edits in `Week N Weight (kg)`, `Week N Reps`, `Week N RPE`, `Week N RIR`, and `Week N Notes` always take precedence without being overwritten by stale summary text. Also preserves explicit `"Set N:"` set indices inside multi-line breakdown cells.
+   - **Dual-Row Super-Header Fix (`buildMergedDualHeaderRow`)**: Preserved core Row-2 column headers (`Exercise`, `Sets`, `Reps`, `Video`, etc.) when Row 1 contains generic banners (`Program`, `Program Specification`) alongside `Week 1`, `Week 2`, `Week 3`, `Week 4` super-headers, preventing multi-week sheets from collapsing into Week 1.
+   - **Repeated Un-Numbered Week Block Auto-Numbering (`isHeaderRowMatch`)**: Automatically increments an implicit week counter (`Week 1`, `Week 2`, `Week 3`...) whenever a header row contains repeated un-numbered `Weight` / `Reps` / `RPE` / `RIR` / `Notes` / `Done` column blocks.
+   - **Dynamic `w1..w52` Column Override Preservation (`buildColumnMapFromOverride`, `summarizeColumnsAndMissing`)**: Generalized `ManualColumnMappingRole` to `w${number}_(weight|reps|rpe|rir|done|notes|combined)` and preserved Week 1..52, `Week N Notes`, `Week N Done`, and `Set N` mappings whenever users manually assign any missing column in the Column Mapper.
+   - **Shared `consolidateMultiTabWorkoutSheets` Helper**: Unified multi-tab consolidation for both `Week 1`..`Week N` tabs (including mixed `Program` + `Week 2` + `Week 3` workbooks and `Week 2` tabs with either generic `Weight`/`Reps` or explicit `Week 2 Weight` headers) and multi-day tabs, shared cleanly by `SheetUploader.tsx` and `GymApp.tsx`.
+
+2. **Automatic Overwrite Defaults, Synchronous Week Expansion & Progress Sync (`src/lib/gymService.ts`, `src/components/gym/SheetUploader.tsx`, `src/components/gym/GymApp.tsx`)**:
+   - Defaulted `"Overwrite existing week logs from sheet"` (`replaceExistingWeekLogs`) to `true` automatically whenever updating an existing plan with detected trained week data in both **Upload Sheet** (`SheetUploader.tsx`) and **Modify Worksheet -> Import Updated File** (`GymApp.tsx`).
+   - Upgraded `handleImportSheetIntoWorksheetDraft` (`GymApp.tsx`) to consolidate all workout & week tabs via `consolidateMultiTabWorkoutSheets` instead of reading only the first tab, and synchronized weekly `progress[wKey]` checkmarks cleanly in `applyParsedSheetDataForExercise` (`gymService.ts`) across Weeks `1..N`.
+   - Fixed stale React `draftSets` / `warmupDraftSets` / `exerciseNoteDrafts` shadowing updated plan logs by adding `clearPlanDraftCaches` (invoked on `SheetUploader.onSaved` and automatically whenever a plan's `updatedAt`, `weeks`, or exercise count changes).
+   - Fixed synchronous `planWeeks` calculation during `SheetUploader.handleSave`, dynamic `buildColumnRoleOptions` in the Column Mapper, and guarded `initialTargetPlanId` initialization so background snapshots never reset user-detected week counts.
+
+---
+
+## 42. Single-Exercise Sheet Update Reliability & Edge-Case Hardening
+
+1. **Eliminated Day-Banner False Positives Dropping Individual Exercises (`src/lib/sheetParser.ts`)**:
+   - Tightened `DAY_BANNER_PATTERN` with boundary lookaheads and added `EXERCISE_NOUN_HINT` / `STRICT_DAY_BANNER_PATTERN` checks inside `looksLikeDayBanner` so individual exercises beginning with split/muscle words (e.g., `Back Extension`, `Shoulder Press`, `Chest Press`, `Leg Curl`, `Pull Up`, `Push Up`) are never dropped as Day headers even when Sets/Reps are empty, qualitative (`AMRAP`, `Failure`, `BW`), or paired only with Notes.
+2. **Canonical Exercise Name Matching (`normalizeExerciseMatchKey`) (`src/lib/sheetParser.ts`, `src/lib/gymService.ts`, `src/components/gym/GymApp.tsx`)**:
+   - Exported `normalizeExerciseMatchKey(name, loose)` normalizing non-breaking/zero-width spaces (`\u00A0`), Unicode dashes (`–`, `—`), curly quotes, list numbers/bullets (`1.`, `1)`), and superset prefixes (`[SS]`, `A1 -`).
+   - Wired strict and loose canonical matching into `consolidateMultiTabWorkoutSheets`, `mergeUpdatedWorksheetIntoPlan`, and `handleImportSheetIntoWorksheetDraft` (plus exact delimited single-day plan filtering in `GymApp.tsx`) so minor sheet formatting differences preserve exercise IDs and update the right row instead of creating unlinked orphans.
+3. **Excel Vertical Merges, Qualitative Reps/Loads, Later-Tab Updates & Target Set Count Expansion (`src/lib/sheetParser.ts`, `src/lib/gymService.ts`, `src/components/gym/SheetUploader.tsx`, `src/components/gym/GymApp.tsx`)**:
+   - **Vertical Single-Column `!merges` (`extractExcelHyperlinkGrid`)**: Propagates vertically merged `Day`, `Sets`, `Reps`, `Video`, `Superset`, or `Notes` cells downward inside Excel sheets while keeping horizontal Day/Super-Header merges intact.
+   - **Broader Rep & Load Formats**: Added support in `parseLoggedCellEntries`, `set_reps`, `week_reps`, and `actual_reps` for `BW + 15`, `100 x AMRAP`, `Failure`, `Max`, and trailing cell annotations (`(paused)`, `each`, `per arm`), and preserved explicit `completed: false` unchecks (`Done = No`) without artificially inflating `detectedDataWeeks`.
+   - **Later-Tab Edits & Set Expansion**: `consolidateMultiTabWorkoutSheets` sorts Week tabs chronologically and lets later tabs (`Week 2+`) update `sets`, `reps`, `notes`, `video`, `rpe`, and `rir`; `mergeUpdatedWorksheetIntoPlan` expands existing `setEntries` when target `sets` increase (and stamps `updatedAt`); `normalizeSetEntries` in `GymApp.tsx` pads `setEntries` up to `targetCount`; and `selectTargetPlanToUpdate` in `SheetUploader.tsx` auto-enables `replaceExistingWeekLogs` whenever trained week data is loaded.
+
+---
+
+## 43. Multi-Split Workout Support, Full Uploaded Data Export Parity & Split-Neutral Standard Template
+
+1. **Universal Multi-Split Workout Sheet Detection (`src/lib/sheetParser.ts`)**:
+   - Expanded `HEADER_HINTS.day`, `WORKOUT_SHEET_NAME_HINT`, `STRICT_DAY_BANNER_PATTERN`, and `DAY_BANNER_PATTERN` to detect all common training splits (`Torso`, `Limbs`, `Pro Split` / `Bro Split` / `Chest` / `Back` / `Shoulders` / `Delts` / `Arms` / `Biceps` / `Triceps` / `Quads` / `Hamstrings` / `Calves` / `Abs`, `Anterior`, `Posterior`, `Push`, `Pull`, `Legs`, `PPL`, `Upper`, `Lower`, `Full Body`, `Day A–E`, `Split A/B`) while preserving `EXERCISE_NOUN_HINT` guards against false day-banner drops.
+   - Updated `TARGET_RIR_HEADER_HINT` and `classifyExtraDataHeader` to recognize combined `RIR / RIP` and `RIP / RIR` headers cleanly, and refined `classifySheetRole` so explicit guide/info tabs (`Template Guide`, `Instructions`) lacking sets/reps rows classify automatically as `instructions` rather than `workout`.
+
+2. **Export Parity (`Previous` Baselines) & Multi-Workout Export (`src/lib/workoutExcelExport.ts`, `src/lib/workoutPdfExport.ts`, `src/components/gym/GymApp.tsx`)**:
+   - **Excel Export Parity (`populatePlanWorkoutSheet`, `summarizePreviousMetric`)**: Conditionally includes the `Previous` column alongside `Day`, `Type`, `Exercise`, `Sets`, `Reps`, `Target RPE`, `Target RIR`, `Coach Notes`, `Video`, and `Week 1..N` logs/notes/done statuses, ensuring exported `.xlsx` sheets match and round-trip 100% of uploaded sheet data.
+   - **PDF Export Parity (`renderPlanIntoPdfDoc`)**: Displays recorded `Previous` baseline metrics directly inside exercise cards when `plan.previousLogs` is populated.
+   - **Multi-Workout Portfolio Exports (`buildAllWorkoutPlansExcelWorkbook`, `exportAllWorkoutPlansToExcel`, `buildAllWorkoutPlansPdfDocument`, `exportAllWorkoutPlansToPdf`)**: Added **Export All Workouts (.xlsx)** and **Export All Workouts (.pdf)** to `GymApp.tsx`'s `renderExportControl` menu (shown whenever a user has multiple plans/splits), producing either a unified Excel workbook (`All Workouts Summary` + one re-importable worksheet per workout plan + `Combined Analytics` + `Combined Set-by-Set Log`) or a multi-program A4 PDF portfolio.
+
+3. **Split-Neutral Standard Upload Template (`src/lib/workoutExcelExport.ts`, `src/components/gym/SheetUploader.tsx`)**:
+   - Extracted `buildStandardWorkoutTemplateWorkbook` used by `downloadStandardWorkoutTemplateExcel`, using universal standard column headers (`Exercises | Sets | Reps | RPE | RIR | Weight (kg/lbs) | Actual Reps | Notes | Video URL`) and neutral session banners (`Day 1`, `Day 2`, `Day 3`) instead of hardcoded `Day 1 - Push` / `Day 2 - Pull` / `Day 3 - Legs`, accompanied by a `Template Guide` tab documenting `Torso / Limbs`, `Pro / Bro Split`, `Push / Pull / Legs`, `Upper / Lower`, and `Multi-Week` usage.
+   - Updated `SheetUploader.tsx` layout helper text and input placeholders to be split-neutral across any training program.
+
+---
+
+## 44. Mid-Sheet Header Guard on `Day`-Column Sheets, `Day + Exercise` Banner Protection & Column Mapper Override Sync
+
+1. **Eliminated Mid-Sheet Header False Positives Wiping Weights & Sets (`src/lib/sheetParser.ts`)**:
+   - **Root Cause Fixed**: On sheets with a `Day` column paired with an `Exercises` column, unanchored substring regexes in `HEADER_HINTS.name` (e.g., `|lift|`, `|workout|`, `|movement|` matching exercise names such as `Romanian Deadlift` or `Leg Lift`) and `HEADER_HINTS.notes` (`|rest|` matching `Rest 90s`) caused `isHeaderRowMatch` to falsely match an actual exercise row mid-sheet. In `rowsToExercisesWithMeta`, that falsely switched `activeMap` to a broken 2-column map (`sets: -1`, `reps: -1`, `dataCols: []`), blanking out weights/sets for all subsequent rows automatically — and even with a manual column override active, that triggering row was still skipped via `continue`.
+   - **Fix Applied**:
+     - Anchored `HEADER_HINTS.superset`, `HEADER_HINTS.setsReps`, `HEADER_HINTS.name`, `HEADER_HINTS.notes`, and `HEADER_HINTS.video` with exact column header phrasing rather than arbitrary substrings inside exercise names or cues.
+     - Added a `numericDataCells` guard in `isHeaderRowMatch` so rows containing numeric/bodyweight data without explicit `Sets`/`Reps`/`Sets × Reps` headers immediately return `matched: false`.
+     - Updated `rowsToExercisesWithMeta` to skip mid-sheet `subHeader`/`dualSub` matching whenever `customOverride` is active OR `rowHasConcreteExerciseData` is true, preventing both `activeMap` corruption and accidental row skips.
+
+2. **`Day + Exercise` Row Protection & Column Mapper Override Sync (`src/lib/sheetParser.ts`, `src/components/gym/SheetUploader.tsx`)**:
+   - **`looksLikeDayBanner` Guard**: Added an explicit check so rows with both an active `Day` column (`map.day >= 0`) and `Exercise` column (`map.name >= 0`, `day !== name`) holding distinct non-empty values are never classified or swallowed as standalone Day banner rows even when `Sets`/`Reps` cells are blank or non-numeric.
+   - **Dedicated `Previous` Roles (`prev_combined`, `prev_weight`, `prev_reps`, `prev_rpe`, `prev_rir`)**: Added dedicated Previous Session roles to `ManualColumnMappingRole`, `summarizeColumnsAndMissing`, `buildColumnMapFromOverride`, and `SheetUploader.tsx` `BASE_COLUMN_ROLE_OPTIONS` so `Previous` columns no longer collide with `Week 1 Weight` / `Actual Reps` in the Column Mapper.
+   - **Override State Sync (`applySheetColumnOverride`)**: Ensured manual Column Mapper re-assignments also sync detected `weightUnit` and automatically enable `replaceExistingWeekLogs` when updating an existing plan with newly detected trained week data.
+

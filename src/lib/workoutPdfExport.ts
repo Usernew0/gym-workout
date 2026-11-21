@@ -110,11 +110,15 @@ export interface ExportWorkoutPdfOptions {
  * - Warm-up Protocol Table
  * - Day-Combined Training Sections (Day Header + Exercises + Aligned Weekly Set/RPE/Volume Tables + Day Session Notes)
  */
-export function buildWorkoutPlanPdfDocument(
+function renderPlanIntoPdfDoc(
+  doc: jsPDF,
   plan: WorkoutPlan,
-  options: ExportWorkoutPdfOptions = {}
-): jsPDF {
-  const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+  options: ExportWorkoutPdfOptions = {},
+  startOnNewPage = false
+): void {
+  if (startOnNewPage) {
+    doc.addPage();
+  }
   const pageWidth = doc.internal.pageSize.getWidth();
   const pageHeight = doc.internal.pageSize.getHeight();
   const margin = 13;
@@ -538,6 +542,15 @@ export function buildWorkoutPlanPdfDocument(
         metaBadges.push(`Done: ${completedWeeks.join(', ')}`);
       }
 
+      const prevSets = getPopulatedSetList(ex, plan.previousLogs?.[ex.id], planUnit);
+      const prevSummaryLine =
+        prevSets.length > 0
+          ? `Previous: ${prevSets.map((s) => formatCompactSet(s, planUnit, showRpe, showRir)).join('  |  ')}`
+          : '';
+      const prevLines = prevSummaryLine
+        ? doc.splitTextToSize(pdfSafeText(prevSummaryLine), contentWidth - 10)
+        : [];
+
       const coachNotesLines = ex.notes ? doc.splitTextToSize(`Coach Note: ${pdfSafeText(ex.notes)}`, contentWidth - 10) : [];
 
       const extraColW = (showRpe ? 16 : 0) + (showRir ? 16 : 0);
@@ -553,6 +566,7 @@ export function buildWorkoutPlanPdfDocument(
       const cardH =
         11.5 +
         (metaBadges.length > 0 ? 4.4 : 0) +
+        prevLines.length * 3.8 +
         coachNotesLines.length * 3.8 +
         (ex.videoUrl ? 3.8 : 0) +
         tableTotalH +
@@ -585,6 +599,14 @@ export function buildWorkoutPlanPdfDocument(
         doc.setTextColor(ex.isSuperset ? 162 : 185, ex.isSuperset ? 28 : 28, ex.isSuperset ? 175 : 28);
         doc.text(doc.splitTextToSize(metaBadges.join('   |   '), contentWidth - 8)[0], margin + 3.5, cy);
         cy += 4.3;
+      }
+
+      if (prevLines.length > 0) {
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(7.6);
+        doc.setTextColor(79, 70, 229);
+        doc.text(prevLines, margin + 3.5, cy);
+        cy += prevLines.length * 3.8;
       }
 
       if (coachNotesLines.length > 0) {
@@ -748,9 +770,12 @@ export function buildWorkoutPlanPdfDocument(
     });
   }
 
-  // =========================================================================
-  // 8. PAGE FOOTERS
-  // =========================================================================
+}
+
+function applyPdfFooters(doc: jsPDF, footerTitle: string) {
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const margin = 13;
   const pageCount = doc.getNumberOfPages();
   for (let p = 1; p <= pageCount; p++) {
     doc.setPage(p);
@@ -759,10 +784,122 @@ export function buildWorkoutPlanPdfDocument(
     doc.setFont('helvetica', 'normal');
     doc.setFontSize(7.8);
     doc.setTextColor(100, 116, 139);
-    doc.text(`Gym Workout  -  ${pdfSafeText(plan.title)}`, margin, pageHeight - 6.5);
+    doc.text(`Gym Workout  -  ${pdfSafeText(footerTitle)}`, margin, pageHeight - 6.5);
     doc.text(`Page ${p} of ${pageCount}`, pageWidth - margin, pageHeight - 6.5, { align: 'right' });
   }
+}
 
+export function buildWorkoutPlanPdfDocument(
+  plan: WorkoutPlan,
+  options: ExportWorkoutPdfOptions = {}
+): jsPDF {
+  const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+  renderPlanIntoPdfDoc(doc, plan, options, false);
+  applyPdfFooters(doc, plan.title || 'Workout Plan');
+  return doc;
+}
+
+export function buildAllWorkoutPlansPdfDocument(
+  plans: WorkoutPlan[],
+  options: ExportWorkoutPdfOptions = {}
+): jsPDF {
+  if (plans.length <= 1 && plans[0]) {
+    return buildWorkoutPlanPdfDocument(plans[0], options);
+  }
+
+  const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const margin = 13;
+  const contentWidth = pageWidth - margin * 2;
+  let y = 13;
+
+  doc.setFillColor(17, 20, 28);
+  doc.roundedRect(margin, y, contentWidth, 27, 3, 3, 'F');
+  doc.setFillColor(220, 38, 38);
+  doc.rect(margin, y, 2.8, 27, 'F');
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(8.5);
+  doc.setTextColor(248, 113, 113);
+  doc.text('GYM WORKOUT  -  COMPLETE MULTI-SPLIT PROGRAM REPORT', margin + 6, y + 6.5);
+
+  doc.setFontSize(15);
+  doc.setTextColor(255, 255, 255);
+  doc.text(`All Workouts Portfolio (${plans.length} Programs)`, margin + 6, y + 14);
+
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(8.5);
+  doc.setTextColor(203, 213, 225);
+  const memberLabel = pdfSafeText(options.ownerName || plans[0]?.ownerUsername || 'Athlete');
+  const exportDate = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+  doc.text(`Athlete: ${memberLabel}  |  Total Plans: ${plans.length}  |  ${exportDate}`, margin + 6, y + 21);
+  y += 33;
+
+  // Overview table of all uploaded splits / programs
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(10);
+  doc.setTextColor(15, 23, 42);
+  doc.text('Included Workout Programs & Splits', margin, y);
+  y += 4;
+
+  const cols = [contentWidth * 0.34, contentWidth * 0.32, contentWidth * 0.12, contentWidth * 0.1, contentWidth * 0.12];
+  const hdrs = ['Workout Title', 'Days / Split', 'Exercises', 'Weeks', 'Done %'];
+  doc.setFillColor(30, 41, 59);
+  doc.rect(margin, y, contentWidth, 6.8, 'F');
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(7.8);
+  doc.setTextColor(255, 255, 255);
+  let cx = margin;
+  hdrs.forEach((h, i) => {
+    doc.text(h, cx + 2, y + 4.6);
+    cx += cols[i];
+  });
+  y += 6.8;
+
+  plans.forEach((p, idx) => {
+    if (y + 8 > pageHeight - 18) {
+      doc.addPage();
+      y = 14;
+    }
+    const exs = p.exercises || [];
+    const wks = Math.max(1, Number(p.weeks) || 1);
+    const daysList = Array.from(new Set(exs.map((e) => normalizeDayKey(e.day))));
+    let doneCount = 0;
+    for (let w = 0; w < wks; w++) doneCount += (p.progress?.[weekKey(w)] || []).length;
+    const totalPossible = exs.length * wks;
+    const pct = totalPossible > 0 ? Math.round((doneCount / totalPossible) * 100) : 0;
+
+    doc.setFillColor(idx % 2 === 0 ? 255 : 248, idx % 2 === 0 ? 255 : 250, idx % 2 === 0 ? 255 : 252);
+    doc.setDrawColor(226, 232, 240);
+    doc.rect(margin, y, contentWidth, 6.6, 'FD');
+
+    let rx = margin;
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7.8);
+    doc.setTextColor(15, 23, 42);
+    doc.text(doc.splitTextToSize(pdfSafeText(p.title), cols[0] - 3)[0] || '', rx + 2, y + 4.4);
+    rx += cols[0];
+
+    doc.setFont('helvetica', 'normal');
+    doc.setTextColor(51, 65, 85);
+    doc.text(doc.splitTextToSize(pdfSafeText(daysList.join(' - ')), cols[1] - 3)[0] || '', rx + 2, y + 4.4);
+    rx += cols[1];
+    doc.text(String(exs.length), rx + 2, y + 4.4);
+    rx += cols[2];
+    doc.text(String(wks), rx + 2, y + 4.4);
+    rx += cols[3];
+    doc.setFont('helvetica', 'bold');
+    doc.text(`${pct}%`, rx + 2, y + 4.4);
+
+    y += 6.6;
+  });
+
+  plans.forEach((plan) => {
+    renderPlanIntoPdfDoc(doc, plan, options, true);
+  });
+
+  applyPdfFooters(doc, `All Workouts (${plans.length})`);
   return doc;
 }
 
@@ -775,6 +912,39 @@ export function getWorkoutPdfFilename(plan: WorkoutPlan): string {
       .slice(0, 48) || 'workout-plan';
   const dateStamp = new Date().toISOString().slice(0, 10);
   return `${safeSlug}-${dateStamp}.pdf`;
+}
+
+export function exportAllWorkoutPlansToPdfBuffer(
+  plans: WorkoutPlan[],
+  options: ExportWorkoutPdfOptions = {}
+): { filename: string; buffer: Uint8Array } {
+  const doc = buildAllWorkoutPlansPdfDocument(plans, options);
+  const dateStamp = new Date().toISOString().slice(0, 10);
+  const athleteSlug =
+    (options.ownerName || plans[0]?.ownerUsername || 'athlete')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/gi, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 32) || 'athlete';
+  const filename = `gym-all-workouts-${athleteSlug}-${dateStamp}.pdf`;
+  return { filename, buffer: new Uint8Array(doc.output('arraybuffer')) };
+}
+
+export function exportAllWorkoutPlansToPdf(
+  plans: WorkoutPlan[],
+  options: ExportWorkoutPdfOptions = {}
+): string {
+  const doc = buildAllWorkoutPlansPdfDocument(plans, options);
+  const dateStamp = new Date().toISOString().slice(0, 10);
+  const athleteSlug =
+    (options.ownerName || plans[0]?.ownerUsername || 'athlete')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/gi, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 32) || 'athlete';
+  const filename = `gym-all-workouts-${athleteSlug}-${dateStamp}.pdf`;
+  doc.save(filename);
+  return filename;
 }
 
 export function exportWorkoutPlanToPdfBuffer(
