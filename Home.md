@@ -1246,3 +1246,21 @@ Expanded and fixed the event trigger architecture to ensure 100% of security eve
 3. **Disabled Editable RIR Inputs — Read-Only Display Only When Found in Sheet (`src/components/gym/GymApp.tsx`)**:
    - Removed all editable `<input>` fields for per-set `RIR`, inline exercise `Target RIR` edits, and the `Modify Worksheet` RIR column.
    - Workout cards now render RIR strictly as read-only content (Exercise header `Target RIR` pill and non-editable read-only per-set RIR cells) exclusively when `ex.targetRir` or sheet-imported `setRow.rir` values are present in the uploaded workout sheet, leaving set rows focused on `Weight | Reps | [RPE] | Rest` whenever no sheet RIR exists.
+
+---
+
+## 47. Cross-Plan Exercise Search Bar, Telegram Bot `/workout` Done/Remaining Weeks & Comprehensive PDF Report Update
+
+1. **Cross-Plan Exercise Search Bar on `Dashboard` & `My Workouts` (`src/components/gym/GymApp.tsx`)**:
+   - Added a unified **Search Exercises Across All Workouts** input inside `renderWorkoutsWorkspace` (active on both `'Dashboard'` and `'My Workouts'` tabs) powered by `globalExerciseSearchResults` (`useMemo` across `myPlans` matching exercise names, days, and coach notes).
+   - Typing live-filters exercises in the open plan and displays quick-jump matches across **all** uploaded/assigned plans with plan badges, training day badges, and target `Sets × Reps`. Clicking any match runs `jumpToSearchedExercise(planId, ex)` to switch plans/days cleanly, clear temporary edit states, smooth-scroll directly to `#exercise-card-<planId>-<exId>`, and highlight the target movement card.
+
+2. **Telegram Bot `/workout`, `/workouts` & `/progress` Done vs. Remaining Weeks (`server/telegramBotEngine.ts`)**:
+   - Added `{ command: 'workout', description: 'View workout details, done & remaining weeks' }` to `TELEGRAM_BOT_COMMANDS`, `/help`, `/start`, and command routing alongside `/workouts`, `/plan`, and `/today`.
+   - Upgraded `computePlanStats` (`PlanStatsSummary`) to calculate `doneWeeks`, `remainingWeeks` (`PlanRemainingWeekDetail` with per-week progress & sets logged), `currentFocusWeek`, `totalSetsLogged`, `warmupCount`, `notesCount`, `lastUpdatedLabel`, and per-day focus breakdowns (`dayBreakdown`).
+   - Updated `/workout` (supporting optional plan filter arguments like `/workout 2` or `/workout push`), `/workouts`, and `/progress` replies to display done weeks, remaining weeks (with partial completion and sets logged), split/days, notes/warm-up counts, and focus-week breakdown; wired personalized `waterGoalGlasses` and `waterTargetLiters` (`computeUserWaterGoal`) into `/pdf` bot exports.
+
+3. **PDF Export Notes Consolidation & Latest Version Alignment (`src/lib/workoutPdfExport.ts`, `src/components/gym/GymApp.tsx`, `server/telegramBotEngine.ts`)**:
+   - Extended `ExportWorkoutPdfOptions` with `waterGoalGlasses` and `waterTargetLiters` (passed from `GymApp.tsx` `waterGoalSummary` and `telegramBotEngine.ts` `computeUserWaterGoal`), replacing hardcoded `/ 8 Glasses` with personalized glass targets and liters (`consumedLiters / targetLiters L`) across single-plan and multi-split portfolio headers/KPIs.
+   - Added the **Weekly Progress Schedule (Done vs Remaining Weeks)** section table, updated executive banner metadata (`Updated` date, `Sheet` filename, done/remaining week counts, total notes logged), ensured sheet `Target RIR` renders cleanly as read-only metadata, highlighted **Coach Notes** and **Per-Week Exercise Notes** (`Note: ...`) inside exercise cards and warm-up tables, and upgraded Section 7 into **Notes, Coach Cues & Session Feedback** consolidating all non-empty session feedback, exercise week notes, coach notes, and warm-up notes across the plan.
+

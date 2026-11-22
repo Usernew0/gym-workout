@@ -14,8 +14,9 @@ export const TELEGRAM_BOT_COMMANDS: BotCommandSpec[] = [
   { command: 'confirm', description: 'Confirm access & register for gym alerts' },
   { command: 'id', description: 'Get your Telegram Chat ID & username' },
   { command: 'status', description: 'Check bot connection & workout alerts status' },
-  { command: 'workouts', description: 'View your assigned workout plans' },
-  { command: 'progress', description: 'Check your weekly training completion' },
+  { command: 'workout', description: 'View workout details, done & remaining weeks' },
+  { command: 'workouts', description: 'View your assigned workout plans & weeks' },
+  { command: 'progress', description: 'Check weekly completion, done & remaining weeks' },
   { command: 'pdf', description: 'Send your workout plan as a PDF document' },
   { command: 'excel', description: 'Send your workout sheet as an Excel (.xlsx) file' },
   { command: 'water', description: 'Check water intake goal & hydration reminder' },
@@ -244,7 +245,40 @@ function buildProgressBar(pct: number): string {
   return `${'█'.repeat(filled)}${'░'.repeat(10 - filled)} ${clamped}%`;
 }
 
-function computePlanStats(plan: FirestoreWorkoutPlanRecord): {
+function formatShortDate(iso?: string): string {
+  if (!iso) return '';
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts) || ts <= 0) return '';
+  return new Date(ts).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function countEntrySets(entry: any): number {
+  if (!entry || typeof entry !== 'object') return 0;
+  if (Array.isArray(entry.setEntries) && entry.setEntries.length > 0) {
+    return entry.setEntries.filter(
+      (s: any) =>
+        s &&
+        (String(s.weight || '').trim() !== '' ||
+          String(s.reps || '').trim() !== '' ||
+          String(s.rpe || '').trim() !== '' ||
+          String(s.rir || '').trim() !== '')
+    ).length;
+  }
+  if (String(entry.weight || '').trim() !== '' || String(entry.reps || '').trim() !== '') {
+    return 1;
+  }
+  return 0;
+}
+
+export interface PlanRemainingWeekDetail {
+  week: number;
+  done: number;
+  total: number;
+  loggedSets: number;
+  inProgress: boolean;
+}
+
+export interface PlanStatsSummary {
   done: number;
   total: number;
   pct: number;
@@ -252,17 +286,91 @@ function computePlanStats(plan: FirestoreWorkoutPlanRecord): {
   exerciseCount: number;
   days: string[];
   loggedWeeksCount: number;
-} {
+  doneWeeks: number[];
+  remainingWeeks: PlanRemainingWeekDetail[];
+  currentFocusWeek: number;
+  totalSetsLogged: number;
+  warmupCount: number;
+  notesCount: number;
+  lastUpdatedLabel: string;
+  dayBreakdown: Array<{
+    day: string;
+    total: number;
+    doneInFocusWeek: number;
+  }>;
+}
+
+export function computePlanStats(plan: FirestoreWorkoutPlanRecord): PlanStatsSummary {
   const weeks = Math.max(1, Number(plan.weeks) || 1);
   const exercises = Array.isArray(plan.exercises) ? plan.exercises : [];
   const exerciseCount = exercises.length;
+  const exerciseIdSet = new Set(
+    exercises.map((ex, idx) => ex?.id || `ex_${idx + 1}`)
+  );
   const total = exerciseCount * weeks;
-  let done = 0;
   const progress = plan.progress || {};
-  for (let w = 0; w < weeks; w++) {
-    const arr = progress[`w${w + 1}`];
-    if (Array.isArray(arr)) done += arr.length;
+  const exerciseLogs = plan.exerciseLogs || {};
+
+  let done = 0;
+  let totalSetsLogged = 0;
+  let loggedWeeksCount = 0;
+  let notesCount = 0;
+  const doneWeeks: number[] = [];
+  const remainingWeeks: PlanRemainingWeekDetail[] = [];
+
+  exercises.forEach((ex) => {
+    if (typeof ex?.notes === 'string' && ex.notes.trim()) notesCount++;
+  });
+  if (typeof plan.instructions === 'string' && plan.instructions.trim()) notesCount++;
+
+  for (let w = 1; w <= weeks; w++) {
+    const wk = `w${w}`;
+    const arr = Array.isArray(progress[wk]) ? progress[wk] : [];
+    const doneSetInWeek = new Set(arr.filter((id) => typeof id === 'string'));
+    const doneInWeek = exerciseCount > 0 ? doneSetInWeek.size : 0;
+    done += doneInWeek;
+
+    const wkLogs = exerciseLogs[wk] && typeof exerciseLogs[wk] === 'object' ? exerciseLogs[wk] : {};
+    let wkLoggedSets = 0;
+    let wkHasActivity = doneInWeek > 0;
+
+    for (const [entryKey, entryVal] of Object.entries(wkLogs)) {
+      if (entryKey.startsWith('__session_note__')) {
+        if (entryVal && typeof entryVal.notes === 'string' && entryVal.notes.trim()) {
+          notesCount++;
+        }
+        continue;
+      }
+      if (!exerciseIdSet.has(entryKey) && !exercises.some((e) => e.id === entryKey)) {
+        // Still count custom/direct keys when ids are normalized cleanly
+      }
+      const setCount = countEntrySets(entryVal);
+      if (setCount > 0) {
+        wkLoggedSets += setCount;
+        wkHasActivity = true;
+      }
+      if (entryVal && typeof entryVal.notes === 'string' && entryVal.notes.trim()) {
+        notesCount++;
+        wkHasActivity = true;
+      }
+    }
+
+    totalSetsLogged += wkLoggedSets;
+    if (wkHasActivity) loggedWeeksCount++;
+
+    if (exerciseCount > 0 && doneInWeek >= exerciseCount) {
+      doneWeeks.push(w);
+    } else {
+      remainingWeeks.push({
+        week: w,
+        done: doneInWeek,
+        total: exerciseCount,
+        loggedSets: wkLoggedSets,
+        inProgress: doneInWeek > 0 || wkLoggedSets > 0,
+      });
+    }
   }
+
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
   const daysSet = new Set<string>();
   exercises.forEach((ex) => {
@@ -270,10 +378,32 @@ function computePlanStats(plan: FirestoreWorkoutPlanRecord): {
       daysSet.add(ex.day.trim());
     }
   });
-  const loggedWeeksCount = Object.values(plan.exerciseLogs || {}).reduce((acc, byEx) => {
-    if (byEx && typeof byEx === 'object') return Math.max(acc, Object.keys(byEx).length);
-    return acc;
-  }, 0);
+  const days = Array.from(daysSet);
+
+  const currentFocusWeek =
+    remainingWeeks.length > 0 ? remainingWeeks[0].week : weeks;
+  const focusDoneSet = new Set(
+    Array.isArray(progress[`w${currentFocusWeek}`]) ? progress[`w${currentFocusWeek}`] : []
+  );
+
+  const dayMap = new Map<string, { total: number; doneInFocusWeek: number }>();
+  exercises.forEach((ex, idx) => {
+    const dayLabel = (ex?.day && typeof ex.day === 'string' && ex.day.trim()) || 'General';
+    const exId = ex?.id || `ex_${idx + 1}`;
+    const cur = dayMap.get(dayLabel) || { total: 0, doneInFocusWeek: 0 };
+    cur.total += 1;
+    if (focusDoneSet.has(exId)) cur.doneInFocusWeek += 1;
+    dayMap.set(dayLabel, cur);
+  });
+
+  const dayBreakdown = Array.from(dayMap.entries()).map(([day, counts]) => ({
+    day,
+    total: counts.total,
+    doneInFocusWeek: counts.doneInFocusWeek,
+  }));
+
+  const warmupCount = Array.isArray(plan.warmupExercises) ? plan.warmupExercises.length : 0;
+  const lastUpdatedLabel = formatShortDate(plan.updatedAt || plan.createdAt);
 
   return {
     done,
@@ -281,8 +411,16 @@ function computePlanStats(plan: FirestoreWorkoutPlanRecord): {
     pct,
     weeks,
     exerciseCount,
-    days: Array.from(daysSet),
+    days,
     loggedWeeksCount,
+    doneWeeks,
+    remainingWeeks,
+    currentFocusWeek,
+    totalSetsLogged,
+    warmupCount,
+    notesCount,
+    lastUpdatedLabel,
+    dayBreakdown,
   };
 }
 
@@ -688,7 +826,7 @@ export async function buildTelegramCommandReply(params: {
   text: string;
 }): Promise<string> {
   const { chatId, tgUsername, firstName, text } = params;
-  const { command, rawLower } = normalizeCommandText(text);
+  const { command, args, rawLower } = normalizeCommandText(text);
   const safeName = escapeHtml(firstName || 'Athlete');
   const safeHandle = tgUsername ? `<code>${escapeHtml(tgUsername)}</code>` : 'No @username';
 
@@ -776,13 +914,13 @@ export async function buildTelegramCommandReply(params: {
       `• <code>/start</code> or <code>/confirm</code> — Confirm access &amp; link alerts\n` +
       `• <code>/id</code> or <code>/chatid</code> — Show your Telegram Chat ID\n` +
       `• <code>/status</code> — Check bot connection &amp; alert settings\n` +
-      `• <code>/workouts</code> — View your assigned workout plans\n` +
-      `• <code>/progress</code> — View your weekly training progress\n` +
+      `• <code>/workout</code> or <code>/workouts</code> — View workout details, done &amp; remaining weeks\n` +
+      `• <code>/progress</code> — View weekly completion, done &amp; remaining weeks\n` +
       `• <code>/pdf</code> — Download your workout sheet as a PDF file 📄\n` +
       `• <code>/excel</code> — Download your workout sheet as an Excel (.xlsx) file 📊\n` +
       `• <code>/water</code> — Check water intake goal &amp; hydration reminder 💧\n` +
       `• <code>/help</code> — Show this command reference\n\n` +
-      `<i>Tip: If you have multiple plans, send <code>/pdf 2</code> or <code>/excel 2</code> to pick a plan by number!</i>`
+      `<i>Tip: Send <code>/workout 2</code>, <code>/pdf 2</code>, or <code>/excel 2</code> to focus on a specific workout plan!</i>`
     );
   }
 
@@ -835,8 +973,8 @@ export async function buildTelegramCommandReply(params: {
     );
   }
 
-  // 5. /workouts, /plan, /today
-  if (command === 'workouts' || command === 'plan' || command === 'today') {
+  // 5. /workout, /workouts, /plan, /today
+  if (command === 'workout' || command === 'workouts' || command === 'plan' || command === 'today') {
     if (!linkedAccount) {
       return (
         `🏋️ <b>My Workout Plans</b>\n\n` +
@@ -844,7 +982,7 @@ export async function buildTelegramCommandReply(params: {
         `To link your own profile:\n` +
         `1. Open <b>Gym Workout → Profile → Telegram Bot</b>\n` +
         `2. Save your Chat ID (<code>${escapeHtml(chatId)}</code>) or ask Admin to map your App Profile.\n` +
-        `Then send <code>/workouts</code> again! 💪`
+        `Then send <code>/workout</code> again! 💪`
       );
     }
 
@@ -860,24 +998,92 @@ export async function buildTelegramCommandReply(params: {
       (a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
     );
 
-    const lines = sortedPlans.slice(0, 6).map((plan, idx) => {
+    const formatWeekTags = (stats: PlanStatsSummary) => {
+      const doneText =
+        stats.doneWeeks.length > 0
+          ? stats.doneWeeks.map((w) => `W${w}`).join(', ')
+          : 'None yet';
+      const remText =
+        stats.remainingWeeks.length > 0
+          ? stats.remainingWeeks
+              .map((rw) => {
+                if (rw.inProgress) {
+                  return `W${rw.week} (${rw.done}/${rw.total}${rw.loggedSets > 0 ? ` • ${rw.loggedSets} sets` : ''})`;
+                }
+                return `W${rw.week}`;
+              })
+              .join(', ')
+          : 'All weeks finished! 🎉';
+      return { doneText, remText };
+    };
+
+    const formatPlanDetailBlock = (plan: FirestoreWorkoutPlanRecord, idxNum: number, includeDayBreakdown: boolean) => {
       const stats = computePlanStats(plan);
+      const { doneText, remText } = formatWeekTags(stats);
+      const unitLabel = (plan.defaultWeightUnit || 'kg').toUpperCase();
       const dayText =
         stats.days.length > 0
-          ? ` • Days: ${stats.days.slice(0, 4).map(escapeHtml).join(', ')}${stats.days.length > 4 ? '…' : ''}`
+          ? `\n   • <b>Split / Days:</b> ${stats.days.slice(0, 6).map(escapeHtml).join(', ')}${stats.days.length > 6 ? '…' : ''}`
           : '';
+      const metaParts = [
+        `${stats.weeks}w`,
+        `${stats.exerciseCount} exercises`,
+        unitLabel,
+        stats.warmupCount > 0 ? `${stats.warmupCount} warm-ups` : '',
+        stats.notesCount > 0 ? `${stats.notesCount} notes` : '',
+      ].filter(Boolean);
+
+      const dayLines =
+        includeDayBreakdown && stats.dayBreakdown.length > 0
+          ? `\n   • <b>Week ${stats.currentFocusWeek} Focus Breakdown:</b>\n` +
+            stats.dayBreakdown
+              .slice(0, 8)
+              .map(
+                (db) =>
+                  `      ◦ ${escapeHtml(db.day)}: <b>${db.doneInFocusWeek}/${db.total}</b> exercises`
+              )
+              .join('\n')
+          : '';
+
       return (
-        `<b>${idx + 1}. ${escapeHtml(plan.title)}</b>\n` +
-        `   ${stats.weeks}w • ${stats.exerciseCount} exercises${dayText}\n` +
-        `   <code>${buildProgressBar(stats.pct)}</code> (${stats.done}/${stats.total})`
+        `<b>${idxNum}. ${escapeHtml(plan.title)}</b>\n` +
+        `   ${metaParts.join(' • ')}${stats.lastUpdatedLabel ? ` • Updated ${escapeHtml(stats.lastUpdatedLabel)}` : ''}` +
+        dayText +
+        `\n   • <b>Overall:</b> <code>${buildProgressBar(stats.pct)}</code> (${stats.done}/${stats.total} checks • ${stats.totalSetsLogged} sets logged)` +
+        `\n   • ✅ <b>Done Weeks (${stats.doneWeeks.length}/${stats.weeks}):</b> ${doneText}` +
+        `\n   • ⏳ <b>Remaining Weeks (${stats.remainingWeeks.length}/${stats.weeks}):</b> ${remText}` +
+        dayLines
       );
-    });
+    };
+
+    // Detailed single-plan mode when user sends `/workout 2`, `/workout push`, or has only 1 plan
+    if (args.trim() || sortedPlans.length === 1) {
+      const picked = args.trim() ? pickMemberPlan(sortedPlans, args) : sortedPlans[0];
+      if (picked) {
+        const pickedIndex = Math.max(0, sortedPlans.findIndex((p) => p.id === picked.id));
+        const detailBlock = formatPlanDetailBlock(picked, pickedIndex + 1, true);
+        const otherHint =
+          sortedPlans.length > 1
+            ? `\n\n<i>Showing plan ${pickedIndex + 1} of ${sortedPlans.length}. Send <code>/workouts</code> to see all plans or <code>/workout 2</code> to switch.</i>`
+            : '';
+        return (
+          `🏋️ <b>Workout Details — ${memberLabel}</b>\n\n` +
+          detailBlock +
+          otherHint +
+          `\n\n<i>Send <code>/pdf${pickedIndex > 0 ? ` ${pickedIndex + 1}` : ''}</code> or <code>/excel${pickedIndex > 0 ? ` ${pickedIndex + 1}` : ''}</code> to download this sheet, or <code>/progress</code> for full stats.</i>`
+        );
+      }
+    }
+
+    const lines = sortedPlans.slice(0, 5).map((plan, idx) =>
+      formatPlanDetailBlock(plan, idx + 1, idx === 0)
+    );
 
     return (
       `🏋️ <b>Your Workouts — ${memberLabel}</b>\n\n` +
       lines.join('\n\n') +
-      (sortedPlans.length > 6 ? `\n\n<i>…and ${sortedPlans.length - 6} more plans in the app.</i>` : '') +
-      `\n\n<i>Send /pdf or /excel to download your workout sheet directly here, or /progress for stats.</i>`
+      (sortedPlans.length > 5 ? `\n\n<i>…and ${sortedPlans.length - 5} more plans in the app.</i>` : '') +
+      `\n\n<i>Tip: Send <code>/workout 1</code> for focused breakdown, <code>/pdf</code> or <code>/excel</code> to download, or <code>/progress</code> for stats.</i>`
     );
   }
 
@@ -900,11 +1106,20 @@ export async function buildTelegramCommandReply(params: {
     let totalDone = 0;
     let totalChecks = 0;
     let totalExercises = 0;
+    let totalSets = 0;
+    let totalWeeksAll = 0;
+    let totalDoneWeeksAll = 0;
+    let totalRemainingWeeksAll = 0;
+
     memberPlans.forEach((p) => {
       const s = computePlanStats(p);
       totalDone += s.done;
       totalChecks += s.total;
       totalExercises += s.exerciseCount;
+      totalSets += s.totalSetsLogged;
+      totalWeeksAll += s.weeks;
+      totalDoneWeeksAll += s.doneWeeks.length;
+      totalRemainingWeeksAll += s.remainingWeeks.length;
     });
     const overallPct = totalChecks > 0 ? Math.round((totalDone / totalChecks) * 100) : 0;
 
@@ -913,16 +1128,29 @@ export async function buildTelegramCommandReply(params: {
     );
     const latest = sortedPlans[0];
     const latestStats = computePlanStats(latest);
+    const latestDoneWeeksText =
+      latestStats.doneWeeks.length > 0
+        ? latestStats.doneWeeks.map((w) => `W${w}`).join(', ')
+        : 'None yet';
+    const latestRemainingWeeksText =
+      latestStats.remainingWeeks.length > 0
+        ? latestStats.remainingWeeks
+            .map((rw) => (rw.inProgress ? `W${rw.week} (${rw.done}/${rw.total})` : `W${rw.week}`))
+            .join(', ')
+        : 'Completed 🎉';
 
     return (
       `📈 <b>Training Progress — ${memberLabel}</b>\n\n` +
       `• <b>Active Plans:</b> ${memberPlans.length}\n` +
-      `• <b>Total Exercises:</b> ${totalExercises}\n` +
+      `• <b>Total Exercises:</b> ${totalExercises} • <b>Total Sets Logged:</b> ${totalSets}\n` +
+      `• <b>Program Weeks Summary:</b> ✅ <b>${totalDoneWeeksAll}</b> done / ⏳ <b>${totalRemainingWeeksAll}</b> remaining (of ${totalWeeksAll}w)\n` +
       `• <b>Overall Completion:</b>\n` +
       `  <code>${buildProgressBar(overallPct)}</code> (${totalDone}/${totalChecks} checks)\n\n` +
       `🔥 <b>Latest Plan: ${escapeHtml(latest.title)}</b>\n` +
-      `  <code>${buildProgressBar(latestStats.pct)}</code> (${latestStats.weeks} weeks)\n\n` +
-      `<i>Send /pdf or /excel to get your latest sheet right here!</i> 💪`
+      `  <code>${buildProgressBar(latestStats.pct)}</code> (${latestStats.weeks}w • ${latestStats.totalSetsLogged} sets)\n` +
+      `  • ✅ <b>Done Weeks:</b> ${latestDoneWeeksText}\n` +
+      `  • ⏳ <b>Remaining Weeks:</b> ${latestRemainingWeeksText}\n\n` +
+      `<i>Send <code>/workout</code> for full week breakdown or <code>/pdf</code> / <code>/excel</code> for your latest sheet!</i> 💪`
     );
   }
 
@@ -949,11 +1177,12 @@ export async function buildTelegramCommandReply(params: {
           `You will receive your workout reminders, water intake alerts, and security alerts right here.\n\n`
         : `\nYour Telegram handle is whitelisted! Save your Chat ID above in <b>Profile → Telegram Bot</b> (or ask your Admin to bind your App Profile) to access your workouts.\n\n`) +
       `<b>Quick Commands:</b>\n` +
-      `• /workouts — View your workout plans\n` +
+      `• /workout — View workout details, done &amp; remaining weeks\n` +
+      `• /workouts — View all assigned workout plans\n` +
+      `• /progress — Check weekly completion &amp; remaining weeks\n` +
       `• /pdf — Receive your workout sheet as PDF\n` +
       `• /excel — Receive your workout sheet as Excel (.xlsx)\n` +
       `• /water — Check water intake &amp; hydration reminder\n` +
-      `• /progress — Check weekly completion\n` +
       `• /status — Check alert status\n` +
       `• /id — Get your Chat ID\n` +
       `• /help — All commands`
@@ -967,7 +1196,7 @@ export async function buildTelegramCommandReply(params: {
     (linkedAccount
       ? `Linked account: <b>${memberLabel}</b>.\n\n`
       : `\nBind your account in <b>Profile → Telegram Bot</b>, or `) +
-    `Send <code>/help</code> to see all commands (<code>/workouts</code>, <code>/pdf</code>, <code>/excel</code>, <code>/water</code>, <code>/progress</code>, <code>/status</code>).`
+    `Send <code>/help</code> to see all commands (<code>/workout</code>, <code>/workouts</code>, <code>/pdf</code>, <code>/excel</code>, <code>/water</code>, <code>/progress</code>, <code>/status</code>).`
   );
 }
 
@@ -1058,6 +1287,8 @@ export async function replyToTelegramMessage(
     const fullPlan = toFullWorkoutPlan(targetRec);
     const ownerName = linkedAccount.displayName?.trim() || linkedAccount.username;
     const waterGlasses = getUserTodayWaterGlasses(linkedAccount);
+    const { goalGlasses: waterGoalGlasses, targetLiters: waterTargetLiters } =
+      computeUserWaterGoal(linkedAccount);
     const planHint =
       memberPlans.length > 1
         ? `\n<i>You have ${memberPlans.length} plans — send /${command === 'pdf' ? 'pdf' : 'excel'} 2 for the next plan.</i>`
@@ -1065,7 +1296,12 @@ export async function replyToTelegramMessage(
 
     try {
       if (command === 'pdf') {
-        const { filename, buffer } = exportWorkoutPlanToPdfBuffer(fullPlan, { ownerName, waterGlasses });
+        const { filename, buffer } = exportWorkoutPlanToPdfBuffer(fullPlan, {
+          ownerName,
+          waterGlasses,
+          waterGoalGlasses,
+          waterTargetLiters,
+        });
         const caption =
           `📄 <b>${escapeHtml(fullPlan.title)}</b> (PDF)\n` +
           `Member: <b>${escapeHtml(ownerName)}</b> • ${fullPlan.exercises.length} exercises • ${fullPlan.weeks}w` +

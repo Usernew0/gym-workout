@@ -8,7 +8,7 @@ import {
   ChevronDown, ChevronUp, Plus, Minus, Zap, Pencil,
   FileSpreadsheet, Maximize2, ShieldCheck, Loader2, Download,
   User, KeyRound, Eye, EyeOff, Send, ShieldAlert, AlertCircle, Bell,
-  Droplets, RotateCcw, Clock, Timer, Volume2, Scale, Image as ImageIcon, Layers
+  Droplets, RotateCcw, Clock, Timer, Volume2, Scale, Image as ImageIcon, Layers, Search
 } from 'lucide-react';
 import {
   ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip
@@ -858,6 +858,9 @@ export const GymApp: React.FC<GymAppProps> = ({
   const [selectedPlanId, setSelectedPlanId] = useState<string | null>(null);
   const [selectedWeek, setSelectedWeek] = useState(1);
   const [selectedDayFilter, setSelectedDayFilter] = useState<string>('ALL');
+  const [exerciseSearchQuery, setExerciseSearchQuery] = useState('');
+  const [highlightedExerciseKey, setHighlightedExerciseKey] = useState<string | null>(null);
+  const highlightClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showInstructions, setShowInstructions] = useState(true);
 
   // Custom Delete Plan Confirmation Modal state
@@ -1404,6 +1407,45 @@ export const GymApp: React.FC<GymAppProps> = ({
       pct: total > 0 ? Math.round((done / total) * 100) : 0,
     };
   }, [myPlans]);
+
+  const globalExerciseSearchResults = useMemo(() => {
+    const q = exerciseSearchQuery.trim().toLowerCase();
+    if (!q) return [];
+    const results: Array<{
+      planId: string;
+      planTitle: string;
+      isCurrentPlan: boolean;
+      ex: WorkoutExercise;
+      matchScore: number;
+    }> = [];
+    for (const p of myPlans) {
+      const isCurrentPlan = activePlan ? p.id === activePlan.id : false;
+      for (const ex of p.exercises || []) {
+        const nameLower = (ex.name || '').toLowerCase();
+        const dayLower = (ex.day || '').toLowerCase();
+        const notesLower = (ex.notes || '').toLowerCase();
+        if (nameLower.includes(q) || dayLower.includes(q) || notesLower.includes(q)) {
+          let matchScore = 3;
+          if (nameLower.startsWith(q)) matchScore = 0;
+          else if (nameLower.includes(q)) matchScore = 1;
+          else if (dayLower.includes(q)) matchScore = 2;
+          results.push({
+            planId: p.id,
+            planTitle: p.title,
+            isCurrentPlan,
+            ex,
+            matchScore,
+          });
+        }
+      }
+    }
+    results.sort((a, b) => {
+      if (a.matchScore !== b.matchScore) return a.matchScore - b.matchScore;
+      if (a.isCurrentPlan !== b.isCurrentPlan) return a.isCurrentPlan ? -1 : 1;
+      return (a.ex.name || '').localeCompare(b.ex.name || '');
+    });
+    return results;
+  }, [exerciseSearchQuery, myPlans, activePlan]);
 
   const draftKey = (planId: string, wk: number, exId: string) => `${planId}__w${wk}__${exId}`;
 
@@ -3052,6 +3094,8 @@ export const GymApp: React.FC<GymAppProps> = ({
       const filename = exportWorkoutPlanToPdf(plan, {
         ownerName: resolvedDisplayName,
         waterGlasses,
+        waterGoalGlasses: waterGoalSummary.targetGlasses,
+        waterTargetLiters: waterGoalSummary.targetLiters,
       });
       setExportNotice(`Exported ${filename}`);
       setTimeout(() => setExportNotice(prev => (prev === `Exported ${filename}` ? null : prev)), 3000);
@@ -3085,6 +3129,8 @@ export const GymApp: React.FC<GymAppProps> = ({
     const filename = exportAllWorkoutPlansToPdf(owned, {
       ownerName: resolvedDisplayName,
       waterGlasses,
+      waterGoalGlasses: waterGoalSummary.targetGlasses,
+      waterTargetLiters: waterGoalSummary.targetLiters,
     });
     setExportNotice(`Exported all ${owned.length} workouts -> ${filename}`);
     setTimeout(() => setExportNotice(prev => (prev?.includes(filename) ? null : prev)), 3500);
@@ -3135,6 +3181,8 @@ export const GymApp: React.FC<GymAppProps> = ({
         const { filename, buffer } = exportWorkoutPlanToPdfBuffer(plan, {
           ownerName: resolvedDisplayName,
           waterGlasses,
+          waterGoalGlasses: waterGoalSummary.targetGlasses,
+          waterTargetLiters: waterGoalSummary.targetLiters,
         });
         const caption = `📄 <b>${plan.title}</b> (PDF)\nAthlete: <b>${resolvedDisplayName}</b> • ${plan.exercises.length} exercises • ${plan.weeks}w`;
         const res = await sendTelegramDocumentFile({
@@ -3996,6 +4044,45 @@ export const GymApp: React.FC<GymAppProps> = ({
     setWorksheetImportNotice(null);
   };
 
+  const jumpToSearchedExercise = (targetPlanId: string, ex: WorkoutExercise) => {
+    const targetPlan = myPlans.find(p => p.id === targetPlanId);
+    if (!targetPlan) return;
+    const switchingPlan = activePlan?.id !== targetPlanId;
+    if (switchingPlan) {
+      openPlan(targetPlanId);
+    } else {
+      setEditingExerciseId(null);
+      setEditDraft(null);
+      setInlineVideoExId(null);
+    }
+    const targetDays = new Set(
+      (targetPlan.exercises || []).map(item => item.day?.trim()).filter(Boolean)
+    );
+    const targetDay = ex.day?.trim() || '';
+    if (targetDays.size > 1 && targetDay) {
+      setSelectedDayFilter(targetDay);
+    } else {
+      setSelectedDayFilter('ALL');
+    }
+
+    setExerciseSearchQuery('');
+    const hKey = `${targetPlanId}__${ex.id}`;
+    if (highlightClearTimerRef.current) {
+      clearTimeout(highlightClearTimerRef.current);
+    }
+    setHighlightedExerciseKey(hKey);
+    highlightClearTimerRef.current = setTimeout(() => {
+      setHighlightedExerciseKey(prev => (prev === hKey ? null : prev));
+    }, 2800);
+
+    setTimeout(() => {
+      const el = document.getElementById(`exercise-card-${targetPlanId}-${ex.id}`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }, switchingPlan ? 120 : 60);
+  };
+
   const renderWorkoutsWorkspace = (showEmptyState = true, allowModify = true) => {
     if (myPlans.length === 0) {
       if (!showEmptyState) return null;
@@ -4026,11 +4113,21 @@ export const GymApp: React.FC<GymAppProps> = ({
     const weekPct = plan.exercises.length > 0 ? Math.round((weekDone / plan.exercises.length) * 100) : 0;
     const showRpe = planHasRpeColumn(plan);
     const showRir = planHasRirColumn(plan);
+    const trimmedSearchQuery = exerciseSearchQuery.trim().toLowerCase();
 
-    const visibleExercises =
+    const dayFilteredExercises =
       selectedDayFilter === 'ALL' || activePlanDays.length === 0
         ? plan.exercises
         : plan.exercises.filter(e => e.day?.trim() === selectedDayFilter);
+
+    const visibleExercises = trimmedSearchQuery
+      ? dayFilteredExercises.filter(
+          e =>
+            (e.name || '').toLowerCase().includes(trimmedSearchQuery) ||
+            (e.day || '').toLowerCase().includes(trimmedSearchQuery) ||
+            (e.notes || '').toLowerCase().includes(trimmedSearchQuery)
+        )
+      : dayFilteredExercises;
 
     return (
       <div className="space-y-4">
@@ -4080,6 +4177,98 @@ export const GymApp: React.FC<GymAppProps> = ({
               );
             })}
           </div>
+        </div>
+
+        {/* CROSS-PLAN EXERCISE SEARCH BAR */}
+        <div className="rounded-2xl border border-white/10 bg-neutral-900/70 p-3 sm:p-4 space-y-2.5">
+          <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+            <div className="relative flex-1">
+              <Search className="w-4 h-4 text-neutral-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <input
+                type="text"
+                value={exerciseSearchQuery}
+                onChange={(e) => setExerciseSearchQuery(e.target.value)}
+                placeholder="Search exercises across all workouts (e.g. Bench Press, Squat, Lat Pulldown)..."
+                className="w-full h-10 pl-10 pr-9 rounded-xl bg-neutral-950 border border-white/15 focus:border-red-500/60 focus:outline-none text-xs sm:text-sm text-white placeholder:text-neutral-500"
+              />
+              {exerciseSearchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setExerciseSearchQuery('')}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded-lg text-neutral-400 hover:text-white hover:bg-white/10 cursor-pointer"
+                  title="Clear search"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+            {trimmedSearchQuery && (
+              <div className="text-[11px] font-semibold text-neutral-300 px-2 shrink-0 flex items-center justify-between sm:justify-start gap-2">
+                <span>
+                  <strong className="text-white">{globalExerciseSearchResults.length}</strong> match{globalExerciseSearchResults.length === 1 ? '' : 'es'} across all plans
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setExerciseSearchQuery('')}
+                  className="text-red-400 hover:text-red-300 underline cursor-pointer"
+                >
+                  Clear
+                </button>
+              </div>
+            )}
+          </div>
+
+          {trimmedSearchQuery && (
+            globalExerciseSearchResults.length === 0 ? (
+              <div className="text-xs text-neutral-400 bg-neutral-950/60 border border-white/10 rounded-xl px-3 py-2.5">
+                No movements matched "<span className="text-white font-semibold">{exerciseSearchQuery.trim()}</span>" across your {myPlans.length} plan{myPlans.length === 1 ? '' : 's'}.
+              </div>
+            ) : (
+              <div className="max-h-60 overflow-y-auto space-y-1.5 pr-1">
+                {globalExerciseSearchResults.slice(0, 30).map((item) => {
+                  const target = getExerciseTargetDisplay(item.ex);
+                  return (
+                    <button
+                      key={`${item.planId}-${item.ex.id}`}
+                      type="button"
+                      onClick={() => jumpToSearchedExercise(item.planId, item.ex)}
+                      className="w-full text-left flex items-center justify-between gap-3 px-3 py-2 rounded-xl bg-neutral-950/80 hover:bg-red-950/30 border border-white/10 hover:border-red-500/40 transition-colors cursor-pointer group"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="text-xs sm:text-sm font-bold text-white truncate">
+                            {item.ex.name}
+                          </span>
+                          <span
+                            className={`text-[10px] font-bold px-2 py-0.5 rounded-md border ${
+                              item.isCurrentPlan
+                                ? 'bg-red-500/15 text-red-300 border-red-500/30'
+                                : 'bg-white/5 text-neutral-300 border-white/10'
+                            }`}
+                          >
+                            {item.planTitle}
+                          </span>
+                          {item.ex.day?.trim() && (
+                            <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-200 border border-amber-500/30">
+                              {item.ex.day.trim()}
+                            </span>
+                          )}
+                        </div>
+                        {(target.setsDisplay || target.repsDisplay) && (
+                          <div className="text-[11px] text-neutral-400 mt-0.5">
+                            Target: {[target.setsDisplay && `${target.setsDisplay} sets`, target.repsDisplay && `${target.repsDisplay} reps`].filter(Boolean).join(' × ')}
+                          </div>
+                        )}
+                      </div>
+                      <span className="shrink-0 text-[11px] font-bold text-red-400 group-hover:text-red-300">
+                        Jump →
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )
+          )}
         </div>
 
         {/* ACTIVE WORKOUT HEADER SUMMARY + WEIGHT UNIT SELECTOR */}
@@ -5239,6 +5428,32 @@ export const GymApp: React.FC<GymAppProps> = ({
 
         {/* EXERCISES LIST */}
         <div className="space-y-3">
+          {visibleExercises.length === 0 && trimmedSearchQuery && (
+            <div className="rounded-2xl border border-white/10 bg-neutral-900/60 p-5 text-center space-y-2">
+              <p className="text-xs sm:text-sm text-neutral-300">
+                No exercises in <strong className="text-white">{plan.title}</strong>
+                {selectedDayFilter !== 'ALL' ? ` (${selectedDayFilter})` : ''} match "<span className="text-red-300">{exerciseSearchQuery.trim()}</span>".
+              </p>
+              <div className="flex flex-wrap items-center justify-center gap-2">
+                {selectedDayFilter !== 'ALL' && (
+                  <button
+                    type="button"
+                    onClick={() => setSelectedDayFilter('ALL')}
+                    className="px-3 py-1.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-amber-200 text-xs font-bold cursor-pointer"
+                  >
+                    Search All Days in {plan.title}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setExerciseSearchQuery('')}
+                  className="px-3 py-1.5 rounded-xl bg-white/10 hover:bg-white/15 text-white text-xs font-bold cursor-pointer"
+                >
+                  Clear Filter
+                </button>
+              </div>
+            </div>
+          )}
           {visibleExercises.map((ex, idx) => {
             const checked = doneIds.includes(ex.id);
             const isSuperset = !!ex.isSuperset;
@@ -5251,8 +5466,11 @@ export const GymApp: React.FC<GymAppProps> = ({
             const isEditingThis = editingExerciseId === ex.id && editDraft !== null;
             const exDKey = draftKey(plan.id, selectedWeek, ex.id);
             const isCelebrating = justCompletedExKey === exDKey;
+            const isJumpHighlighted = highlightedExerciseKey === `${plan.id}__${ex.id}`;
 
-            const cardClasses = isCelebrating
+            const cardClasses = isJumpHighlighted
+              ? 'border-amber-400 bg-amber-950/25 ring-2 ring-amber-400/60 shadow-lg shadow-amber-950/30'
+              : isCelebrating
               ? 'border-emerald-400/70 bg-emerald-950/30 ring-2 ring-emerald-500/35 animate-exercise-complete'
               : checked
               ? isSuperset
@@ -5263,7 +5481,11 @@ export const GymApp: React.FC<GymAppProps> = ({
               : 'border-white/10 bg-neutral-900/70';
 
             return (
-              <div key={ex.id} className={`rounded-2xl border p-4 transition-all ${cardClasses}`}>
+              <div
+                key={ex.id}
+                id={`exercise-card-${plan.id}-${ex.id}`}
+                className={`rounded-2xl border p-4 transition-all ${cardClasses}`}
+              >
                 <div className="flex flex-col sm:flex-row items-start gap-4">
                   {/* Left: Checkbox + Details + Editable Target + Sets */}
                   <div className="flex items-start gap-3 flex-1 min-w-0 w-full">
