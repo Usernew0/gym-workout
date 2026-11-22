@@ -25,7 +25,8 @@ import {
   planHasRpeColumn,
   planHasRirColumn,
 } from '../../lib/gymService';
-import { saveUserAccountDoc, saveAdminSettingDoc, logActivity, getFirestoreUserAccounts } from '../../lib/syncService';
+import { saveUserAccountDoc, saveAdminSettingDoc, logActivity, getFirestoreUserAccounts, cascadeUsernameRename } from '../../lib/syncService';
+import { getUserBgSettingIdForUsername, validateUsernameAvailability } from '../../lib/usernameUtils';
 import { hashPassword, verifyPassword } from '../../utils/crypto';
 import {
   getTelegramConfig,
@@ -56,6 +57,7 @@ interface GymAppProps {
   userAccounts?: UserAccount[];
   adminSettings?: AdminSetting[];
   onLogout: () => void;
+  onUsernameChanged?: (newUsername: string) => Promise<void> | void;
 }
 
 type GymTab = 'dashboard' | 'workouts' | 'weight' | 'upload' | 'progress' | 'profile';
@@ -194,15 +196,7 @@ function saveStoredBodyWeight(username: string, entries: BodyWeightEntry[]) {
 const MAX_BG_DATA_URL_CHARS = 420_000;
 
 export function getUserBgSettingId(username: string): string {
-  const clean = (username || 'member').trim().toLowerCase();
-  const slug = clean.replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '') || 'user';
-  let hash = 0;
-  for (let i = 0; i < clean.length; i++) {
-    hash = ((hash * 31) + clean.charCodeAt(i)) >>> 0;
-  }
-  const suffix = hash.toString(36);
-  const raw = `userBg_${slug}_${suffix}`;
-  return raw.slice(0, 128);
+  return getUserBgSettingIdForUsername(username);
 }
 
 function computeWaterGoalFromBodyWeightEntries(entries: BodyWeightEntry[]): {
@@ -852,6 +846,7 @@ export const GymApp: React.FC<GymAppProps> = ({
   userAccounts = [],
   adminSettings = [],
   onLogout,
+  onUsernameChanged,
 }) => {
   const [activeTab, setActiveTab] = useState<GymTab>('dashboard');
   const [plans, setPlans] = useState<WorkoutPlan[]>([]);
@@ -867,7 +862,7 @@ export const GymApp: React.FC<GymAppProps> = ({
   const [planToDelete, setPlanToDelete] = useState<WorkoutPlan | null>(null);
   const [isDeletingPlan, setIsDeletingPlan] = useState(false);
 
-  // User Profile State (Display Name, Password Change, Telegram Bot, 2FA)
+  // User Profile State (Display Name, Username, Password Change, Telegram Bot, 2FA)
   const [localAccountOverride, setLocalAccountOverride] = useState<UserAccount | null>(null);
   const matchedAccount = useMemo(() => {
     const clean = (currentUser || '').toLowerCase().trim();
@@ -890,10 +885,22 @@ export const GymApp: React.FC<GymAppProps> = ({
   resolvedDisplayNameRef.current = resolvedDisplayName;
 
   const [profileDisplayName, setProfileDisplayName] = useState('');
+  const [profileUsername, setProfileUsername] = useState('');
   const [profileGender, setProfileGender] = useState('male');
   const [profileWeightUnit, setProfileWeightUnit] = useState<WeightUnit>('kg');
   const [isSavingProfile, setIsSavingProfile] = useState(false);
   const [profileFeedback, setProfileFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [profileToast, setProfileToast] = useState<{ id: number; type: 'success' | 'error'; text: string } | null>(null);
+  const profileToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showProfileToast = (type: 'success' | 'error', text: string) => {
+    if (profileToastTimerRef.current) clearTimeout(profileToastTimerRef.current);
+    const id = Date.now();
+    setProfileToast({ id, type, text });
+    profileToastTimerRef.current = setTimeout(() => {
+      setProfileToast(prev => (prev?.id === id ? null : prev));
+    }, 5000);
+  };
 
   // Password Change (Old -> New -> Confirm New)
   const [oldPasswordInput, setOldPasswordInput] = useState('');
@@ -919,6 +926,7 @@ export const GymApp: React.FC<GymAppProps> = ({
 
   useEffect(() => {
     setProfileDisplayName(matchedAccount?.displayName?.trim() || currentUser);
+    setProfileUsername(matchedAccount?.username?.trim() || currentUser);
     setProfileGender(matchedAccount?.gender || 'male');
     setProfileWeightUnit(matchedAccount?.weightUnitPreference || 'kg');
     setTgUsernameInput(matchedAccount?.telegramUsername || '');
@@ -3403,34 +3411,139 @@ export const GymApp: React.FC<GymAppProps> = ({
     return null;
   };
 
+  const migrateUserLocalStorageKeys = (oldUsername: string, newUsername: string) => {
+    const cleanOld = (oldUsername || '').trim().toLowerCase();
+    const cleanNew = (newUsername || '').trim().toLowerCase();
+    if (!cleanOld || !cleanNew || cleanOld === cleanNew) return;
+    try {
+      const pairs: Array<[string, string]> = [
+        [getWaterStorageKey(cleanOld), getWaterStorageKey(cleanNew)],
+        [getWaterReminderStorageKey(cleanOld), getWaterReminderStorageKey(cleanNew)],
+        [getBodyWeightStorageKey(cleanOld), getBodyWeightStorageKey(cleanNew)],
+        [getUserBgStorageKey(cleanOld), getUserBgStorageKey(cleanNew)],
+        [getRestTimerStorageKey(cleanOld), getRestTimerStorageKey(cleanNew)],
+        [getRestSoundStorageKey(cleanOld), getRestSoundStorageKey(cleanNew)],
+        [getActiveRestTimerStorageKey(cleanOld), getActiveRestTimerStorageKey(cleanNew)],
+      ];
+      for (const [oldKey, newKey] of pairs) {
+        if (oldKey === newKey) continue;
+        const existingVal = localStorage.getItem(oldKey);
+        if (existingVal !== null && localStorage.getItem(newKey) === null) {
+          localStorage.setItem(newKey, existingVal);
+        }
+        localStorage.removeItem(oldKey);
+      }
+    } catch {
+      // ignore localStorage migration errors
+    }
+  };
+
   const handleSaveProfileDetails = async (e: React.FormEvent) => {
     e.preventDefault();
     setProfileFeedback(null);
     const trimmedName = profileDisplayName.trim();
     if (!trimmedName) {
-      setProfileFeedback({ type: 'error', text: 'Display name cannot be empty.' });
+      const msg = 'Display name cannot be empty.';
+      setProfileFeedback({ type: 'error', text: msg });
+      showProfileToast('error', msg);
       return;
     }
+
+    const baseAccount = await resolveWritableAccount();
+    if (!baseAccount) {
+      const msg = 'Account profile is still syncing. Please wait a moment and try again.';
+      setProfileFeedback({ type: 'error', text: msg });
+      showProfileToast('error', msg);
+      return;
+    }
+
+    const localCheck = validateUsernameAvailability({
+      candidateUsername: profileUsername,
+      mode: 'user',
+      excludeUserId: baseAccount.id,
+      userAccounts,
+      adminSettings,
+    });
+    if (!localCheck.valid) {
+      const msg = localCheck.message || 'Username already exists! Please choose a different username.';
+      setProfileFeedback({ type: 'error', text: msg });
+      showProfileToast('error', msg);
+      return;
+    }
+
     setIsSavingProfile(true);
     try {
-      const baseAccount = await resolveWritableAccount();
-      if (!baseAccount) {
-        setProfileFeedback({ type: 'error', text: 'Account profile is still syncing. Please wait a moment and try again.' });
+      // Live Firestore re-check to prevent race conditions across devices/tabs
+      const mergedById = new Map<string, UserAccount>();
+      userAccounts.forEach(u => {
+        if (u?.id) mergedById.set(u.id, u);
+      });
+      try {
+        const fsUsers = await getFirestoreUserAccounts();
+        fsUsers.forEach(u => {
+          if (u?.id) mergedById.set(u.id, u);
+        });
+      } catch {
+        // Fallback to subscribed accounts
+      }
+
+      const liveCheck = validateUsernameAvailability({
+        candidateUsername: profileUsername,
+        mode: 'user',
+        excludeUserId: baseAccount.id,
+        userAccounts: Array.from(mergedById.values()),
+        adminSettings,
+      });
+      if (!liveCheck.valid) {
+        const msg = liveCheck.message || 'Username already exists! Please choose a different username.';
+        setProfileFeedback({ type: 'error', text: msg });
+        showProfileToast('error', msg);
         return;
       }
+
+      const oldUsername = (baseAccount.username || currentUser).trim();
+      const cleanNewUsername = liveCheck.cleanUsername;
+      const usernameChanged = oldUsername.toLowerCase() !== cleanNewUsername.toLowerCase();
+
       const nextAccount: UserAccount = {
         ...baseAccount,
+        username: cleanNewUsername,
         displayName: trimmedName,
         gender: profileGender,
         weightUnitPreference: profileWeightUnit,
       };
-      await saveUserAccountDoc(nextAccount);
-      setLocalAccountOverride(nextAccount);
-      await logActivity(currentUser, 'profile_updated', `Updated display name to "${trimmedName}" (${profileWeightUnit.toUpperCase()}).`).catch(() => {});
-      setProfileFeedback({ type: 'success', text: 'Profile details saved and synchronized!' });
+      const persistedAccount = await saveUserAccountDoc(nextAccount);
+      setLocalAccountOverride(persistedAccount);
+
+      if (usernameChanged) {
+        migrateUserLocalStorageKeys(oldUsername, cleanNewUsername);
+        await cascadeUsernameRename({
+          oldUsername,
+          newUsername: cleanNewUsername,
+          adminSettings,
+        });
+        await onUsernameChanged?.(cleanNewUsername);
+      }
+
+      await logActivity(
+        cleanNewUsername,
+        'profile_updated',
+        usernameChanged
+          ? `Updated profile & changed username from "${oldUsername}" to "${cleanNewUsername}" (${profileWeightUnit.toUpperCase()}).`
+          : `Updated display name to "${trimmedName}" (${profileWeightUnit.toUpperCase()}).`
+      ).catch(() => {});
+
+      const okMsg = usernameChanged
+        ? `Profile saved and login username updated to @${cleanNewUsername}!`
+        : 'Profile details saved and synchronized!';
+      setProfileFeedback({ type: 'success', text: okMsg });
+      showProfileToast('success', okMsg);
       setTimeout(() => setProfileFeedback(null), 4000);
     } catch (err: any) {
-      setProfileFeedback({ type: 'error', text: `Failed to save profile: ${err?.message || String(err)}` });
+      const rawErr = err?.message || String(err);
+      const errMsg = rawErr.toLowerCase().includes('already exists') ? rawErr : `Failed to save profile: ${rawErr}`;
+      setProfileFeedback({ type: 'error', text: errMsg });
+      showProfileToast('error', errMsg);
     } finally {
       setIsSavingProfile(false);
     }
@@ -7041,10 +7154,17 @@ export const GymApp: React.FC<GymAppProps> = ({
                 <span className="text-[11px] uppercase tracking-wider text-neutral-400 font-semibold">Login Username</span>
                 <input
                   type="text"
-                  value={currentUser}
-                  readOnly
-                  className="w-full bg-neutral-950/60 border border-white/10 rounded-xl px-3.5 py-2.5 text-sm text-neutral-400 font-mono outline-none cursor-not-allowed"
+                  value={profileUsername}
+                  onChange={(e) => setProfileUsername(e.target.value)}
+                  placeholder="Enter login username"
+                  minLength={2}
+                  maxLength={128}
+                  className="w-full bg-neutral-950 border border-white/15 focus:border-red-500/60 rounded-xl px-3.5 py-2.5 text-sm text-white font-mono outline-none"
+                  required
                 />
+                <span className="text-[10px] text-neutral-500 block">
+                  Used to sign in. Your workout sheets, progress, and settings move automatically if changed.
+                </span>
               </label>
 
               <div className="grid grid-cols-2 gap-3">
@@ -7497,6 +7617,31 @@ export const GymApp: React.FC<GymAppProps> = ({
 
   return (
     <div className="relative h-[100dvh] flex flex-col bg-black text-white overflow-hidden selection:bg-red-900 selection:text-red-100 font-sans">
+      {profileToast && (
+        <div
+          role="alert"
+          className={`fixed top-16 right-4 sm:right-6 z-[10000] max-w-md w-[calc(100vw-2rem)] sm:w-auto flex items-center gap-3 px-4 py-3 rounded-2xl border shadow-2xl backdrop-blur-xl ${
+            profileToast.type === 'error'
+              ? 'bg-rose-950/95 border-rose-500/60 text-rose-100 shadow-rose-950/60'
+              : 'bg-emerald-950/95 border-emerald-500/60 text-emerald-100 shadow-emerald-950/60'
+          }`}
+        >
+          {profileToast.type === 'error' ? (
+            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+          ) : (
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+          )}
+          <span className="text-xs font-semibold leading-snug flex-1">{profileToast.text}</span>
+          <button
+            type="button"
+            onClick={() => setProfileToast(null)}
+            className="p-1 rounded-lg hover:bg-white/10 text-neutral-300 hover:text-white cursor-pointer"
+            title="Dismiss notification"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
       {userBgImageUrl && (
         <div className="pointer-events-none fixed inset-0 z-0 overflow-hidden" aria-hidden="true">
           <div

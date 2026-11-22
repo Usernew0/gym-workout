@@ -120,7 +120,6 @@ service cloud.firestore {
       allow update: if isValidId(userId)
         && incoming().id == userId
         && (!('id' in existing()) || incoming().id == existing().id)
-        && incoming().username.lower() == existing().username.lower()
         && isValidUserAccount(incoming())
         && (!('password' in existing()) || ('password' in incoming() && incoming().password is string && incoming().password.size() >= 4 && incoming().password.size() <= 256))
         && incoming().username.lower() != 'admin';

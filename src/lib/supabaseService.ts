@@ -46,7 +46,19 @@ export function mapToDb(obj: any): any {
   Object.keys(obj).forEach(key => {
     if (transientKeys.includes(key)) return;
     const snakeKey = key.replace(/([A-Z])/g, '_$1').toLowerCase();
-    result[snakeKey] = obj[key];
+    const val = obj[key];
+    if (
+      (snakeKey.endsWith('_at') || snakeKey === 'subscription_end_date') &&
+      typeof val === 'string' &&
+      val.trim() === ''
+    ) {
+      if (snakeKey === 'created_at' || snakeKey === 'updated_at') {
+        return; // omit empty created_at/updated_at so DB defaults apply
+      }
+      result[snakeKey] = null;
+      return;
+    }
+    result[snakeKey] = val;
   });
   return result;
 }
@@ -419,33 +431,49 @@ export function subscribeToUserAccounts(callback: (data: UserAccount[]) => void)
   };
 }
 
-export async function saveUserAccountDoc(user: UserAccount) {
+export async function saveUserAccountDoc(user: UserAccount): Promise<UserAccount> {
   const savedUser: UserAccount = sanitizeForFirestore({ ...user });
+  const originalId = (savedUser.id || '').trim();
 
   // Persist to Firestore first so failed writes never poison in-memory cache
-  await saveFirestoreUserAccountDoc(savedUser);
+  const persistedUser = await saveFirestoreUserAccountDoc(savedUser);
 
-  const existingIdx = cachedUserAccounts.findIndex(u => u.id === savedUser.id || u.username.toLowerCase() === savedUser.username.toLowerCase());
+  const byOrigIdIdx = originalId ? cachedUserAccounts.findIndex(u => u.id === originalId) : -1;
+  const byPersistedIdIdx = persistedUser.id ? cachedUserAccounts.findIndex(u => u.id === persistedUser.id) : -1;
+  const existingIdx = byOrigIdIdx >= 0
+    ? byOrigIdIdx
+    : byPersistedIdIdx >= 0
+      ? byPersistedIdIdx
+      : cachedUserAccounts.findIndex(u => u.username.toLowerCase() === persistedUser.username.toLowerCase());
   const updatedList = existingIdx >= 0
-    ? cachedUserAccounts.map((u, i) => (i === existingIdx ? savedUser : u))
-    : [...cachedUserAccounts, savedUser];
+    ? cachedUserAccounts.map((u, i) => (i === existingIdx ? persistedUser : u))
+    : [...cachedUserAccounts, persistedUser];
 
   notifyUserAccountListeners(updatedList);
 
   if (await ensureSupabaseConfigured()) {
-    const dbPayload = mapToDb(savedUser);
+    if (originalId && persistedUser.id && originalId !== persistedUser.id) {
+      await supabaseDelete('user_accounts', 'id', originalId).catch(() => {});
+      await supabaseDelete('profiles', 'id', originalId).catch(() => {});
+    }
+    const dbPayload = mapToDb(persistedUser);
     const res = await safeUpsert('user_accounts', dbPayload, 'id');
     if (!res.success) {
+      if (res.error?.toLowerCase().includes('already exists')) {
+        throw new Error(res.error);
+      }
       handleSupabaseError("saveUserAccountDoc", res.error);
     }
 
     const profilePayload = {
-      id: savedUser.id,
-      username: savedUser.username,
-      display_name: savedUser.displayName?.trim() || savedUser.username
+      id: persistedUser.id,
+      username: persistedUser.username,
+      display_name: persistedUser.displayName?.trim() || persistedUser.username
     };
     await safeUpsert('profiles', profilePayload, 'id');
   }
+
+  return persistedUser;
 }
 
 export async function deleteUserAccountDoc(id: string) {
@@ -799,9 +827,19 @@ export async function safeUpsert(table: string, payload: any, onConflict: string
   try {
     const currentPayload: any = {};
     Object.keys(payload || {}).forEach(k => {
-      if (payload[k] !== undefined) {
-        currentPayload[k] = payload[k];
+      const val = payload[k];
+      if (val === undefined) return;
+      if (
+        (k.endsWith('_at') || k === 'subscription_end_date') &&
+        typeof val === 'string' &&
+        val.trim() === ''
+      ) {
+        if (k !== 'created_at' && k !== 'updated_at') {
+          currentPayload[k] = null;
+        }
+        return;
       }
+      currentPayload[k] = val;
     });
 
     for (let attempt = 0; attempt < 15; attempt++) {
@@ -828,7 +866,19 @@ export async function safeUpsert(table: string, payload: any, onConflict: string
         continue;
       }
 
-      if (msg.includes('profiles_username_key') || msg.includes('username_key') || (msg.includes('duplicate key') && msg.includes('username'))) {
+      if (
+        msg.includes('profiles_username_key') ||
+        msg.includes('username_key') ||
+        msg.includes('idx_user_accounts_username_lower') ||
+        msg.includes('idx_profiles_username_lower') ||
+        (msg.includes('duplicate key') && msg.includes('username'))
+      ) {
+        if (table === 'user_accounts') {
+          return {
+            success: false,
+            error: `Username "${currentPayload.username || ''}" already exists! Please choose a different username.`
+          };
+        }
         const { error: retryErr } = await supabase.from(table).upsert(currentPayload, { onConflict: 'username' });
         if (!retryErr) return { success: true };
       }

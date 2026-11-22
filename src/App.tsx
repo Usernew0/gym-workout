@@ -245,6 +245,20 @@ export default function App() {
     }
   };
 
+  const handleUsernameChanged = async (newUsername: string) => {
+    const cleanNew = (newUsername || '').trim();
+    if (!cleanNew) return;
+    const prevUser = currentUser;
+    setCurrentUser(cleanNew);
+    const token = await createSessionToken(cleanNew);
+    localStorage.setItem('love_app_session_token', token);
+    localStorage.setItem('love_app_is_logged_in', 'true');
+    localStorage.setItem('love_app_username', cleanNew);
+    if (prevUser && prevUser.toLowerCase() !== cleanNew.toLowerCase()) {
+      logActivity(cleanNew, 'username_updated', `Changed login username from "${prevUser}" to "${cleanNew}".`).catch(() => {});
+    }
+  };
+
   if (!isLoggedIn) {
     return <Login onLoginSuccess={handleLoginSuccess} userAccounts={userAccounts} adminSettings={adminSettings} logoutMessage={logoutMessage} />;
   }
@@ -271,6 +285,7 @@ export default function App() {
             userAccounts={userAccounts}
             adminSettings={adminSettings}
             onLogout={handleLogout}
+            onUsernameChanged={handleUsernameChanged}
           />
         </Suspense>
       </ErrorBoundary>
@@ -285,6 +300,7 @@ export default function App() {
           userAccounts={userAccounts}
           adminSettings={adminSettings}
           onLogout={handleLogout}
+          onUsernameChanged={handleUsernameChanged}
         />
       </Suspense>
     </ErrorBoundary>

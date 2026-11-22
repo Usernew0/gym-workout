@@ -66,8 +66,11 @@ import { saveUserAccountDoc,
   syncSingleTableSupabaseToFirestore,
   syncAllTablesFirestoreToSupabase,
   syncAllTablesSupabaseToFirestore,
-  TableSyncResult
+  TableSyncResult,
+  getFirestoreUserAccounts,
+  cascadeUsernameRename
 } from '../lib/syncService';
+import { validateUsernameAvailability } from '../lib/usernameUtils';
 import { isSupabaseConfigured } from '../lib/supabase';
 import { isFirestoreOnline } from '../lib/firebase';
 import { hashPassword } from '../utils/crypto';
@@ -84,6 +87,7 @@ CREATE TABLE IF NOT EXISTS public.user_accounts (
   password TEXT,
   display_name TEXT,
   gender TEXT,
+  weight_unit_preference TEXT DEFAULT 'kg',
   role TEXT DEFAULT 'user',
   visible_tabs JSONB,
   two_factor_enabled BOOLEAN DEFAULT FALSE,
@@ -92,15 +96,27 @@ CREATE TABLE IF NOT EXISTS public.user_accounts (
   two_factor_created_at TIMESTAMPTZ,
   telegram_username TEXT,
   telegram_chat_id TEXT,
+  telegram_notifications_enabled BOOLEAN DEFAULT TRUE,
+  water_intake JSONB,
+  body_weight_history JSONB DEFAULT '[]'::jsonb,
+  rest_timer_prefs JSONB,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS gender TEXT;
+ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS weight_unit_preference TEXT DEFAULT 'kg';
 ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT FALSE;
 ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS two_factor_secret TEXT;
 ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS two_factor_backup_codes JSONB DEFAULT '[]'::jsonb;
 ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS two_factor_created_at TIMESTAMPTZ;
 ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS telegram_username TEXT;
 ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT;
+ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS telegram_notifications_enabled BOOLEAN DEFAULT TRUE;
+ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS water_intake JSONB;
+ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS body_weight_history JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS rest_timer_prefs JSONB;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_accounts_username_lower
+  ON public.user_accounts (LOWER(TRIM(username)));
 ALTER TABLE public.user_accounts ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "User accounts access policy" ON public.user_accounts;
 CREATE POLICY "User accounts access policy" ON public.user_accounts FOR ALL USING (true) WITH CHECK (true);
@@ -114,9 +130,50 @@ CREATE TABLE IF NOT EXISTS public.profiles (
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_username_lower
+  ON public.profiles (LOWER(TRIM(username)));
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Profiles access policy" ON public.profiles;
 CREATE POLICY "Profiles access policy" ON public.profiles FOR ALL USING (true) WITH CHECK (true);
+
+-- Auto-sync trigger from user_accounts to profiles & cascade username renames to workout_plans
+CREATE OR REPLACE FUNCTION public.handle_user_account_sync_profile()
+RETURNS TRIGGER AS $$
+BEGIN
+  BEGIN
+    INSERT INTO public.profiles (id, username, display_name)
+    VALUES (NEW.id, NEW.username, COALESCE(NEW.display_name, NEW.username))
+    ON CONFLICT (id) DO UPDATE
+    SET username = EXCLUDED.username,
+        display_name = EXCLUDED.display_name,
+        updated_at = NOW();
+  EXCEPTION WHEN OTHERS THEN
+    NULL;
+  END;
+
+  IF TG_OP = 'UPDATE' AND LOWER(TRIM(OLD.username)) IS DISTINCT FROM LOWER(TRIM(NEW.username)) THEN
+    BEGIN
+      UPDATE public.workout_plans
+      SET owner_username = NEW.username,
+          updated_at = NOW()
+      WHERE LOWER(TRIM(owner_username)) = LOWER(TRIM(OLD.username));
+
+      UPDATE public.workout_plans
+      SET created_by = NEW.username
+      WHERE LOWER(TRIM(created_by)) = LOWER(TRIM(OLD.username));
+    EXCEPTION WHEN OTHERS THEN
+      NULL;
+    END;
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS on_user_account_sync_profile ON public.user_accounts;
+CREATE TRIGGER on_user_account_sync_profile
+  AFTER INSERT OR UPDATE ON public.user_accounts
+  FOR EACH ROW EXECUTE FUNCTION public.handle_user_account_sync_profile();
 
 -- 3. Activity Logs Table
 CREATE TABLE IF NOT EXISTS public.activity_logs (
@@ -139,6 +196,8 @@ CREATE TABLE IF NOT EXISTS public.admin_settings (
   admin_accounts JSONB,
   visible_tabs JSONB,
   favicon TEXT,
+  image_url TEXT,
+  dim_percent INT,
   auto_logout_minutes INT DEFAULT 15,
   auto_logout_enabled BOOLEAN DEFAULT FALSE,
   login_lockout_seconds INT DEFAULT 60,
@@ -147,10 +206,14 @@ CREATE TABLE IF NOT EXISTS public.admin_settings (
   two_factor_enabled BOOLEAN DEFAULT FALSE,
   two_factor_secret TEXT,
   two_factor_backup_codes JSONB DEFAULT '[]'::jsonb,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS admin_accounts JSONB;
 ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS telegram_config JSONB;
+ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS image_url TEXT;
+ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS dim_percent INT;
+ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS login_lockout_seconds INT DEFAULT 60;
 ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS login_max_attempts INT DEFAULT 5;
 ALTER TABLE public.admin_settings ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT FALSE;
@@ -170,6 +233,10 @@ CREATE TABLE IF NOT EXISTS public.workout_plans (
   sheet_name TEXT,
   default_weight_unit TEXT DEFAULT 'kg',
   weeks INT DEFAULT 1,
+  has_rpe_column BOOLEAN DEFAULT FALSE,
+  has_rir_column BOOLEAN DEFAULT FALSE,
+  warmup_exercises JSONB DEFAULT '[]'::jsonb,
+  warmup_logs JSONB DEFAULT '{}'::jsonb,
   exercises JSONB DEFAULT '[]'::jsonb,
   source_file_name TEXT,
   created_by TEXT,
@@ -183,8 +250,14 @@ CREATE TABLE IF NOT EXISTS public.workout_plans (
 ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS instructions TEXT;
 ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS sheet_name TEXT;
 ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS default_weight_unit TEXT DEFAULT 'kg';
+ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS has_rpe_column BOOLEAN DEFAULT FALSE;
+ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS has_rir_column BOOLEAN DEFAULT FALSE;
+ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS warmup_exercises JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS warmup_logs JSONB DEFAULT '{}'::jsonb;
 ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS exercise_logs JSONB DEFAULT '{}'::jsonb;
 ALTER TABLE public.workout_plans ADD COLUMN IF NOT EXISTS previous_logs JSONB DEFAULT '{}'::jsonb;
+CREATE INDEX IF NOT EXISTS idx_workout_plans_owner_lower
+  ON public.workout_plans (LOWER(TRIM(owner_username)));
 ALTER TABLE public.workout_plans ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Workout plans access policy" ON public.workout_plans;
 CREATE POLICY "Workout plans access policy" ON public.workout_plans FOR ALL USING (true) WITH CHECK (true);`;
@@ -206,12 +279,14 @@ interface AdminPanelProps {
   userAccounts: UserAccount[];
   adminSettings: AdminSetting[];
   onLogout: () => void;
+  onUsernameChanged?: (newUsername: string) => Promise<void> | void;
 }
 
 export const AdminPanel: React.FC<AdminPanelProps> = ({ 
   userAccounts, 
   adminSettings, 
-  onLogout 
+  onLogout,
+  onUsernameChanged
 }) => {
   const [newUsername, setNewUsername] = useState('');
   const [newDisplayName, setNewDisplayName] = useState('');
@@ -219,11 +294,23 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   const [newUserGender, setNewUserGender] = useState<string>('male');
   const [newUserTelegram, setNewUserTelegram] = useState('');
   const [editingUser, setEditingUser] = useState<UserAccount | null>(null);
+  const [editingUsername, setEditingUsername] = useState('');
   const [editingDisplayName, setEditingDisplayName] = useState('');
   const [editingPassword, setEditingPassword] = useState('');
   const [editingUserGender, setEditingUserGender] = useState<string>('male');
   const [editingUserTelegram, setEditingUserTelegram] = useState('');
   const [userToDelete, setUserToDelete] = useState<UserAccount | null>(null);
+  const [toast, setToast] = useState<{ id: number; type: 'error' | 'success'; text: string } | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showToast = useCallback((type: 'error' | 'success', text: string) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    const id = Date.now();
+    setToast({ id, type, text });
+    toastTimerRef.current = setTimeout(() => {
+      setToast(prev => (prev?.id === id ? null : prev));
+    }, 5000);
+  }, []);
   const [confirmActionDialog, setConfirmActionDialog] = useState<{
     title: string;
     subtitle: string;
@@ -1605,33 +1692,69 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     }
   };
 
+  const getMergedUserAccountsForValidation = async (): Promise<UserAccount[]> => {
+    const byId = new Map<string, UserAccount>();
+    userAccounts.forEach(u => {
+      if (u?.id) byId.set(u.id, u);
+    });
+    try {
+      const liveUsers = await getFirestoreUserAccounts();
+      liveUsers.forEach(u => {
+        if (u?.id) byId.set(u.id, u);
+      });
+    } catch {
+      // Fallback to subscribed userAccounts prop
+    }
+    return Array.from(byId.values());
+  };
+
   const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
     setUserSuccessMsg(null);
     setUserErrorMsg(null);
 
-    const uName = newUsername.trim().toLowerCase();
     const rawPass = newPassword.trim();
-
-    if (!uName || !rawPass) {
-      setUserErrorMsg('Both username and password are required.');
+    if (!newUsername.trim() || !rawPass) {
+      const msg = 'Both username and password are required.';
+      setUserErrorMsg(msg);
+      showToast('error', msg);
       return;
     }
 
-    const configUser = ((import.meta as any).env?.VITE_APP_USERNAME || '').toLowerCase().trim();
-    if (uName === configUser || uName === adminUsername.toLowerCase().trim()) {
-      setUserErrorMsg(`"${newUsername}" is reserved for the Admin Panel.`);
-      return;
-    }
-
-    // Check if user already exists
-    if (userAccounts.some(u => u.username.toLowerCase() === uName)) {
-      setUserErrorMsg(`User "${newUsername}" already exists.`);
+    const configUser = ((import.meta as any).env?.VITE_APP_USERNAME || '').trim();
+    const localCheck = validateUsernameAvailability({
+      candidateUsername: newUsername,
+      mode: 'user',
+      userAccounts,
+      adminSettings,
+      adminAccounts: adminAccountsList,
+      extraAdminUsernames: [configUser, adminUsername],
+    });
+    if (!localCheck.valid) {
+      const msg = localCheck.message || 'Username already exists! Please change it.';
+      setUserErrorMsg(msg);
+      showToast('error', msg);
       return;
     }
 
     setIsSyncing(true);
     try {
+      const mergedUsers = await getMergedUserAccountsForValidation();
+      const liveCheck = validateUsernameAvailability({
+        candidateUsername: newUsername,
+        mode: 'user',
+        userAccounts: mergedUsers,
+        adminSettings,
+        adminAccounts: adminAccountsList,
+        extraAdminUsernames: [configUser, adminUsername],
+      });
+      if (!liveCheck.valid) {
+        const msg = liveCheck.message || 'Username already exists! Please change it.';
+        setUserErrorMsg(msg);
+        showToast('error', msg);
+        return;
+      }
+
       const uPass = await hashPassword(rawPass);
       const cleanTg = newUserTelegram.trim()
         ? (newUserTelegram.trim().startsWith('@') ? newUserTelegram.trim().toLowerCase() : `@${newUserTelegram.trim().toLowerCase()}`)
@@ -1639,7 +1762,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
       const newUser: UserAccount = {
         id: `user_${Date.now()}`,
-        username: newUsername.trim(),
+        username: liveCheck.cleanUsername,
         ...(newDisplayName.trim() ? { displayName: newDisplayName.trim() } : {}),
         password: uPass,
         gender: newUserGender,
@@ -1653,11 +1776,16 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       setNewPassword('');
       setNewUserGender('male');
       setNewUserTelegram('');
-      setUserSuccessMsg(`User account "${newUser.username}" created successfully (Password Cryptographically Hashed)!`);
-      
+      const okMsg = `User account "${newUser.username}" created successfully (Password Cryptographically Hashed)!`;
+      setUserSuccessMsg(okMsg);
+      showToast('success', okMsg);
+
       setTimeout(() => setUserSuccessMsg(null), 4000);
     } catch (err: any) {
-      setUserErrorMsg(`Failed to save user account: ${err?.message || String(err)}`);
+      const errMsg = err?.message || String(err);
+      const formatted = errMsg.toLowerCase().includes('already exists') ? errMsg : `Failed to save user account: ${errMsg}`;
+      setUserErrorMsg(formatted);
+      showToast('error', formatted);
     } finally {
       setIsSyncing(false);
     }
@@ -1672,35 +1800,97 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     const rawPass = editingPassword.trim();
 
     if (!rawPass && !editingUser.password) {
-      setUserErrorMsg('Password cannot be empty for an account with no existing password.');
+      const msg = 'Password cannot be empty for an account with no existing password.';
+      setUserErrorMsg(msg);
+      showToast('error', msg);
+      return;
+    }
+
+    const configUser = ((import.meta as any).env?.VITE_APP_USERNAME || '').trim();
+    const localCheck = validateUsernameAvailability({
+      candidateUsername: editingUsername,
+      mode: 'user',
+      excludeUserId: editingUser.id,
+      userAccounts,
+      adminSettings,
+      adminAccounts: adminAccountsList,
+      extraAdminUsernames: [configUser, adminUsername],
+    });
+    if (!localCheck.valid) {
+      const msg = localCheck.message || 'Username already exists! Please change it.';
+      setUserErrorMsg(msg);
+      showToast('error', msg);
       return;
     }
 
     setIsSyncing(true);
     try {
+      const mergedUsers = await getMergedUserAccountsForValidation();
+      const liveCheck = validateUsernameAvailability({
+        candidateUsername: editingUsername,
+        mode: 'user',
+        excludeUserId: editingUser.id,
+        userAccounts: mergedUsers,
+        adminSettings,
+        adminAccounts: adminAccountsList,
+        extraAdminUsernames: [configUser, adminUsername],
+      });
+      if (!liveCheck.valid) {
+        const msg = liveCheck.message || 'Username already exists! Please change it.';
+        setUserErrorMsg(msg);
+        showToast('error', msg);
+        return;
+      }
+
+      const oldUsername = (editingUser.username || '').trim();
+      const cleanNewUsername = liveCheck.cleanUsername;
+      const usernameChanged = oldUsername.toLowerCase() !== cleanNewUsername.toLowerCase();
       const uPass = rawPass ? await hashPassword(rawPass) : editingUser.password;
       const cleanTg = editingUserTelegram.trim()
         ? (editingUserTelegram.trim().startsWith('@') ? editingUserTelegram.trim().toLowerCase() : `@${editingUserTelegram.trim().toLowerCase()}`)
         : '';
       const updated: UserAccount = {
         ...editingUser,
-        displayName: editingDisplayName.trim() || editingUser.username,
+        username: cleanNewUsername,
+        displayName: editingDisplayName.trim() || cleanNewUsername,
         password: uPass,
         gender: editingUserGender,
         ...(cleanTg ? { telegramUsername: cleanTg } : { telegramUsername: '' }),
       };
       await saveUserAccountDoc(updated);
 
-      setUserSuccessMsg(`User account "${editingUser.username}" updated successfully!`);
+      if (usernameChanged) {
+        const cascade = await cascadeUsernameRename({
+          oldUsername,
+          newUsername: cleanNewUsername,
+          adminSettings,
+        });
+        const currentAdmin = localStorage.getItem('love_app_username') || 'Admin';
+        logActivity(
+          currentAdmin,
+          'user_username_renamed',
+          `Renamed member "${oldUsername}" to "${cleanNewUsername}" (${cascade.plansUpdated} plan(s) synced).`
+        ).catch(() => {});
+      }
+
+      const okMsg = usernameChanged
+        ? `User account renamed from "${oldUsername}" to "${cleanNewUsername}" and updated successfully!`
+        : `User account "${cleanNewUsername}" updated successfully!`;
+      setUserSuccessMsg(okMsg);
+      showToast('success', okMsg);
       setEditingUser(null);
+      setEditingUsername('');
       setEditingDisplayName('');
       setEditingPassword('');
       setEditingUserGender('male');
       setEditingUserTelegram('');
-      
+
       setTimeout(() => setUserSuccessMsg(null), 4000);
     } catch (err: any) {
-      setUserErrorMsg(`Failed to update user account: ${err?.message || String(err)}`);
+      const errMsg = err?.message || String(err);
+      const formatted = errMsg.toLowerCase().includes('already exists') ? errMsg : `Failed to update user account: ${errMsg}`;
+      setUserErrorMsg(formatted);
+      showToast('error', formatted);
     } finally {
       setIsSyncing(false);
     }
@@ -1805,17 +1995,22 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setAdminSuccessMsg(null);
     setAdminErrorMsg(null);
 
-    const cleanUser = newAdminUser.trim();
-    if (!cleanUser) {
-      setAdminErrorMsg('Admin username cannot be empty.');
+    const mergedUsers = await getMergedUserAccountsForValidation();
+    const check = validateUsernameAvailability({
+      candidateUsername: newAdminUser,
+      mode: 'admin',
+      userAccounts: mergedUsers,
+      adminSettings,
+      adminAccounts: adminAccountsList,
+    });
+    if (!check.valid) {
+      const msg = check.message || 'Username already exists! Please change it.';
+      setAdminErrorMsg(msg);
+      showToast('error', msg);
       return;
     }
 
-    if (adminAccountsList.some(a => a.username.toLowerCase() === cleanUser.toLowerCase())) {
-      setAdminErrorMsg(`Admin account "${cleanUser}" already exists.`);
-      return;
-    }
-
+    const cleanUser = check.cleanUsername;
     const hashedAdminPass = newAdminPass.trim() ? await hashPassword(newAdminPass.trim()) : '';
 
     const newAcc: AdminAccount = {
@@ -1829,6 +2024,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
     const updated = [...adminAccountsList, newAcc];
     await handleSaveAdminAccountsList(updated, `Created new admin portal credential "${cleanUser}" (${newAcc.role}) [Hashed].`);
+    showToast('success', `Admin credential "${cleanUser}" created successfully!`);
 
     setNewAdminUser('');
     setNewAdminPass('');
@@ -1843,11 +2039,28 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setAdminSuccessMsg(null);
     setAdminErrorMsg(null);
 
-    const cleanUser = editAdminUser.trim();
-    if (!cleanUser) {
-      setAdminErrorMsg('Admin username cannot be empty.');
+    const mergedUsers = await getMergedUserAccountsForValidation();
+    const check = validateUsernameAvailability({
+      candidateUsername: editAdminUser,
+      mode: 'admin',
+      excludeAdminId: editingAdmin.id,
+      userAccounts: mergedUsers,
+      adminSettings,
+      adminAccounts: adminAccountsList,
+    });
+    if (!check.valid) {
+      const msg = check.message || 'Username already exists! Please change it.';
+      setAdminErrorMsg(msg);
+      showToast('error', msg);
       return;
     }
+
+    const cleanUser = check.cleanUsername;
+    const oldAdminUser = (editingAdmin.username || '').trim();
+    const activeSessionUser = (localStorage.getItem('love_app_username') || adminUsername || '').trim().toLowerCase();
+    const isRenamingActiveAdmin =
+      oldAdminUser.toLowerCase() === activeSessionUser &&
+      oldAdminUser.toLowerCase() !== cleanUser.toLowerCase();
 
     const updated = await Promise.all(adminAccountsList.map(async a => {
       if (a.id === editingAdmin.id) {
@@ -1864,6 +2077,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     }));
 
     await handleSaveAdminAccountsList(updated, `Updated admin portal credential "${cleanUser}".`);
+    if (isRenamingActiveAdmin) {
+      setAdminUsername(cleanUser);
+      await onUsernameChanged?.(cleanUser);
+    }
+    showToast('success', `Admin credential "${cleanUser}" updated successfully!`);
     setEditingAdmin(null);
   };
 
@@ -2037,7 +2255,39 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
   return (
     <div id="admin_portal_container" className="min-h-screen bg-neutral-950 text-neutral-100 font-sans flex flex-col relative overflow-x-clip">
-      
+      {/* FLOATING TOAST NOTIFICATION */}
+      <AnimatePresence>
+        {toast && (
+          <motion.div
+            key={toast.id}
+            initial={{ opacity: 0, y: -16, scale: 0.96 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -12, scale: 0.96 }}
+            role="alert"
+            className={`fixed top-20 right-4 sm:right-6 z-[10000] max-w-md w-[calc(100vw-2rem)] sm:w-auto flex items-center gap-3 px-4 py-3 rounded-2xl border shadow-2xl backdrop-blur-xl ${
+              toast.type === 'error'
+                ? 'bg-rose-950/95 border-rose-500/60 text-rose-100 shadow-rose-950/60'
+                : 'bg-emerald-950/95 border-emerald-500/60 text-emerald-100 shadow-emerald-950/60'
+            }`}
+          >
+            {toast.type === 'error' ? (
+              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+            ) : (
+              <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
+            )}
+            <span className="text-xs font-semibold leading-snug flex-1">{toast.text}</span>
+            <button
+              type="button"
+              onClick={() => setToast(null)}
+              className="p-1 rounded-lg hover:bg-white/10 text-neutral-300 hover:text-white cursor-pointer"
+              title="Dismiss notification"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* ATMOSPHERIC BACKGROUND BLOBS */}
       <div className="absolute top-[-200px] left-[-200px] w-[600px] h-[600px] bg-indigo-600/10 rounded-full blur-[150px] pointer-events-none z-0"></div>
       <div className="absolute top-[-200px] right-[-200px] w-[600px] h-[600px] bg-rose-600/10 rounded-full blur-[150px] pointer-events-none z-0"></div>
@@ -2302,6 +2552,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                       type="button"
                       onClick={() => {
                         setEditingUser(null);
+                        setEditingUsername('');
                         setEditingDisplayName('');
                         setEditingPassword('');
                         setEditingUserTelegram('');
@@ -2312,7 +2563,18 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                       Cancel Edit
                     </button>
                   </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">Username</label>
+                      <input
+                        type="text"
+                        value={editingUsername}
+                        onChange={(e) => setEditingUsername(e.target.value)}
+                        placeholder="Login username"
+                        className="w-full bg-neutral-950/80 border border-white/10 rounded-xl px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-indigo-500/60"
+                        required
+                      />
+                    </div>
                     <div className="space-y-1.5">
                       <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">Display Name</label>
                       <input
@@ -2617,10 +2879,12 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                           <button
                             onClick={() => {
                               setEditingUser(user);
+                              setEditingUsername(user.username || '');
                               setEditingDisplayName(user.displayName || user.username || '');
                               setEditingPassword('');
                               setEditingUserGender(user.gender || 'male');
                               setEditingUserTelegram(user.telegramUsername || '');
+                              setUserErrorMsg(null);
                             }}
                             className="p-1.5 rounded-lg border border-white/10 hover:bg-white/5 text-neutral-400 hover:text-white transition-all cursor-pointer"
                             title="Edit Account Details"
@@ -4369,6 +4633,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 <button
                   type="button"
                   onClick={() => {
+                    setAdminErrorMsg(null);
                     setNewAdminUser('');
                     setNewAdminPass('');
                     setNewAdminRole('Super Admin');
@@ -4530,6 +4795,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         </button>
                         <button
                           onClick={() => {
+                            setAdminErrorMsg(null);
                             setEditingAdmin(acc);
                             setEditAdminUser(acc.username);
                             setEditAdminPass('');
@@ -5653,6 +5919,12 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               </div>
 
               <form onSubmit={handleAddAdminAccount} className="space-y-4">
+                {adminErrorMsg && (
+                  <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl text-xs text-rose-300 flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                    <span>{adminErrorMsg}</span>
+                  </div>
+                )}
                 <div className="space-y-1.5">
                   <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">Admin Username</label>
                   <input
@@ -5749,6 +6021,12 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               </div>
 
               <form onSubmit={handleUpdateAdminAccount} className="space-y-4">
+                {adminErrorMsg && (
+                  <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl text-xs text-rose-300 flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                    <span>{adminErrorMsg}</span>
+                  </div>
+                )}
                 <div className="space-y-1.5">
                   <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">Admin Username</label>
                   <input

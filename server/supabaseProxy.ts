@@ -113,9 +113,19 @@ async function serverSafeUpsert(
 ): Promise<{ success: boolean; error?: string }> {
   const currentPayload: Record<string, any> = {};
   Object.keys(payload || {}).forEach((k) => {
-    if (payload[k] !== undefined) {
-      currentPayload[k] = payload[k];
+    const val = payload[k];
+    if (val === undefined) return;
+    if (
+      (k.endsWith('_at') || k === 'subscription_end_date') &&
+      typeof val === 'string' &&
+      val.trim() === ''
+    ) {
+      if (k !== 'created_at' && k !== 'updated_at') {
+        currentPayload[k] = null;
+      }
+      return;
     }
+    currentPayload[k] = val;
   });
 
   for (let attempt = 0; attempt < 15; attempt++) {
@@ -151,8 +161,16 @@ async function serverSafeUpsert(
     if (
       msg.includes('profiles_username_key') ||
       msg.includes('username_key') ||
+      msg.includes('idx_user_accounts_username_lower') ||
+      msg.includes('idx_profiles_username_lower') ||
       (msg.includes('duplicate key') && msg.includes('username'))
     ) {
+      if (table === 'user_accounts') {
+        return {
+          success: false,
+          error: `Username "${currentPayload.username || ''}" already exists! Please choose a different username.`,
+        };
+      }
       const { error: retryErr } = await client
         .from(table)
         .upsert(currentPayload, { onConflict: 'username' });

@@ -38,6 +38,8 @@ import {
   supabaseSelect,
   supabaseInsert
 } from './supabaseService';
+import { saveWorkoutPlanDoc } from './gymService';
+import { getUserBgSettingIdForUsername } from './usernameUtils';
 import { isSupabaseConfigured, isAnySupabaseConfigured } from './supabase';
 import {
   UserAccount,
@@ -476,3 +478,104 @@ export async function syncAllTablesSupabaseToFirestore(): Promise<{ totalSynced:
 
   return { totalSynced, results, errors };
 }
+
+export interface UsernameRenameCascadeResult {
+  plansUpdated: number;
+  telegramUpdated: boolean;
+  backgroundMigrated: boolean;
+}
+
+/**
+ * Cascades a username rename across workoutPlans (ownerUsername/createdBy),
+ * telegramConfig authorizedUsers bindings, and per-user background settings.
+ */
+export async function cascadeUsernameRename(params: {
+  oldUsername: string;
+  newUsername: string;
+  adminSettings?: AdminSetting[];
+}): Promise<UsernameRenameCascadeResult> {
+  const cleanOld = (params.oldUsername || '').trim();
+  const cleanNew = (params.newUsername || '').trim();
+  const oldLower = cleanOld.toLowerCase();
+  const newLower = cleanNew.toLowerCase();
+
+  const summary: UsernameRenameCascadeResult = {
+    plansUpdated: 0,
+    telegramUpdated: false,
+    backgroundMigrated: false,
+  };
+
+  if (!oldLower || !newLower || oldLower === newLower) {
+    return summary;
+  }
+
+  const nowIso = new Date().toISOString();
+
+  // 1. Update owned workoutPlans (and createdBy when it matched the old username)
+  try {
+    const allPlans = await getFirestoreWorkoutPlans();
+    for (const plan of allPlans) {
+      const ownerMatches = (plan.ownerUsername || '').trim().toLowerCase() === oldLower;
+      const creatorMatches = (plan.createdBy || '').trim().toLowerCase() === oldLower;
+      if (ownerMatches || creatorMatches) {
+        await saveWorkoutPlanDoc({
+          ...plan,
+          ...(ownerMatches ? { ownerUsername: cleanNew } : {}),
+          ...(creatorMatches ? { createdBy: cleanNew } : {}),
+          updatedAt: nowIso,
+        });
+        summary.plansUpdated++;
+      }
+    }
+  } catch (err) {
+    console.warn('cascadeUsernameRename workoutPlans error:', err);
+  }
+
+  // 2. Update Telegram authorizedUsers & per-user website background setting
+  try {
+    const fsSettings = await getFirestoreAdminSettings();
+    const settingsSource = fsSettings.length > 0 ? fsSettings : (params.adminSettings || []);
+
+    const tgDoc = settingsSource.find(s => s.id === 'telegramConfig');
+    const authUsers = tgDoc?.telegramConfig?.authorizedUsers;
+    if (tgDoc?.telegramConfig && Array.isArray(authUsers)) {
+      let touched = false;
+      const nextAuthorized = authUsers.map(entry => {
+        if ((entry.appUsername || '').trim().toLowerCase() === oldLower) {
+          touched = true;
+          return { ...entry, appUsername: cleanNew };
+        }
+        return entry;
+      });
+      if (touched) {
+        await saveAdminSettingDoc({
+          ...tgDoc,
+          telegramConfig: {
+            ...tgDoc.telegramConfig,
+            authorizedUsers: nextAuthorized,
+          },
+        });
+        summary.telegramUpdated = true;
+      }
+    }
+
+    const oldBgId = getUserBgSettingIdForUsername(cleanOld);
+    const newBgId = getUserBgSettingIdForUsername(cleanNew);
+    if (oldBgId !== newBgId) {
+      const oldBgDoc = settingsSource.find(s => s.id === oldBgId);
+      if (oldBgDoc && (oldBgDoc.imageUrl || oldBgDoc.dimPercent !== undefined)) {
+        await saveAdminSettingDoc({
+          ...oldBgDoc,
+          id: newBgId,
+          updatedAt: nowIso,
+        });
+        summary.backgroundMigrated = true;
+      }
+    }
+  } catch (err) {
+    console.warn('cascadeUsernameRename adminSettings error:', err);
+  }
+
+  return summary;
+}
+

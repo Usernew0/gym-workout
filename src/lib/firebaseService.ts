@@ -253,7 +253,31 @@ export function subscribeToFirestoreUserAccounts(callback: (data: UserAccount[])
   });
 }
 
-export async function saveFirestoreUserAccountDoc(user: UserAccount) {
+const ALLOWED_FIRESTORE_USER_ACCOUNT_KEYS = new Set([
+  'id',
+  'username',
+  'displayName',
+  'password',
+  'role',
+  'gender',
+  'weightUnitPreference',
+  'telegramUsername',
+  'telegramChatId',
+  'telegramNotificationsEnabled',
+  'waterIntake',
+  'bodyWeightHistory',
+  'restTimerPrefs',
+  'twoFactorEnabled',
+  'twoFactorSecret',
+  'twoFactorBackupCodes',
+  'twoFactorCreatedAt',
+  'visibleTabs',
+  'coupleId',
+  'createdAt',
+  'updatedAt',
+]);
+
+export async function saveFirestoreUserAccountDoc(user: UserAccount): Promise<UserAccount> {
   try {
     const cleanUsername = (user?.username || '').trim();
     if (cleanUsername.length < 2) {
@@ -261,7 +285,7 @@ export async function saveFirestoreUserAccountDoc(user: UserAccount) {
     }
     // Admin credentials belong in adminSettings; firestore.rules intentionally blocks 'admin' inside userAccounts.
     if (cleanUsername.toLowerCase() === 'admin') {
-      return;
+      return user;
     }
 
     const sanitized = sanitizeForFirestore({
@@ -270,39 +294,45 @@ export async function saveFirestoreUserAccountDoc(user: UserAccount) {
     }) as UserAccount;
 
     let targetId = (sanitized.id || '').trim();
+    const cleanLower = cleanUsername.toLowerCase();
     let existingData: Record<string, any> | null = null;
 
-    if (targetId) {
-      try {
-        const directSnap = await getDoc(doc(db, 'userAccounts', targetId));
-        if (directSnap.exists()) {
-          existingData = directSnap.data() as Record<string, any>;
-        }
-      } catch {
-        // ignore read lookup fallback
+    try {
+      const allSnap = await getDocs(collection(db, 'userAccounts'));
+      const exactDoc = targetId ? allSnap.docs.find(d => d.id === targetId) : undefined;
+      if (exactDoc) {
+        existingData = exactDoc.data() as Record<string, any>;
       }
-    }
 
-    // If direct doc wasn't found (e.g. fallback user_<name> id) or password is missing, look up canonical doc by username
-    if (!existingData || typeof sanitized.password !== 'string' || sanitized.password.length < 4) {
-      try {
-        const allSnap = await getDocs(collection(db, 'userAccounts'));
-        for (const d of allSnap.docs) {
-          const data = d.data() as Record<string, any>;
-          const docUser = typeof data?.username === 'string' ? data.username.trim().toLowerCase() : '';
-          if (d.id === targetId || (docUser && docUser === cleanUsername.toLowerCase())) {
-            targetId = d.id;
-            existingData = data;
-            break;
+      const conflictingDoc = allSnap.docs.find(d => {
+        if (exactDoc && d.id === exactDoc.id) return false;
+        if (!exactDoc && targetId && d.id === targetId) return false;
+        const data = d.data() as Record<string, any>;
+        const docUser = typeof data?.username === 'string' ? data.username.trim().toLowerCase() : '';
+        return Boolean(docUser && docUser === cleanLower);
+      });
+
+      if (conflictingDoc) {
+        throw new Error(`Username "${cleanUsername}" already exists! Please choose a different username.`);
+      }
+    } catch (lookupErr: any) {
+      if (lookupErr?.message?.includes('already exists')) {
+        throw lookupErr;
+      }
+      if (targetId && !existingData) {
+        try {
+          const directSnap = await getDoc(doc(db, 'userAccounts', targetId));
+          if (directSnap.exists()) {
+            existingData = directSnap.data() as Record<string, any>;
           }
+        } catch {
+          // ignore read lookup fallback
         }
-      } catch {
-        // ignore lookup errors
       }
     }
 
     if (!targetId) {
-      targetId = `user_${cleanUsername.toLowerCase().replace(/[^a-z0-9_-]+/g, '_')}`;
+      targetId = `user_${cleanLower.replace(/[^a-z0-9_-]+/g, '_')}`;
     }
 
     const resolvedPassword =
@@ -316,17 +346,63 @@ export async function saveFirestoreUserAccountDoc(user: UserAccount) {
       throw new Error(`Account "${cleanUsername}" does not exist in Firestore yet or is missing a valid password.`);
     }
 
-    const finalPayload: Record<string, any> = sanitizeForFirestore({
+    const mergedRaw: Record<string, any> = sanitizeForFirestore({
       ...(existingData || {}),
       ...sanitized,
       id: targetId,
-      username: typeof existingData?.username === 'string' && existingData.username.trim()
-        ? existingData.username
-        : cleanUsername,
+      username: cleanUsername,
       ...(resolvedPassword ? { password: resolvedPassword } : {}),
     });
 
-    await setDoc(doc(db, 'userAccounts', targetId), finalPayload);
+    const finalPayload: Record<string, any> = {};
+    for (const key of Object.keys(mergedRaw)) {
+      if (ALLOWED_FIRESTORE_USER_ACCOUNT_KEYS.has(key)) {
+        finalPayload[key] = mergedRaw[key];
+      }
+    }
+    if (
+      finalPayload.weightUnitPreference !== undefined &&
+      finalPayload.weightUnitPreference !== 'kg' &&
+      finalPayload.weightUnitPreference !== 'lbs'
+    ) {
+      delete finalPayload.weightUnitPreference;
+    }
+
+    try {
+      await setDoc(doc(db, 'userAccounts', targetId), finalPayload);
+      return finalPayload as UserAccount;
+    } catch (writeErr: any) {
+      const code = String(writeErr?.code || '');
+      const msg = String(writeErr?.message || '');
+      const isPermError =
+        code.includes('permission-denied') ||
+        msg.toLowerCase().includes('missing or insufficient permissions') ||
+        msg.toLowerCase().includes('permission');
+
+      const existingUsernameLower =
+        typeof existingData?.username === 'string' ? existingData.username.trim().toLowerCase() : '';
+      const isUsernameRename = Boolean(existingData && existingUsernameLower && existingUsernameLower !== cleanLower);
+
+      // Legacy deployed firestore.rules block in-place username mutation on update (`incoming().username.lower() == existing().username.lower()`).
+      // Migrate atomically by creating the renamed document under a fresh ID and deleting the old document.
+      if (isPermError && isUsernameRename && resolvedPassword && resolvedPassword.length >= 4) {
+        const slug = cleanLower.replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 80) || 'user';
+        const migratedId = `user_${slug}_${Date.now().toString(36)}`;
+        const migratedPayload: Record<string, any> = {
+          ...finalPayload,
+          id: migratedId,
+          username: cleanUsername,
+          password: resolvedPassword,
+        };
+        await setDoc(doc(db, 'userAccounts', migratedId), migratedPayload);
+        await deleteDoc(doc(db, 'userAccounts', targetId)).catch((delErr) => {
+          console.warn('Firestore legacy username doc cleanup warning:', delErr);
+        });
+        return migratedPayload as UserAccount;
+      }
+
+      throw writeErr;
+    }
   } catch (err) {
     console.warn("Firestore saveUserAccountDoc error:", err);
     throw err;

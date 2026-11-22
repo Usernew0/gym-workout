@@ -1264,3 +1264,26 @@ Expanded and fixed the event trigger architecture to ensure 100% of security eve
    - Extended `ExportWorkoutPdfOptions` with `waterGoalGlasses` and `waterTargetLiters` (passed from `GymApp.tsx` `waterGoalSummary` and `telegramBotEngine.ts` `computeUserWaterGoal`), replacing hardcoded `/ 8 Glasses` with personalized glass targets and liters (`consumedLiters / targetLiters L`) across single-plan and multi-split portfolio headers/KPIs.
    - Added the **Weekly Progress Schedule (Done vs Remaining Weeks)** section table, updated executive banner metadata (`Updated` date, `Sheet` filename, done/remaining week counts, total notes logged), ensured sheet `Target RIR` renders cleanly as read-only metadata, highlighted **Coach Notes** and **Per-Week Exercise Notes** (`Note: ...`) inside exercise cards and warm-up tables, and upgraded Section 7 into **Notes, Coach Cues & Session Feedback** consolidating all non-empty session feedback, exercise week notes, coach notes, and warm-up notes across the plan.
 
+---
+
+## 48. Editable Usernames in Admin Panel & Member Profile with Duplicate Protection & Toast Notifications
+
+1. **Shared Username Availability & Validation Helper (`src/lib/usernameUtils.ts`)**:
+   - Added `validateUsernameAvailability` enforcing length constraints (`2..128` characters), reserved `'admin'` blocking on member accounts, and case-insensitive uniqueness across **both** member `userAccounts` and admin `adminAccounts` / `credentials` (excluding only the currently edited account's own ID).
+   - Shared deterministic background setting ID helper `getUserBgSettingIdForUsername` across `GymApp.tsx` and `syncService.ts`.
+
+2. **Database Persistence & Reference Cascading (`firestore.rules`, `src/lib/firebaseService.ts`, `src/lib/supabaseService.ts`, `src/lib/syncService.ts`)**:
+   - Updated `firestore.rules` (`userAccounts` `allow update`) to permit modifying `username` while preserving document ID equality, valid schema bounds, password preservation, and `'admin'` impersonation protection.
+   - Hardened `saveFirestoreUserAccountDoc` to whitelist valid `UserAccount` fields, reject duplicate usernames across other document IDs, persist the updated `cleanUsername`, and automatically migrate the account atomically (`create new ID` -> `delete old ID`, returning the persisted account to keep Supabase/caches aligned) if live un-deployed Firestore rules reject in-place `username` mutation with `permission-denied`.
+   - Updated `saveUserAccountDoc` in `src/lib/supabaseService.ts` to match cached accounts by ID first and synchronize migrated IDs cleanly across cache and Supabase.
+   - Added `cascadeUsernameRename` in `src/lib/syncService.ts` to automatically update `ownerUsername` / `createdBy` on owned `workoutPlans`, `appUsername` inside `telegramConfig.authorizedUsers`, and per-user website background settings (`adminSettings`) whenever a username changes.
+
+3. **Admin Panel & User Profile Editing UI + Floating Toast Feedback (`src/components/AdminPanel.tsx`, `src/components/gym/GymApp.tsx`, `src/App.tsx`)**:
+   - **Admin Panel**: Added an editable **Username** field inside the Website User Accounts edit form, live Firestore + prop duplicate validation across user/admin create & update flows, floating top-right toast alerts (`toast` banner) alongside inline modal/form error banners, and session token rotation (`onUsernameChanged`) if an admin renames their own active admin username.
+   - **Member Profile**: Converted **Login Username** in **Profile -> Profile Information** from read-only to editable, added live Firestore + prop duplicate checks with floating toast alerts (`profileToast`) on conflict, migrated per-user `localStorage` keys (hydration, body weight, backgrounds, rest timers), cascaded plans/Telegram/background references, and rotated the signed browser session token via `App.tsx` `handleUsernameChanged`.
+
+4. **PostgreSQL / Supabase SQL Schema, Triggers & Duplicate Protection (`src/lib/databaseSetup.sql`, `supabase_schema.sql`, `src/components/AdminPanel.tsx` `SUPABASE_SCHEMA_FIX_SQL`, `src/lib/supabaseService.ts`, `server/supabaseProxy.ts`)**:
+   - Added case-insensitive unique username indexes (`idx_user_accounts_username_lower` and `idx_profiles_username_lower` on `LOWER(TRIM(username))`) plus `idx_workout_plans_owner_lower` and current profile/workout/background columns across `databaseSetup.sql`, `supabase_schema.sql`, and `SUPABASE_SCHEMA_FIX_SQL`.
+   - Fixed `handle_user_account_sync_profile()` trigger to resolve `ON CONFLICT (id)` so modifying a username updates `public.profiles.username` on the same row instead of failing on `profiles_pkey`, and automatically cascades `owner_username`/`created_by` updates to `public.workout_plans`.
+   - Updated `safeUpsert` (`src/lib/supabaseService.ts`) and `serverSafeUpsert` (`server/supabaseProxy.ts`) so unique-username violations on `user_accounts` return an explicit duplicate error instead of silently overwriting another account via `onConflict: 'username'`, and normalized empty timestamp strings (such as `twoFactorCreatedAt: ""`) in `mapToDb`, `safeUpsert`, and `serverSafeUpsert` so `TIMESTAMPTZ` columns receive `null`/defaults cleanly.
+
