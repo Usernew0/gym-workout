@@ -1217,3 +1217,32 @@ Expanded and fixed the event trigger architecture to ensure 100% of security eve
    - **Dedicated `Previous` Roles (`prev_combined`, `prev_weight`, `prev_reps`, `prev_rpe`, `prev_rir`)**: Added dedicated Previous Session roles to `ManualColumnMappingRole`, `summarizeColumnsAndMissing`, `buildColumnMapFromOverride`, and `SheetUploader.tsx` `BASE_COLUMN_ROLE_OPTIONS` so `Previous` columns no longer collide with `Week 1 Weight` / `Actual Reps` in the Column Mapper.
    - **Override State Sync (`applySheetColumnOverride`)**: Ensured manual Column Mapper re-assignments also sync detected `weightUnit` and automatically enable `replaceExistingWeekLogs` when updating an existing plan with newly detected trained week data.
 
+---
+
+## 45. Standard Workout Template Focused Solely on Required & Optional Sheet Columns
+
+1. **Split-Free 10-Column Standard Template (`src/lib/workoutExcelExport.ts`)**:
+   - Updated `buildStandardWorkoutTemplateWorkbook` (`downloadStandardWorkoutTemplateExcel`) to remove all mentions of specific training splits (`Push / Pull / Legs`, `Torso / Limbs`, `Pro / Bro Split`, `Upper / Lower`, etc.) from both the `Workout Plan` and `Template Guide` sheets.
+   - Standardized the template on 10 explicit columns ensuring every required and optional workout field is clearly captured: `Day | Exercises | Sets | Reps | RPE | RIR | Weight (kg/lbs) | Actual Reps | Notes | Video URL` with neutral `Day 1`, `Day 2`, `Day 3` labels.
+   - Updated the second `Template Guide` tab to strictly document column requirements (`Required`, `Recommended`, `Optional`), expected values, and optional `Week 2..N` multi-week headers.
+
+2. **Uploader Layout Banner & Placeholder Alignment (`src/components/gym/SheetUploader.tsx`)**:
+   - Updated the **Standard Sheet Column Layout** summary bar (`Col 1: Day` through `Col 10: Video URL`), custom day input placeholder, and plan title placeholder to remove all split-specific examples and match the downloaded `.xlsx` template 1-for-1.
+
+---
+
+## 46. Production Profile Background Persistence, Bot Water Intake Accuracy & Read-Only Sheet RIR Display
+
+1. **Production-Safe Per-User Profile Background Upload (`src/components/gym/GymApp.tsx`)**:
+   - **Root Cause Fixed**: Profile backgrounds previously relied exclusively on local Express disk routes (`/api/profile/background` storing files in `public/uploads/backgrounds/` and `tmp/user_backgrounds.json`), which fail with 404 HTML responses on serverless hosts (Vercel) and do not persist across ephemeral container deployments or multiple devices.
+   - **Firestore Cloud Persistence & Smart Compression**:
+     - Added deterministic Firestore-rule-compliant document ID mapping (`getUserBgSettingId(username)` -> `userBg_<slug>_<hash>`) stored inside `adminSettings` via `saveAdminSettingDoc`, synced in real time to every member session through the `adminSettings` subscription (`localStorage` cache retained for instant initial paint, with legacy Express `/api/profile/background` kept strictly optional and JSON-header-guarded).
+     - Upgraded `compressBackgroundImageToDataUrl(file)` with progressive resolution/quality passes (`1600px -> 640px`, `0.82 -> 0.44`) enforcing a Firestore-safe `<= 420,000` char budget (and falling back to WebP/JPEG for oversized GIFs) so uploaded images and `userBgDimPercent` overlay levels save reliably across production environments.
+
+2. **Accurate Water Intake Glasses & Body-Weight Goals for the Telegram Bot (`src/components/gym/GymApp.tsx`, `server/telegramBotEngine.ts`, `server.ts`, `src/lib/telegramService.ts`, `src/types.ts`)**:
+   - **Fixed Stale Server Clobbering on Mount**: Previously, opening the app on a fresh browser or after cache clearing pushed `glasses: 0` with `updatedAt: new Date().toISOString()` to `/api/water-intake/sync`, overwriting the member's real Firestore water count inside `serverWaterIntakeOverrides`; mount sync now fires only when `storedWater.updatedAt > 0`, while Firestore hydration also pushes live DB values to the server cache.
+   - **Personalized Body-Weight Target & Liters Display**: Removed hardcoded `8`-glass targets in `/water` (`server/telegramBotEngine.ts`) and `runScheduledWaterRemindersPass` (`server.ts`) by adding `computeUserWaterGoal(user)` (`35 ml/kg`, `250 ml/glass`), extending `UserAccount.waterIntake` with optional `goalGlasses` and `targetLiters`, removing `!baseAccount.password` client guards that could skip Firestore water/weight saves, and formatting both `glasses` and `Liters` in `formatWaterIntakeTelegramMessageHtml` and `formatWaterIntakeTelegramMessage`.
+
+3. **Disabled Editable RIR Inputs — Read-Only Display Only When Found in Sheet (`src/components/gym/GymApp.tsx`)**:
+   - Removed all editable `<input>` fields for per-set `RIR`, inline exercise `Target RIR` edits, and the `Modify Worksheet` RIR column.
+   - Workout cards now render RIR strictly as read-only content (Exercise header `Target RIR` pill and non-editable read-only per-set RIR cells) exclusively when `ex.targetRir` or sheet-imported `setRow.rir` values are present in the uploaded workout sheet, leaving set rows focused on `Weight | Reps | [RPE] | Rest` whenever no sheet RIR exists.

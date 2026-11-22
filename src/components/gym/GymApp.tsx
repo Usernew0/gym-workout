@@ -191,6 +191,59 @@ function saveStoredBodyWeight(username: string, entries: BodyWeightEntry[]) {
   }
 }
 
+const MAX_BG_DATA_URL_CHARS = 420_000;
+
+export function getUserBgSettingId(username: string): string {
+  const clean = (username || 'member').trim().toLowerCase();
+  const slug = clean.replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '') || 'user';
+  let hash = 0;
+  for (let i = 0; i < clean.length; i++) {
+    hash = ((hash * 31) + clean.charCodeAt(i)) >>> 0;
+  }
+  const suffix = hash.toString(36);
+  const raw = `userBg_${slug}_${suffix}`;
+  return raw.slice(0, 128);
+}
+
+function computeWaterGoalFromBodyWeightEntries(entries: BodyWeightEntry[]): {
+  hasWeight: boolean;
+  weightDisplay: string;
+  weightKg: number | null;
+  targetLiters: number;
+  targetGlasses: number;
+} {
+  const GLASS_LITERS = 0.25;
+  if (entries && entries.length > 0) {
+    const sorted = [...entries].sort((a, b) => {
+      const dCmp = a.date.localeCompare(b.date);
+      if (dCmp !== 0) return dCmp;
+      return (a.updatedAt || '').localeCompare(b.updatedAt || '');
+    });
+    const latest = sorted[sorted.length - 1];
+    const weightKgRaw = latest.unit === 'lbs' ? latest.weight * 0.45359237 : latest.weight;
+    const weightKg = Math.round(weightKgRaw * 10) / 10;
+    if (Number.isFinite(weightKg) && weightKg > 0) {
+      const targetLiters = Math.min(6.0, Math.max(1.2, Math.round(weightKg * 0.035 * 10) / 10));
+      const targetGlasses = Math.max(4, Math.round(targetLiters / GLASS_LITERS));
+      return {
+        hasWeight: true,
+        weightDisplay: `${latest.weight} ${latest.unit}`,
+        weightKg,
+        targetLiters,
+        targetGlasses,
+      };
+    }
+  }
+  const defaultLiters = Number((WATER_DAILY_GOAL * GLASS_LITERS).toFixed(1));
+  return {
+    hasWeight: false,
+    weightDisplay: '',
+    weightKg: null,
+    targetLiters: defaultLiters,
+    targetGlasses: WATER_DAILY_GOAL,
+  };
+}
+
 function getUserBgStorageKey(username: string): string {
   return `gymworkout_bg_${(username || 'member').toLowerCase().trim()}`;
 }
@@ -233,34 +286,67 @@ async function compressBackgroundImageToDataUrl(file: File): Promise<string> {
     reader.readAsDataURL(file);
   });
 
-  if (file.type === 'image/gif' && file.size <= 4 * 1024 * 1024) {
+  // Preserve animated GIFs only when safely within Firestore 1 MiB doc limit
+  if (file.type === 'image/gif' && rawDataUrl.length <= MAX_BG_DATA_URL_CHARS) {
     return rawDataUrl;
   }
 
-  return await new Promise((resolve) => {
+  return await new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
-      const maxDim = 1920;
-      let { width, height } = img;
-      if (width > maxDim || height > maxDim) {
-        const scale = Math.min(maxDim / width, maxDim / height);
-        width = Math.max(1, Math.round(width * scale));
-        height = Math.max(1, Math.round(height * scale));
+      const steps: Array<{ maxDim: number; quality: number }> = [
+        { maxDim: 1600, quality: 0.82 },
+        { maxDim: 1280, quality: 0.72 },
+        { maxDim: 1024, quality: 0.62 },
+        { maxDim: 800, quality: 0.52 },
+        { maxDim: 640, quality: 0.44 },
+      ];
+      const preferredMime = file.type === 'image/png' ? 'image/webp' : 'image/jpeg';
+      let bestEncoded = '';
+
+      for (const step of steps) {
+        let width = img.width || 1280;
+        let height = img.height || 720;
+        if (width > step.maxDim || height > step.maxDim) {
+          const scale = Math.min(step.maxDim / width, step.maxDim / height);
+          width = Math.max(1, Math.round(width * scale));
+          height = Math.max(1, Math.round(height * scale));
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) break;
+        ctx.drawImage(img, 0, 0, width, height);
+
+        let encoded = canvas.toDataURL(preferredMime, step.quality);
+        if (!encoded.startsWith('data:image/')) {
+          encoded = canvas.toDataURL('image/jpeg', step.quality);
+        }
+        bestEncoded = encoded;
+        if (encoded.length <= MAX_BG_DATA_URL_CHARS) {
+          resolve(encoded);
+          return;
+        }
       }
-      const canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
+
+      if (bestEncoded && bestEncoded.length <= 750_000) {
+        resolve(bestEncoded);
+        return;
+      }
+      if (rawDataUrl.length <= MAX_BG_DATA_URL_CHARS) {
         resolve(rawDataUrl);
         return;
       }
-      ctx.drawImage(img, 0, 0, width, height);
-      const mime = file.type === 'image/png' ? 'image/webp' : 'image/jpeg';
-      const encoded = canvas.toDataURL(mime, 0.85);
-      resolve(encoded.startsWith('data:image/') ? encoded : rawDataUrl);
+      reject(new Error('Image is too large after optimization. Please choose a smaller image.'));
     };
-    img.onerror = () => resolve(rawDataUrl);
+    img.onerror = () => {
+      if (rawDataUrl.length <= MAX_BG_DATA_URL_CHARS) {
+        resolve(rawDataUrl);
+      } else {
+        reject(new Error('Unable to process this image format in your browser.'));
+      }
+    };
     img.src = rawDataUrl;
   });
 }
@@ -979,41 +1065,67 @@ export const GymApp: React.FC<GymAppProps> = ({
     setBgFeedback(null);
 
     if (currentUser) {
+      // Optional legacy local-server background sync (only applies if Firestore adminSettings does not have an entry yet)
       fetch(`/api/profile/background?username=${encodeURIComponent(currentUser)}`)
-        .then(r => (r.ok ? r.json() : null))
+        .then(r => (r.ok && r.headers.get('content-type')?.includes('application/json') ? r.json() : null))
         .then((res) => {
-          if (!res?.success) return;
-          if (res.background?.imageUrl) {
-            const dim = typeof res.background.dimPercent === 'number' ? res.background.dimPercent : 72;
-            setUserBgImageUrl(res.background.imageUrl);
-            setUserBgDimPercent(dim);
-            saveStoredUserBg(currentUser, res.background.imageUrl, dim);
-          } else if (res.background === null) {
-            setUserBgImageUrl('');
-            saveStoredUserBg(currentUser, '', 72);
-          }
+          if (!res?.success || !res.background?.imageUrl) return;
+          const settingId = getUserBgSettingId(currentUser);
+          const hasCloudSetting = adminSettings.some(s => s.id === settingId);
+          if (hasCloudSetting) return;
+          const dim = typeof res.background.dimPercent === 'number' ? res.background.dimPercent : 72;
+          setUserBgImageUrl(res.background.imageUrl);
+          setUserBgDimPercent(dim);
+          saveStoredUserBg(currentUser, res.background.imageUrl, dim);
         })
         .catch(() => {});
 
-      fetch('/api/water-intake/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          username: currentUser,
-          date: getTodayDateKey(),
-          timezoneOffsetMinutes: -new Date().getTimezoneOffset(),
-          glasses: storedWater.count,
-          updatedAt: storedWater.updatedAt > 0 ? new Date(storedWater.updatedAt).toISOString() : new Date().toISOString(),
-          reminderEnabled: rem.enabled,
-          reminderIntervalMinutes: rem.intervalMinutes,
-        }),
-      }).catch(() => {});
+      // Only push local water count to backend if this browser actually logged water updates today
+      if (storedWater.updatedAt > 0) {
+        const storedGoal = computeWaterGoalFromBodyWeightEntries(readStoredBodyWeight(currentUser).entries);
+        fetch('/api/water-intake/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: currentUser,
+            date: getTodayDateKey(),
+            timezoneOffsetMinutes: -new Date().getTimezoneOffset(),
+            glasses: storedWater.count,
+            goalGlasses: storedGoal.targetGlasses,
+            targetLiters: storedGoal.targetLiters,
+            updatedAt: new Date(storedWater.updatedAt).toISOString(),
+            reminderEnabled: rem.enabled,
+            reminderIntervalMinutes: rem.intervalMinutes,
+          }),
+        }).catch(() => {});
+      }
     }
   }, [currentUser]);
+
+  // Hydrate persistent per-user Website Background from Firestore adminSettings across production & multi-device
+  useEffect(() => {
+    if (!currentUser) return;
+    const bgSettingId = getUserBgSettingId(currentUser);
+    const cloudBgDoc = adminSettings.find(s => s.id === bgSettingId);
+    if (!cloudBgDoc) return;
+
+    const cloudUrl = typeof cloudBgDoc.imageUrl === 'string' ? cloudBgDoc.imageUrl : '';
+    const rawDim = Number(cloudBgDoc.dimPercent);
+    const cloudDim = Number.isFinite(rawDim) && rawDim >= 20 && rawDim <= 95 ? Math.round(rawDim) : 72;
+    setUserBgImageUrl(cloudUrl);
+    setUserBgDimPercent(cloudDim);
+    saveStoredUserBg(currentUser, cloudUrl, cloudDim);
+  }, [adminSettings, currentUser]);
 
   // Hydrate persistent Water Reminder, Body Weight & Rest Timer prefs from Firestore UserAccount
   useEffect(() => {
     if (!matchedAccount) return;
+    const effectiveGoal = computeWaterGoalFromBodyWeightEntries(
+      Array.isArray(matchedAccount.bodyWeightHistory) && matchedAccount.bodyWeightHistory.length > 0
+        ? matchedAccount.bodyWeightHistory
+        : readStoredBodyWeight(currentUser).entries
+    );
+
     if (matchedAccount.waterIntake) {
       const dbUpdated = matchedAccount.waterIntake.updatedAt ? (Date.parse(matchedAccount.waterIntake.updatedAt) || 0) : 0;
       const localRem = readStoredWaterReminder(currentUser);
@@ -1032,7 +1144,7 @@ export const GymApp: React.FC<GymAppProps> = ({
         }
       }
       const localWater = readStoredWaterCount(currentUser);
-      if (matchedAccount.waterIntake.date === getTodayDateKey() && (dbUpdated > localWater.updatedAt || localWater.updatedAt === 0)) {
+      if (matchedAccount.waterIntake.date === getTodayDateKey() && (dbUpdated >= localWater.updatedAt || localWater.updatedAt === 0)) {
         const dbGlasses = Math.max(0, Math.min(40, Math.floor(Number(matchedAccount.waterIntake.glasses) || 0)));
         waterGlassesRef.current = dbGlasses;
         setWaterGlasses(dbGlasses);
@@ -1044,17 +1156,55 @@ export const GymApp: React.FC<GymAppProps> = ({
         } catch {
           // ignore
         }
-      } else if (localWater.updatedAt > dbUpdated && matchedAccount.password) {
+        // Keep backend live bot cache synchronized with Firestore value
+        fetch('/api/water-intake/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: currentUser,
+            date: getTodayDateKey(),
+            timezoneOffsetMinutes: -new Date().getTimezoneOffset(),
+            glasses: dbGlasses,
+            goalGlasses: effectiveGoal.targetGlasses,
+            targetLiters: effectiveGoal.targetLiters,
+            updatedAt: matchedAccount.waterIntake.updatedAt || new Date().toISOString(),
+            reminderEnabled: matchedAccount.waterIntake.reminderEnabled ?? waterReminderEnabledRef.current,
+            reminderIntervalMinutes: matchedAccount.waterIntake.reminderIntervalMinutes ?? waterReminderIntervalRef.current,
+          }),
+        }).catch(() => {});
+      } else if (localWater.updatedAt > dbUpdated && matchedAccount.username?.toLowerCase().trim() !== 'admin') {
         // Local water intake is newer than DB (e.g. saved just before refresh); push local state up cleanly
         const syncPayload: UserAccount = {
           ...matchedAccount,
           waterIntake: {
             date: getTodayDateKey(),
             glasses: localWater.count,
+            goalGlasses: effectiveGoal.targetGlasses,
+            targetLiters: effectiveGoal.targetLiters,
             updatedAt: new Date(localWater.updatedAt).toISOString(),
             timezoneOffsetMinutes: -new Date().getTimezoneOffset(),
             reminderEnabled: readStoredWaterReminder(currentUser).enabled,
             reminderIntervalMinutes: readStoredWaterReminder(currentUser).intervalMinutes,
+          },
+        };
+        setLocalAccountOverride(syncPayload);
+        saveUserAccountDoc(syncPayload).catch(() => {});
+      }
+    } else if (currentUser && matchedAccount.username?.toLowerCase().trim() !== 'admin') {
+      const localWater = readStoredWaterCount(currentUser);
+      if (localWater.updatedAt > 0 || effectiveGoal.hasWeight) {
+        const remState = readStoredWaterReminder(currentUser);
+        const syncPayload: UserAccount = {
+          ...matchedAccount,
+          waterIntake: {
+            date: getTodayDateKey(),
+            glasses: localWater.count,
+            goalGlasses: effectiveGoal.targetGlasses,
+            targetLiters: effectiveGoal.targetLiters,
+            updatedAt: localWater.updatedAt > 0 ? new Date(localWater.updatedAt).toISOString() : new Date().toISOString(),
+            timezoneOffsetMinutes: -new Date().getTimezoneOffset(),
+            reminderEnabled: remState.enabled,
+            reminderIntervalMinutes: remState.intervalMinutes,
           },
         };
         setLocalAccountOverride(syncPayload);
@@ -2307,12 +2457,14 @@ export const GymApp: React.FC<GymAppProps> = ({
     nextCount: number,
     remEnabled = waterReminderEnabledRef.current,
     remInterval = waterReminderIntervalRef.current,
-    updatedAtIso = new Date().toISOString()
+    updatedAtIso = new Date().toISOString(),
+    goalOverride?: { targetGlasses: number; targetLiters: number }
   ) => {
     const todayKey = getTodayDateKey();
     const tzOffset = -new Date().getTimezoneOffset();
+    const goalInfo = goalOverride || computeWaterGoalFromBodyWeightEntries(bodyWeightEntries);
 
-    // Always sync live count to backend server cache so /water & closed-tab reminders stay current immediately
+    // Always sync live count & personalized target to backend server cache so /water & closed-tab reminders stay current immediately
     fetch('/api/water-intake/sync', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2321,6 +2473,8 @@ export const GymApp: React.FC<GymAppProps> = ({
         date: todayKey,
         timezoneOffsetMinutes: tzOffset,
         glasses: nextCount,
+        goalGlasses: goalInfo.targetGlasses,
+        targetLiters: goalInfo.targetLiters,
         updatedAt: updatedAtIso,
         reminderEnabled: remEnabled,
         reminderIntervalMinutes: remInterval,
@@ -2328,12 +2482,14 @@ export const GymApp: React.FC<GymAppProps> = ({
     }).catch(() => {});
 
     const baseAccount = matchedAccountRef.current;
-    if (!baseAccount || baseAccount.username?.toLowerCase().trim() === 'admin' || !baseAccount.password) return;
+    if (!baseAccount || baseAccount.username?.toLowerCase().trim() === 'admin') return;
     const nextAccount: UserAccount = {
       ...baseAccount,
       waterIntake: {
         date: todayKey,
         glasses: nextCount,
+        goalGlasses: goalInfo.targetGlasses,
+        targetLiters: goalInfo.targetLiters,
         updatedAt: updatedAtIso,
         timezoneOffsetMinutes: tzOffset,
         reminderEnabled: remEnabled,
@@ -2421,11 +2577,43 @@ export const GymApp: React.FC<GymAppProps> = ({
     setBodyWeightNotice(existingIdx >= 0 ? `Updated ${cleanDate} (${rounded} ${bodyWeightUnitInput})` : `Saved ${rounded} ${bodyWeightUnitInput} for ${cleanDate}`);
     setTimeout(() => setBodyWeightNotice(null), 3500);
 
+    const updatedGoal = computeWaterGoalFromBodyWeightEntries(nextList);
+    const todayKey = getTodayDateKey();
+    const tzOffset = -new Date().getTimezoneOffset();
+    const nowIso = new Date().toISOString();
+
+    fetch('/api/water-intake/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: currentUser,
+        date: todayKey,
+        timezoneOffsetMinutes: tzOffset,
+        glasses: waterGlassesRef.current,
+        goalGlasses: updatedGoal.targetGlasses,
+        targetLiters: updatedGoal.targetLiters,
+        updatedAt: nowIso,
+        reminderEnabled: waterReminderEnabledRef.current,
+        reminderIntervalMinutes: waterReminderIntervalRef.current,
+      }),
+    }).catch(() => {});
+
     const baseBwAccount = matchedAccountRef.current;
-    if (baseBwAccount && baseBwAccount.username?.toLowerCase().trim() !== 'admin' && baseBwAccount.password) {
+    if (baseBwAccount && baseBwAccount.username?.toLowerCase().trim() !== 'admin') {
       const nextAccount: UserAccount = {
         ...baseBwAccount,
         bodyWeightHistory: nextList,
+        waterIntake: {
+          ...(baseBwAccount.waterIntake || {}),
+          date: todayKey,
+          glasses: waterGlassesRef.current,
+          goalGlasses: updatedGoal.targetGlasses,
+          targetLiters: updatedGoal.targetLiters,
+          updatedAt: nowIso,
+          timezoneOffsetMinutes: tzOffset,
+          reminderEnabled: waterReminderEnabledRef.current,
+          reminderIntervalMinutes: waterReminderIntervalRef.current,
+        },
       };
       setLocalAccountOverride(nextAccount);
       saveUserAccountDoc(nextAccount).catch(() => {});
@@ -2436,55 +2624,37 @@ export const GymApp: React.FC<GymAppProps> = ({
     const nextList = bodyWeightEntries.filter(item => item.id !== entryId);
     setBodyWeightEntries(nextList);
     saveStoredBodyWeight(currentUser, nextList);
+    const updatedGoal = computeWaterGoalFromBodyWeightEntries(nextList);
+    const todayKey = getTodayDateKey();
+    const tzOffset = -new Date().getTimezoneOffset();
+    const nowIso = new Date().toISOString();
+
     const baseBwAccount = matchedAccountRef.current;
-    if (baseBwAccount && baseBwAccount.username?.toLowerCase().trim() !== 'admin' && baseBwAccount.password) {
+    if (baseBwAccount && baseBwAccount.username?.toLowerCase().trim() !== 'admin') {
       const nextAccount: UserAccount = {
         ...baseBwAccount,
         bodyWeightHistory: nextList,
+        waterIntake: {
+          ...(baseBwAccount.waterIntake || {}),
+          date: todayKey,
+          glasses: waterGlassesRef.current,
+          goalGlasses: updatedGoal.targetGlasses,
+          targetLiters: updatedGoal.targetLiters,
+          updatedAt: nowIso,
+          timezoneOffsetMinutes: tzOffset,
+          reminderEnabled: waterReminderEnabledRef.current,
+          reminderIntervalMinutes: waterReminderIntervalRef.current,
+        },
       };
       setLocalAccountOverride(nextAccount);
       saveUserAccountDoc(nextAccount).catch(() => {});
     }
   };
 
-  const latestBodyWeightInfo = useMemo(() => {
-    if (!bodyWeightEntries || bodyWeightEntries.length === 0) return null;
-    const sorted = [...bodyWeightEntries].sort((a, b) => {
-      const dCmp = a.date.localeCompare(b.date);
-      if (dCmp !== 0) return dCmp;
-      return (a.updatedAt || '').localeCompare(b.updatedAt || '');
-    });
-    const latest = sorted[sorted.length - 1];
-    const weightKg = latest.unit === 'lbs' ? latest.weight * 0.45359237 : latest.weight;
-    return {
-      entry: latest,
-      weightKg: Math.round(weightKg * 10) / 10,
-    };
-  }, [bodyWeightEntries]);
-
-  const waterGoalSummary = useMemo(() => {
-    const GLASS_LITERS = 0.25; // 250 ml per glass
-    if (latestBodyWeightInfo && latestBodyWeightInfo.weightKg > 0) {
-      // Standard hydration baseline: 35 ml (0.035 L) per kg of body weight
-      const targetLiters = Math.min(6.0, Math.max(1.2, Math.round(latestBodyWeightInfo.weightKg * 0.035 * 10) / 10));
-      const targetGlasses = Math.max(4, Math.round(targetLiters / GLASS_LITERS));
-      return {
-        hasWeight: true,
-        weightDisplay: `${latestBodyWeightInfo.entry.weight} ${latestBodyWeightInfo.entry.unit}`,
-        weightKg: latestBodyWeightInfo.weightKg,
-        targetLiters,
-        targetGlasses,
-      };
-    }
-    const defaultLiters = Number((WATER_DAILY_GOAL * GLASS_LITERS).toFixed(1));
-    return {
-      hasWeight: false,
-      weightDisplay: '',
-      weightKg: null as number | null,
-      targetLiters: defaultLiters,
-      targetGlasses: WATER_DAILY_GOAL,
-    };
-  }, [latestBodyWeightInfo]);
+  const waterGoalSummary = useMemo(
+    () => computeWaterGoalFromBodyWeightEntries(bodyWeightEntries),
+    [bodyWeightEntries]
+  );
 
   const handleQuickWaterWeightSave = (e: React.FormEvent) => {
     e.preventDefault();
@@ -2509,11 +2679,42 @@ export const GymApp: React.FC<GymAppProps> = ({
     saveStoredBodyWeight(currentUser, nextList);
     setQuickWaterWeightInput('');
 
+    const updatedGoal = computeWaterGoalFromBodyWeightEntries(nextList);
+    const tzOffset = -new Date().getTimezoneOffset();
+    const nowIso = new Date().toISOString();
+
+    fetch('/api/water-intake/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: currentUser,
+        date: today,
+        timezoneOffsetMinutes: tzOffset,
+        glasses: waterGlassesRef.current,
+        goalGlasses: updatedGoal.targetGlasses,
+        targetLiters: updatedGoal.targetLiters,
+        updatedAt: nowIso,
+        reminderEnabled: waterReminderEnabledRef.current,
+        reminderIntervalMinutes: waterReminderIntervalRef.current,
+      }),
+    }).catch(() => {});
+
     const baseBwAccount = matchedAccountRef.current;
-    if (baseBwAccount && baseBwAccount.username?.toLowerCase().trim() !== 'admin' && baseBwAccount.password) {
+    if (baseBwAccount && baseBwAccount.username?.toLowerCase().trim() !== 'admin') {
       const nextAccount: UserAccount = {
         ...baseBwAccount,
         bodyWeightHistory: nextList,
+        waterIntake: {
+          ...(baseBwAccount.waterIntake || {}),
+          date: today,
+          glasses: waterGlassesRef.current,
+          goalGlasses: updatedGoal.targetGlasses,
+          targetLiters: updatedGoal.targetLiters,
+          updatedAt: nowIso,
+          timezoneOffsetMinutes: tzOffset,
+          reminderEnabled: waterReminderEnabledRef.current,
+          reminderIntervalMinutes: waterReminderIntervalRef.current,
+        },
       };
       setLocalAccountOverride(nextAccount);
       saveUserAccountDoc(nextAccount).catch(() => {});
@@ -2531,25 +2732,35 @@ export const GymApp: React.FC<GymAppProps> = ({
     setIsUploadingBg(true);
     try {
       const dataUrl = await compressBackgroundImageToDataUrl(file);
-      const res = await fetch('/api/profile/background', {
+      const bgSettingId = getUserBgSettingId(currentUser);
+      const clampedDim = Math.min(95, Math.max(20, Math.round(userBgDimPercent)));
+
+      // Primary production persistence: Firestore adminSettings document (works across Vercel, Cloud Run & multi-device)
+      await saveAdminSettingDoc({
+        id: bgSettingId,
+        username: currentUser,
+        imageUrl: dataUrl,
+        dimPercent: clampedDim,
+        updatedAt: new Date().toISOString(),
+      } as AdminSetting);
+
+      setUserBgImageUrl(dataUrl);
+      setUserBgDimPercent(clampedDim);
+      saveStoredUserBg(currentUser, dataUrl, clampedDim);
+
+      // Optional best-effort local Node Express mirror (never throws if absent on Vercel serverless)
+      fetch('/api/profile/background', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           username: currentUser,
           fileName: file.name,
           dataUrl,
-          dimPercent: userBgDimPercent,
+          dimPercent: clampedDim,
         }),
-      });
-      const json = await res.json();
-      if (!res.ok || !json?.success || !json.background?.imageUrl) {
-        throw new Error(json?.error || 'Upload failed');
-      }
-      setUserBgImageUrl(json.background.imageUrl);
-      const nextDim = typeof json.background.dimPercent === 'number' ? json.background.dimPercent : userBgDimPercent;
-      setUserBgDimPercent(nextDim);
-      saveStoredUserBg(currentUser, json.background.imageUrl, nextDim);
-      setBgFeedback({ type: 'success', text: 'Your personal website background has been updated!' });
+      }).catch(() => {});
+
+      setBgFeedback({ type: 'success', text: 'Your personal website background has been updated and synced!' });
       setTimeout(() => setBgFeedback(null), 4000);
     } catch (err: any) {
       setBgFeedback({ type: 'error', text: err?.message || 'Failed to upload background image.' });
@@ -2566,6 +2777,14 @@ export const GymApp: React.FC<GymAppProps> = ({
     if (bgDimSaveTimerRef.current) clearTimeout(bgDimSaveTimerRef.current);
     bgDimSaveTimerRef.current = setTimeout(() => {
       if (!userBgImageUrl) return;
+      const bgSettingId = getUserBgSettingId(currentUser);
+      saveAdminSettingDoc({
+        id: bgSettingId,
+        username: currentUser,
+        imageUrl: userBgImageUrl,
+        dimPercent: clamped,
+        updatedAt: new Date().toISOString(),
+      } as AdminSetting).catch(() => {});
       fetch('/api/profile/background', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2579,15 +2798,23 @@ export const GymApp: React.FC<GymAppProps> = ({
     setUserBgImageUrl('');
     saveStoredUserBg(currentUser, '', 72);
     try {
-      await fetch(`/api/profile/background?username=${encodeURIComponent(currentUser)}`, {
+      const bgSettingId = getUserBgSettingId(currentUser);
+      await saveAdminSettingDoc({
+        id: bgSettingId,
+        username: currentUser,
+        imageUrl: '',
+        dimPercent: 72,
+        updatedAt: new Date().toISOString(),
+      } as AdminSetting);
+      fetch(`/api/profile/background?username=${encodeURIComponent(currentUser)}`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: currentUser }),
-      });
+      }).catch(() => {});
       setBgFeedback({ type: 'success', text: 'Background reset to default dark theme.' });
       setTimeout(() => setBgFeedback(null), 3500);
-    } catch {
-      // local state already cleared
+    } catch (err: any) {
+      setBgFeedback({ type: 'error', text: err?.message || 'Could not reset cloud background setting.' });
     }
   };
 
@@ -2631,6 +2858,7 @@ export const GymApp: React.FC<GymAppProps> = ({
     setIsSendingWaterAlert(true);
     try {
       const targetGlasses = waterGoalSummary.targetGlasses;
+      const targetLiters = waterGoalSummary.targetLiters;
       const note =
         liveGlasses >= targetGlasses
           ? 'Great work staying hydrated!'
@@ -2639,7 +2867,8 @@ export const GymApp: React.FC<GymAppProps> = ({
         displayName,
         liveGlasses,
         targetGlasses,
-        note
+        note,
+        targetLiters
       );
       const res = await sendDirectTelegramMessage(tgCfg.botToken, targetChat, msg);
       if (res.success) {
@@ -4168,16 +4397,16 @@ export const GymApp: React.FC<GymAppProps> = ({
                         />
                       </td>
                       <td className="px-1.5 py-1">
-                        <input
-                          value={row.targetRir || ''}
-                          onChange={(e) => {
-                            const next = [...worksheetDraft.exercises];
-                            next[rIdx] = { ...next[rIdx], targetRir: e.target.value };
-                            setWorksheetDraft({ ...worksheetDraft, exercises: next });
-                          }}
-                          placeholder="2"
-                          className="w-full bg-neutral-900 border border-white/10 rounded-lg px-2 py-1 text-xs text-sky-200 font-mono outline-none"
-                        />
+                        <span
+                          title="RIR / RIP is read-only from the uploaded workout sheet"
+                          className={`inline-flex items-center justify-center w-full rounded-lg px-2 py-1 text-xs font-mono border ${
+                            row.targetRir?.trim()
+                              ? 'bg-sky-500/10 border-sky-500/30 text-sky-200'
+                              : 'bg-neutral-900/50 border-white/5 text-neutral-600'
+                          }`}
+                        >
+                          {row.targetRir?.trim() || '—'}
+                        </span>
                       </td>
                       <td className="px-1.5 py-1">
                         <input
@@ -5089,7 +5318,7 @@ export const GymApp: React.FC<GymAppProps> = ({
                             Target RPE: {ex.targetRpe}
                           </span>
                         )}
-                        {showRir && ex.targetRir && (
+                        {ex.targetRir?.trim() && (
                           <span className="text-[11px] text-sky-200 font-mono font-semibold bg-sky-500/15 border border-sky-500/30 px-2 py-0.5 rounded-md">
                             Target RIR: {ex.targetRir}
                           </span>
@@ -5188,15 +5417,14 @@ export const GymApp: React.FC<GymAppProps> = ({
                                 className="bg-neutral-900 border border-white/15 rounded-lg px-2.5 py-1.5 text-amber-200 font-mono outline-none"
                               />
                             </label>
-                            <label className="flex flex-col gap-1">
-                              <span className="text-[10px] uppercase text-neutral-400 font-semibold">Target RIR (RIP / Reps in Reserve)</span>
-                              <input
-                                value={editDraft.targetRir}
-                                onChange={(e) => setEditDraft({ ...editDraft, targetRir: e.target.value })}
-                                placeholder="e.g. 2 or 1-2"
-                                className="bg-neutral-900 border border-white/15 rounded-lg px-2.5 py-1.5 text-sky-200 font-mono outline-none"
-                              />
-                            </label>
+                            {editDraft.targetRir?.trim() && (
+                              <div className="flex flex-col gap-1">
+                                <span className="text-[10px] uppercase text-neutral-400 font-semibold">Target RIR (from workout sheet)</span>
+                                <div className="bg-neutral-900/60 border border-sky-500/25 rounded-lg px-2.5 py-1.5 text-sky-200 font-mono select-text">
+                                  {editDraft.targetRir}
+                                </div>
+                              </div>
+                            )}
                             <label className="flex flex-col gap-1 sm:col-span-2">
                               <span className="text-[10px] uppercase text-neutral-400 font-semibold">Video URL</span>
                               <input
@@ -5298,151 +5526,151 @@ export const GymApp: React.FC<GymAppProps> = ({
                           </div>
                         </div>
 
-                        {/* column labels, phones only */}
-                        <div
-                          className={`grid ${
-                            showRpe && showRir
-                              ? 'grid-cols-[24px_minmax(0,1.2fr)_minmax(0,0.75fr)_minmax(0,0.6fr)_minmax(0,0.6fr)_auto]'
-                              : showRpe || showRir
-                              ? 'grid-cols-[26px_minmax(0,1.35fr)_minmax(0,0.8fr)_minmax(0,0.7fr)_auto]'
-                              : 'grid-cols-[28px_minmax(0,1.4fr)_minmax(0,0.9fr)_auto]'
-                          } gap-1 sm:hidden text-[9px] uppercase tracking-wider text-neutral-500 font-mono px-0.5`}
-                        >
-                          <span className="text-center">Set</span>
-                          <span>Weight</span>
-                          <span>Reps</span>
-                          {showRpe && <span>RPE</span>}
-                          {showRir && <span>RIR</span>}
-                          <span className="text-center">Rest</span>
-                        </div>
-
-                        <div className="space-y-1.5">
-                          {setEntries.map((setRow, sIdx) => {
-                            const prevForThisSet = prevWeekData?.setEntries[sIdx];
-                            const setUnit: WeightUnit = setRow.unit || planUnit;
-                            const setTimerKey = `${plan.id}__w${selectedWeek}__${ex.id}__s${sIdx}`;
-                            const isThisTimer = setRestTimer?.timerKey === setTimerKey;
-                            const isTimerRunning = isThisTimer && !!setRestTimer?.running;
-                            const isTimerDone = isThisTimer && !!setRestTimer?.finished;
-
-                            const rowGridClasses =
-                              showRpe && showRir
-                                ? 'grid-cols-[24px_minmax(0,1.2fr)_minmax(0,0.75fr)_minmax(0,0.6fr)_minmax(0,0.6fr)_auto] sm:grid-cols-[60px_140px_100px_84px_84px_auto]'
-                                : showRpe || showRir
-                                ? 'grid-cols-[26px_minmax(0,1.35fr)_minmax(0,0.8fr)_minmax(0,0.7fr)_auto] sm:grid-cols-[64px_150px_115px_96px_auto]'
-                                : 'grid-cols-[28px_minmax(0,1.4fr)_minmax(0,0.9fr)_auto] sm:grid-cols-[64px_165px_125px_auto]';
-
-                            return (
+                        {(() => {
+                          const hasSheetRirDisplay =
+                            (showRir || Boolean(ex.targetRir?.trim())) &&
+                            (Boolean(ex.targetRir?.trim()) || setEntries.some(s => (s.rir || '').trim() !== ''));
+                          return (
+                            <>
+                              {/* column labels, phones only */}
                               <div
-                                key={sIdx}
-                                className={`grid ${rowGridClasses} items-center gap-1 sm:gap-2`}
+                                className={`grid ${
+                                  showRpe && hasSheetRirDisplay
+                                    ? 'grid-cols-[24px_minmax(0,1.2fr)_minmax(0,0.75fr)_minmax(0,0.6fr)_minmax(0,0.55fr)_auto]'
+                                    : showRpe || hasSheetRirDisplay
+                                    ? 'grid-cols-[26px_minmax(0,1.35fr)_minmax(0,0.8fr)_minmax(0,0.65fr)_auto]'
+                                    : 'grid-cols-[28px_minmax(0,1.4fr)_minmax(0,0.9fr)_auto]'
+                                } gap-1 sm:hidden text-[9px] uppercase tracking-wider text-neutral-500 font-mono px-0.5`}
                               >
-                                <span
-                                  className={`h-11 sm:h-auto flex items-center justify-center text-[11px] font-mono font-bold border rounded-lg sm:py-1.5 ${
-                                    isSuperset
-                                      ? 'text-fuchsia-200 bg-fuchsia-500/20 border-fuchsia-400/35'
-                                      : 'text-red-300 bg-red-500/10 border-red-500/20'
-                                  }`}
-                                >
-                                  <span className="sm:hidden">{sIdx + 1}</span>
-                                  <span className="hidden sm:inline">Set {sIdx + 1}</span>
-                                </span>
+                                <span className="text-center">Set</span>
+                                <span>Weight</span>
+                                <span>Reps</span>
+                                {showRpe && <span>RPE</span>}
+                                {hasSheetRirDisplay && <span>RIR</span>}
+                                <span className="text-center">Rest</span>
+                              </div>
 
-                                {/* Weight */}
-                                <div className="relative flex items-center min-w-0">
-                                  <span className="hidden sm:block absolute left-2.5 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">Wt</span>
-                                  <input
-                                    type="text"
-                                    inputMode="decimal"
-                                    value={setRow.weight}
-                                    onChange={(e) => updateSetField(plan, selectedWeek, ex, sIdx, 'weight', e.target.value)}
-                                    onBlur={() => saveExerciseSets(plan, selectedWeek, ex)}
-                                    onKeyDown={(e) => {
-                                      if (e.key === 'Enter') {
-                                        e.preventDefault();
-                                        (e.currentTarget as HTMLInputElement).blur();
-                                      }
-                                    }}
-                                    placeholder={prevForThisSet?.weight || '0'}
-                                    aria-label={`Set ${sIdx + 1} Weight (${setUnit})`}
-                                    className="w-full min-w-0 h-11 sm:h-auto bg-neutral-900 border border-white/15 focus:border-red-500/70 rounded-lg pl-2 pr-10 sm:pl-8 sm:pr-11 sm:py-1.5 text-base sm:text-xs text-white font-mono outline-none"
-                                  />
-                                  <button
-                                    type="button"
-                                    onClick={() => updateSetField(plan, selectedWeek, ex, sIdx, 'unit', setUnit === 'kg' ? 'lbs' : 'kg')}
-                                    aria-label="Switch between kg and lbs"
-                                    className="absolute right-1 h-8 sm:h-auto px-1.5 sm:py-0.5 rounded-md bg-white/10 active:bg-white/25 text-[10px] font-bold uppercase text-neutral-200 cursor-pointer"
-                                  >
-                                    {setUnit}
-                                  </button>
-                                </div>
+                              <div className="space-y-1.5">
+                                {setEntries.map((setRow, sIdx) => {
+                                  const prevForThisSet = prevWeekData?.setEntries[sIdx];
+                                  const setUnit: WeightUnit = setRow.unit || planUnit;
+                                  const setTimerKey = `${plan.id}__w${selectedWeek}__${ex.id}__s${sIdx}`;
+                                  const isThisTimer = setRestTimer?.timerKey === setTimerKey;
+                                  const isTimerRunning = isThisTimer && !!setRestTimer?.running;
+                                  const isTimerDone = isThisTimer && !!setRestTimer?.finished;
+                                  const sheetRirDisplay = (setRow.rir || '').trim() || (ex.targetRir || '').trim();
 
-                                {/* Reps */}
-                                <label className="relative flex items-center min-w-0">
-                                  <span className="hidden sm:block absolute left-2 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">Reps</span>
-                                  <input
-                                    type="text"
-                                    inputMode="numeric"
-                                    value={setRow.reps}
-                                    onChange={(e) => updateSetField(plan, selectedWeek, ex, sIdx, 'reps', e.target.value)}
-                                    onBlur={() => saveExerciseSets(plan, selectedWeek, ex)}
-                                    onKeyDown={(e) => {
-                                      if (e.key === 'Enter') {
-                                        e.preventDefault();
-                                        (e.currentTarget as HTMLInputElement).blur();
-                                      }
-                                    }}
-                                    placeholder={prevForThisSet?.reps || '0'}
-                                    aria-label={`Set ${sIdx + 1} Reps`}
-                                    className="w-full min-w-0 h-11 sm:h-auto bg-neutral-900 border border-white/15 focus:border-red-500/70 rounded-lg px-2 sm:pl-9 sm:pr-2 sm:py-1.5 text-base sm:text-xs text-white font-mono outline-none"
-                                  />
-                                </label>
+                                  const rowGridClasses =
+                                    showRpe && hasSheetRirDisplay
+                                      ? 'grid-cols-[24px_minmax(0,1.2fr)_minmax(0,0.75fr)_minmax(0,0.6fr)_minmax(0,0.55fr)_auto] sm:grid-cols-[60px_140px_100px_84px_76px_auto]'
+                                      : showRpe || hasSheetRirDisplay
+                                      ? 'grid-cols-[26px_minmax(0,1.35fr)_minmax(0,0.8fr)_minmax(0,0.65fr)_auto] sm:grid-cols-[64px_150px_115px_88px_auto]'
+                                      : 'grid-cols-[28px_minmax(0,1.4fr)_minmax(0,0.9fr)_auto] sm:grid-cols-[64px_165px_125px_auto]';
 
-                                {/* Conditional RPE (only if sheet/plan includes RPE column) */}
-                                {showRpe && (
-                                  <label className="relative flex items-center min-w-0">
-                                    <span className="hidden sm:block absolute left-2 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">RPE</span>
-                                    <input
-                                      type="text"
-                                      inputMode="decimal"
-                                      value={setRow.rpe || ''}
-                                      onChange={(e) => updateSetField(plan, selectedWeek, ex, sIdx, 'rpe', e.target.value)}
-                                      onBlur={() => saveExerciseSets(plan, selectedWeek, ex)}
-                                      onKeyDown={(e) => {
-                                        if (e.key === 'Enter') {
-                                          e.preventDefault();
-                                          (e.currentTarget as HTMLInputElement).blur();
-                                        }
-                                      }}
-                                      placeholder={ex.targetRpe || prevForThisSet?.rpe || 'RPE'}
-                                      aria-label={`Set ${sIdx + 1} RPE`}
-                                      className="w-full min-w-0 h-11 sm:h-auto bg-neutral-900 border border-white/15 focus:border-amber-500/70 rounded-lg px-1.5 sm:pl-8 sm:pr-2 sm:py-1.5 text-base sm:text-xs text-amber-200 font-mono outline-none"
-                                    />
-                                  </label>
-                                )}
+                                  return (
+                                    <div
+                                      key={sIdx}
+                                      className={`grid ${rowGridClasses} items-center gap-1 sm:gap-2`}
+                                    >
+                                      <span
+                                        className={`h-11 sm:h-auto flex items-center justify-center text-[11px] font-mono font-bold border rounded-lg sm:py-1.5 ${
+                                          isSuperset
+                                            ? 'text-fuchsia-200 bg-fuchsia-500/20 border-fuchsia-400/35'
+                                            : 'text-red-300 bg-red-500/10 border-red-500/20'
+                                        }`}
+                                      >
+                                        <span className="sm:hidden">{sIdx + 1}</span>
+                                        <span className="hidden sm:inline">Set {sIdx + 1}</span>
+                                      </span>
 
-                                {/* Conditional RIR / RIP (only if sheet/plan includes RIR/RIP column) */}
-                                {showRir && (
-                                  <label className="relative flex items-center min-w-0">
-                                    <span className="hidden sm:block absolute left-2 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">RIR</span>
-                                    <input
-                                      type="text"
-                                      inputMode="decimal"
-                                      value={setRow.rir || ''}
-                                      onChange={(e) => updateSetField(plan, selectedWeek, ex, sIdx, 'rir', e.target.value)}
-                                      onBlur={() => saveExerciseSets(plan, selectedWeek, ex)}
-                                      onKeyDown={(e) => {
-                                        if (e.key === 'Enter') {
-                                          e.preventDefault();
-                                          (e.currentTarget as HTMLInputElement).blur();
-                                        }
-                                      }}
-                                      placeholder={ex.targetRir || prevForThisSet?.rir || 'RIR'}
-                                      aria-label={`Set ${sIdx + 1} RIR`}
-                                      className="w-full min-w-0 h-11 sm:h-auto bg-neutral-900 border border-white/15 focus:border-sky-500/70 rounded-lg px-1.5 sm:pl-8 sm:pr-2 sm:py-1.5 text-base sm:text-xs text-sky-200 font-mono outline-none"
-                                    />
-                                  </label>
-                                )}
+                                      {/* Weight */}
+                                      <div className="relative flex items-center min-w-0">
+                                        <span className="hidden sm:block absolute left-2.5 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">Wt</span>
+                                        <input
+                                          type="text"
+                                          inputMode="decimal"
+                                          value={setRow.weight}
+                                          onChange={(e) => updateSetField(plan, selectedWeek, ex, sIdx, 'weight', e.target.value)}
+                                          onBlur={() => saveExerciseSets(plan, selectedWeek, ex)}
+                                          onKeyDown={(e) => {
+                                            if (e.key === 'Enter') {
+                                              e.preventDefault();
+                                              (e.currentTarget as HTMLInputElement).blur();
+                                            }
+                                          }}
+                                          placeholder={prevForThisSet?.weight || '0'}
+                                          aria-label={`Set ${sIdx + 1} Weight (${setUnit})`}
+                                          className="w-full min-w-0 h-11 sm:h-auto bg-neutral-900 border border-white/15 focus:border-red-500/70 rounded-lg pl-2 pr-10 sm:pl-8 sm:pr-11 sm:py-1.5 text-base sm:text-xs text-white font-mono outline-none"
+                                        />
+                                        <button
+                                          type="button"
+                                          onClick={() => updateSetField(plan, selectedWeek, ex, sIdx, 'unit', setUnit === 'kg' ? 'lbs' : 'kg')}
+                                          aria-label="Switch between kg and lbs"
+                                          className="absolute right-1 h-8 sm:h-auto px-1.5 sm:py-0.5 rounded-md bg-white/10 active:bg-white/25 text-[10px] font-bold uppercase text-neutral-200 cursor-pointer"
+                                        >
+                                          {setUnit}
+                                        </button>
+                                      </div>
+
+                                      {/* Reps */}
+                                      <label className="relative flex items-center min-w-0">
+                                        <span className="hidden sm:block absolute left-2 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">Reps</span>
+                                        <input
+                                          type="text"
+                                          inputMode="numeric"
+                                          value={setRow.reps}
+                                          onChange={(e) => updateSetField(plan, selectedWeek, ex, sIdx, 'reps', e.target.value)}
+                                          onBlur={() => saveExerciseSets(plan, selectedWeek, ex)}
+                                          onKeyDown={(e) => {
+                                            if (e.key === 'Enter') {
+                                              e.preventDefault();
+                                              (e.currentTarget as HTMLInputElement).blur();
+                                            }
+                                          }}
+                                          placeholder={prevForThisSet?.reps || '0'}
+                                          aria-label={`Set ${sIdx + 1} Reps`}
+                                          className="w-full min-w-0 h-11 sm:h-auto bg-neutral-900 border border-white/15 focus:border-red-500/70 rounded-lg px-2 sm:pl-9 sm:pr-2 sm:py-1.5 text-base sm:text-xs text-white font-mono outline-none"
+                                        />
+                                      </label>
+
+                                      {/* Conditional RPE (only if sheet/plan includes RPE column) */}
+                                      {showRpe && (
+                                        <label className="relative flex items-center min-w-0">
+                                          <span className="hidden sm:block absolute left-2 text-[9px] uppercase font-mono text-neutral-500 pointer-events-none">RPE</span>
+                                          <input
+                                            type="text"
+                                            inputMode="decimal"
+                                            value={setRow.rpe || ''}
+                                            onChange={(e) => updateSetField(plan, selectedWeek, ex, sIdx, 'rpe', e.target.value)}
+                                            onBlur={() => saveExerciseSets(plan, selectedWeek, ex)}
+                                            onKeyDown={(e) => {
+                                              if (e.key === 'Enter') {
+                                                e.preventDefault();
+                                                (e.currentTarget as HTMLInputElement).blur();
+                                              }
+                                            }}
+                                            placeholder={ex.targetRpe || prevForThisSet?.rpe || 'RPE'}
+                                            aria-label={`Set ${sIdx + 1} RPE`}
+                                            className="w-full min-w-0 h-11 sm:h-auto bg-neutral-900 border border-white/15 focus:border-amber-500/70 rounded-lg px-1.5 sm:pl-8 sm:pr-2 sm:py-1.5 text-base sm:text-xs text-amber-200 font-mono outline-none"
+                                          />
+                                        </label>
+                                      )}
+
+                                      {/* Read-only RIR / RIP display (only rendered when RIR content exists in workout sheet) */}
+                                      {hasSheetRirDisplay && (
+                                        <div
+                                          title={sheetRirDisplay ? `Sheet RIR: ${sheetRirDisplay}` : 'No RIR value on this set'}
+                                          aria-label={`Set ${sIdx + 1} Sheet RIR`}
+                                          className={`h-11 sm:h-auto sm:py-1.5 px-2 rounded-lg border font-mono text-xs flex items-center justify-center sm:justify-between gap-1 select-text ${
+                                            sheetRirDisplay
+                                              ? 'bg-sky-950/35 border-sky-500/30 text-sky-200'
+                                              : 'bg-neutral-900/40 border-white/10 text-neutral-600'
+                                          }`}
+                                        >
+                                          <span className="hidden sm:inline text-[9px] uppercase text-sky-400/80">RIR</span>
+                                          <span className="truncate font-semibold">{sheetRirDisplay || '—'}</span>
+                                        </div>
+                                      )}
 
                                 {/* User-Controlled Per-Set Rest Timer */}
                                 <div className="flex items-center gap-1 justify-end shrink-0">
@@ -5508,6 +5736,9 @@ export const GymApp: React.FC<GymAppProps> = ({
                             );
                           })}
                         </div>
+                            </>
+                          );
+                        })()}
                       </div>
 
                       {/* PER-EXERCISE WEEK NOTE CHECKITEM (DISABLED BY DEFAULT UNTIL ENABLED) */}

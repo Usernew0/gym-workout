@@ -33,11 +33,20 @@ export interface FirestoreUserRecord {
   waterIntake?: {
     date?: string;
     glasses?: number;
+    goalGlasses?: number;
+    targetLiters?: number;
     updatedAt?: string;
     timezoneOffsetMinutes?: number;
     reminderEnabled?: boolean;
     reminderIntervalMinutes?: number;
   };
+  bodyWeightHistory?: Array<{
+    id?: string;
+    date?: string;
+    weight?: number;
+    unit?: string;
+    updatedAt?: string;
+  }>;
 }
 
 export interface FirestoreWorkoutPlanRecord {
@@ -280,6 +289,8 @@ function computePlanStats(plan: FirestoreWorkoutPlanRecord): {
 export interface ServerWaterIntakeSnapshot {
   date: string;
   glasses: number;
+  goalGlasses?: number;
+  targetLiters?: number;
   updatedAt: string;
   timezoneOffsetMinutes?: number;
   reminderEnabled?: boolean;
@@ -377,15 +388,63 @@ export function getUserTodayWaterGlasses(user: FirestoreUserRecord | null): numb
   return Number.isFinite(n) && n >= 0 ? Math.min(40, Math.floor(n)) : undefined;
 }
 
+export function computeUserWaterGoal(user: FirestoreUserRecord | null): {
+  goalGlasses: number;
+  targetLiters: number;
+} {
+  const GLASS_LITERS = 0.25;
+  const effectiveWater = resolveEffectiveUserWaterIntake(user);
+  const explicitGoal = Number(effectiveWater?.goalGlasses);
+  const explicitLiters = Number(effectiveWater?.targetLiters);
+
+  if (Number.isFinite(explicitGoal) && explicitGoal >= 4 && explicitGoal <= 40) {
+    const goalGlasses = Math.round(explicitGoal);
+    const targetLiters =
+      Number.isFinite(explicitLiters) && explicitLiters >= 0.5 && explicitLiters <= 10
+        ? Number(explicitLiters.toFixed(1))
+        : Number((goalGlasses * GLASS_LITERS).toFixed(1));
+    return { goalGlasses, targetLiters };
+  }
+
+  const history = Array.isArray(user?.bodyWeightHistory) ? user.bodyWeightHistory : [];
+  const validEntries = history
+    .filter((entry) => entry && Number.isFinite(Number(entry.weight)) && Number(entry.weight) > 0)
+    .sort((a, b) => {
+      const dateCmp = String(a.date || '').localeCompare(String(b.date || ''));
+      if (dateCmp !== 0) return dateCmp;
+      return String(a.updatedAt || '').localeCompare(String(b.updatedAt || ''));
+    });
+
+  if (validEntries.length > 0) {
+    const latest = validEntries[validEntries.length - 1];
+    const rawWeight = Number(latest.weight);
+    const weightKg = latest.unit === 'lbs' ? rawWeight * 0.45359237 : rawWeight;
+    if (Number.isFinite(weightKg) && weightKg > 0) {
+      const targetLiters = Math.min(6.0, Math.max(1.2, Math.round(weightKg * 0.035 * 10) / 10));
+      const goalGlasses = Math.max(4, Math.round(targetLiters / GLASS_LITERS));
+      return { goalGlasses, targetLiters };
+    }
+  }
+
+  return { goalGlasses: 8, targetLiters: 2.0 };
+}
+
 export function formatWaterIntakeTelegramMessageHtml(
   memberName: string,
   glassesToday: number,
   goalGlasses = 8,
   note?: string,
-  timezoneOffsetMinutes?: number
+  timezoneOffsetMinutes?: number,
+  targetLiters?: number
 ): string {
-  const remaining = Math.max(0, goalGlasses - glassesToday);
-  const pct = Math.min(100, Math.round((glassesToday / Math.max(1, goalGlasses)) * 100));
+  const safeGoal = Math.max(1, Math.round(goalGlasses || 8));
+  const consumedLiters = Number((glassesToday * 0.25).toFixed(2));
+  const resolvedTargetLiters =
+    typeof targetLiters === 'number' && Number.isFinite(targetLiters) && targetLiters > 0
+      ? Number(targetLiters.toFixed(2))
+      : Number((safeGoal * 0.25).toFixed(2));
+  const remaining = Math.max(0, safeGoal - glassesToday);
+  const pct = Math.min(100, Math.round((glassesToday / safeGoal) * 100));
   const bar = buildProgressBar(pct);
 
   let timeLabel = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -401,7 +460,7 @@ export function formatWaterIntakeTelegramMessageHtml(
   return (
     `💧 <b>Gym Workout — Water Intake Reminder</b>\n\n` +
     `Athlete: <b>${escapeHtml(memberName)}</b>\n` +
-    `Today's Intake: <b>${glassesToday} / ${goalGlasses}</b> glasses\n` +
+    `Today's Intake: <b>${glassesToday} / ${safeGoal}</b> glasses (<b>${consumedLiters} / ${resolvedTargetLiters} L</b>)\n` +
     `Progress: <code>${bar}</code>\n` +
     (remaining > 0
       ? `Remaining: <b>${remaining} glass${remaining === 1 ? '' : 'es'}</b> left for today's hydration target.\n`
@@ -759,8 +818,9 @@ export async function buildTelegramCommandReply(params: {
     }
 
     const effectiveWater = resolveEffectiveUserWaterIntake(linkedAccount);
-    const todayGlasses = getUserTodayWaterGlasses(linkedAccount) ?? 0;
-    const goal = 8;
+    const mergedUser = { ...linkedAccount, waterIntake: effectiveWater };
+    const todayGlasses = getUserTodayWaterGlasses(mergedUser) ?? 0;
+    const { goalGlasses: goal, targetLiters } = computeUserWaterGoal(mergedUser);
     const note =
       todayGlasses >= goal
         ? 'Great work staying hydrated!'
@@ -770,7 +830,8 @@ export async function buildTelegramCommandReply(params: {
       todayGlasses,
       goal,
       note,
-      effectiveWater?.timezoneOffsetMinutes
+      effectiveWater?.timezoneOffsetMinutes,
+      targetLiters
     );
   }
 

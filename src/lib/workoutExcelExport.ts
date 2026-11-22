@@ -1405,10 +1405,9 @@ export async function exportWorkoutPlanToExcel(
 }
 
 /**
- * Generates and downloads the Standard Upload Sheet template using universal split-neutral standard column names:
- * Col 1: Exercises (with generic Day / Split header rows inside Col 1 above each session)
- * Col 2: Sets | Col 3: Reps | Col 4: RPE | Col 5: RIR | Col 6: Weight (kg/lbs) | Col 7: Actual Reps | Col 8: Notes | Col 9: Video URL
- * Includes a second guide tab showing examples for any split (Push/Pull/Legs, Torso/Limbs, Upper/Lower, Pro/Bro Split).
+ * Generates and downloads the Standard Upload Sheet template with universal standard columns:
+ * Col 1: Day | Col 2: Exercises | Col 3: Sets | Col 4: Reps | Col 5: RPE | Col 6: RIR | Col 7: Weight (kg/lbs) | Col 8: Actual Reps | Col 9: Notes | Col 10: Video URL
+ * Includes a Column Guide tab explaining required and optional sheet fields without split-specific labels.
  */
 export async function buildStandardWorkoutTemplateWorkbook(
   unit: WeightUnit = 'kg'
@@ -1425,6 +1424,7 @@ export async function buildStandardWorkoutTemplateWorkbook(
   });
 
   const headers = [
+    'Day',
     'Exercises',
     'Sets',
     'Reps',
@@ -1438,7 +1438,7 @@ export async function buildStandardWorkoutTemplateWorkbook(
   const colCount = headers.length;
 
   const titleRow = ws.addRow([
-    'STANDARD WORKOUT SHEET — Works with Any Split (Day 1/2/3, Torso/Limbs, Push/Pull/Legs, Pro Split, Upper/Lower)',
+    'STANDARD WORKOUT SHEET TEMPLATE — Fill Day, Exercises, Sets, Reps, RPE, RIR, Weight, Actual Reps, Notes & Video URL',
   ]);
   ws.mergeCells(1, 1, 1, colCount);
   styleBannerRow(titleRow, colCount, 'FF111827', 'FFFFFFFF');
@@ -1446,75 +1446,58 @@ export async function buildStandardWorkoutTemplateWorkbook(
   const headerRow = ws.addRow(headers);
   styleHeaderRow(headerRow, colCount, 'FF1E293B');
 
-  const templateRows: Array<{ isDay?: boolean; values: Array<string | number> }> = [
-    { isDay: true, values: ['Day 1'] },
-    { values: ['Barbell Bench Press', 4, '8-10', '8', '2', unit === 'lbs' ? '175 / 185' : '80 / 85', '8 / 8', 'Control eccentric, pause on chest', 'https://www.youtube.com/watch?v=rT7DgCr-3pg'] },
-    { values: ['Incline Dumbbell Press', 3, '10-12', '8.5', '1-2', unit === 'lbs' ? '65' : '30', '10', '30° bench angle', 'https://www.youtube.com/watch?v=8iPEnn-ltC8'] },
-    { values: ['Lateral Raises', 4, '12-15', '9', '1', unit === 'lbs' ? '25' : '12', '', 'Strict form, no swinging', ''] },
-    { isDay: true, values: ['Day 2'] },
-    { values: ['Lat Pulldown', 4, '10-12', '8', '2', unit === 'lbs' ? '130' : '60', '10', 'Full stretch at top', 'https://www.youtube.com/watch?v=CAwf7n6Luuc'] },
-    { values: ['Seated Cable Row', 3, '10-12', '8', '2', unit === 'lbs' ? '140' : '65', '', 'Squeeze shoulder blades', ''] },
-    { isDay: true, values: ['Day 3'] },
-    { values: ['Barbell Squat', 4, '6-8', '8.5', '1-2', unit === 'lbs' ? '225' : '100', '6', 'Break parallel with brace', 'https://www.youtube.com/watch?v=ultWZbUMPL8'] },
-    { values: ['Romanian Deadlift', 3, '8-10', '8', '2', unit === 'lbs' ? '185' : '85', '', 'Hinge at hips, soft knees', ''] },
+  const templateRows: Array<Array<string | number>> = [
+    ['Day 1', 'Barbell Bench Press', 4, '8-10', '8', '2', unit === 'lbs' ? '175 / 185' : '80 / 85', '8 / 8', 'Control eccentric, pause on chest', 'https://www.youtube.com/watch?v=rT7DgCr-3pg'],
+    ['Day 1', 'Incline Dumbbell Press', 3, '10-12', '8.5', '1-2', unit === 'lbs' ? '65' : '30', '10', '30° bench angle', 'https://www.youtube.com/watch?v=8iPEnn-ltC8'],
+    ['Day 1', 'Lateral Raises', 4, '12-15', '9', '1', unit === 'lbs' ? '25' : '12', '12', 'Strict form, no swinging', ''],
+    ['Day 2', 'Lat Pulldown', 4, '10-12', '8', '2', unit === 'lbs' ? '130' : '60', '10', 'Full stretch at top', 'https://www.youtube.com/watch?v=CAwf7n6Luuc'],
+    ['Day 2', 'Seated Cable Row', 3, '10-12', '8', '2', unit === 'lbs' ? '140' : '65', '10', 'Squeeze shoulder blades', ''],
+    ['Day 3', 'Barbell Squat', 4, '6-8', '8.5', '1-2', unit === 'lbs' ? '225' : '100', '6', 'Break parallel with brace', 'https://www.youtube.com/watch?v=ultWZbUMPL8'],
+    ['Day 3', 'Romanian Deadlift', 3, '8-10', '8', '2', unit === 'lbs' ? '185' : '85', '8', 'Hinge at hips, soft knees', ''],
   ];
 
   const allRows: Array<Array<string | number>> = [headers];
-  let dataIdx = 0;
 
-  templateRows.forEach((item) => {
-    const r = ws.addRow(item.values);
-    if (item.isDay) {
-      r.height = 24;
-      ws.mergeCells(r.number, 1, r.number, colCount);
-      for (let c = 1; c <= colCount; c++) {
-        const cell = r.getCell(c);
-        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEF2F2' } };
-        cell.font = { name: 'Calibri', size: 11, bold: true, color: { argb: 'FF991B1B' } };
-        cell.border = {
-          top: { style: 'medium', color: { argb: 'FFEF4444' } },
-          bottom: { style: 'thin', color: { argb: 'FFFCA5A5' } },
-          left: THIN_BORDER.left,
-          right: THIN_BORDER.right,
-        };
-        cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
-      }
-      allRows.push([item.values[0]]);
-    } else {
-      r.height = 22;
-      styleDataRow(r, colCount, dataIdx % 2 === 1);
-      r.getCell(1).font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FF0F172A' } };
-      dataIdx++;
-      allRows.push(item.values);
-    }
+  templateRows.forEach((rowValues, idx) => {
+    const r = ws.addRow(rowValues);
+    r.height = 22;
+    styleDataRow(r, colCount, idx % 2 === 1);
+    r.getCell(1).font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FF991B1B' } };
+    r.getCell(2).font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FF0F172A' } };
+    allRows.push(rowValues);
   });
 
   applySheetColumnWidths(ws, allRows, 11, 44, 0);
   styleAllWorksheetCellsCentered(ws);
 
-  // Second Guide Tab: Standard Split & Multi-Week Column Reference (read as 'instructions' on upload)
+  // Second Guide Tab: Standard Column Reference (read as 'instructions' on upload)
   const wsGuide = wb.addWorksheet('Template Guide');
-  const guideHeaders = ['Feature / Split Style', 'How to Name Rows or Columns in Your Sheet', 'Example'];
-  const gBanner = wsGuide.addRow(['STANDARD UPLOAD TEMPLATE GUIDE (Any Training Split + Multi-Week Ready)', '', '']);
-  wsGuide.mergeCells(1, 1, 1, 3);
-  styleBannerRow(gBanner, 3, 'FF0F172A', 'FFFFFFFF');
+  const guideHeaders = ['Column Name', 'Requirement', 'Description', 'Example'];
+  const gBanner = wsGuide.addRow(['STANDARD SHEET COLUMN GUIDE — Required & Optional Data Fields', '', '', '']);
+  wsGuide.mergeCells(1, 1, 1, 4);
+  styleBannerRow(gBanner, 4, 'FF0F172A', 'FFFFFFFF');
   const gHead = wsGuide.addRow(guideHeaders);
-  styleHeaderRow(gHead, 3, 'FF1E293B');
+  styleHeaderRow(gHead, 4, 'FF1E293B');
 
-  const guideRows: Array<[string, string, string]> = [
-    ['Universal Standard Columns', 'Keep the standard column names on Row 2 across any training program', 'Exercises | Sets | Reps | RPE | RIR (or RIP) | Weight | Actual Reps | Notes | Video URL'],
-    ['Torso / Limbs Split', 'Put "Torso" and "Limbs" (or "Day 1 - Torso", "Day 2 - Limbs") inside Column 1 above each session', 'Torso / Limbs / Torso B / Limbs B'],
-    ['Pro / Bro Split', 'Put body-part day banners in Column 1 or separate tabs per day', 'Chest / Back / Shoulders / Arms / Legs'],
-    ['Push / Pull / Legs', 'Put "Push", "Pull", "Legs" (or "Day 1 - Push") in Column 1 or separate tabs', 'Push / Pull / Legs'],
-    ['Upper / Lower / Full Body', 'Put "Upper", "Lower", "Full Body" in Column 1', 'Upper A / Lower A / Full Body'],
-    ['Multi-Week Tracking', 'Add "Week 1 Weight (kg)", "Week 1 Reps", "Week 2 Weight (kg)", "Week 2 Reps"... OR add tabs named "Week 1", "Week 2"', 'Week 1 Weight (kg) | Week 1 Reps | Week 2 Weight (kg) | Week 2 Reps'],
+  const guideRows: Array<[string, string, string, string]> = [
+    ['Day', 'Recommended', 'Session or day label assigned to each exercise row', 'Day 1 / Day 2 / Day 3'],
+    ['Exercises', 'Required', 'Exercise name (one exercise per row)', 'Barbell Bench Press'],
+    ['Sets', 'Required', 'Target number of working sets (or combined "4 x 8-10")', '4'],
+    ['Reps', 'Required', 'Target rep count or rep range', '8-10'],
+    ['RPE', 'Optional', 'Target or logged Rate of Perceived Exertion (1-10)', '8'],
+    ['RIR', 'Optional', 'Target or logged Reps in Reserve (RIR / RIP)', '2'],
+    [`Weight (${unit})`, 'Optional', 'Pre-filled or logged weight per set ("80" or "80 / 85")', unit === 'lbs' ? '175 / 185' : '80 / 85'],
+    ['Actual Reps', 'Optional', 'Completed reps per set ("8" or "8 / 8")', '8 / 8'],
+    ['Notes', 'Optional', 'Coaching cues, tempo, rest time, or instructions', 'Control eccentric, pause on chest'],
+    ['Video URL', 'Optional', 'Demo video link (URL or Excel hyperlink)', 'https://www.youtube.com/watch?v=...'],
+    ['Week 2..N Columns', 'Optional', `Add "Week 2 Weight (${unit})", "Week 2 Reps", "Week 2 RIR", "Week 2 Notes" (or separate "Week 2" tabs) for multi-week logs`, `Week 2 Weight (${unit}) | Week 2 Reps`],
   ];
   guideRows.forEach((gr, idx) => {
     const added = wsGuide.addRow(gr);
-    styleDataRow(added, 3, idx % 2 === 1);
+    styleDataRow(added, 4, idx % 2 === 1);
     added.height = 24;
   });
-  applySheetColumnWidths(wsGuide, [guideHeaders, ...guideRows], 18, 62, 0);
+  applySheetColumnWidths(wsGuide, [guideHeaders, ...guideRows], 16, 54, 0);
   styleAllWorksheetCellsCentered(wsGuide);
 
   return { wb, filename: 'gym-standard-workout-template.xlsx' };

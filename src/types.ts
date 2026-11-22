@@ -25,6 +25,8 @@ export interface UserAccount {
   waterIntake?: {
     date: string;
     glasses: number;
+    goalGlasses?: number;
+    targetLiters?: number;
     updatedAt?: string;
     timezoneOffsetMinutes?: number;
     reminderEnabled?: boolean;
@@ -157,6 +159,9 @@ export interface AdminSetting {
   twoFactorSecret?: string;
   twoFactorBackupCodes?: string[];
   twoFactorCreatedAt?: string;
+  imageUrl?: string;
+  dimPercent?: number;
+  updatedAt?: string;
 }
 
 export interface UserActivityLog {

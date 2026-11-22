@@ -1197,15 +1197,16 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
             Standard Sheet Column Layout
           </div>
           <p className="text-[11px] text-neutral-400 leading-relaxed">
-            <strong className="text-white">Col 1:</strong> Exercises (put split/day headers like <code className="text-amber-300">Day 1</code>, <code className="text-amber-300">Torso</code>, <code className="text-amber-300">Limbs</code>, <code className="text-amber-300">Chest</code>, or <code className="text-amber-300">Push</code> above each session) ·{' '}
-            <strong className="text-white">Col 2:</strong> Sets ·{' '}
-            <strong className="text-white">Col 3:</strong> Reps ·{' '}
-            <strong className="text-white">Col 4:</strong> RPE ·{' '}
-            <strong className="text-white">Col 5:</strong> RIR / RIP ·{' '}
-            <strong className="text-white">Col 6:</strong> Weight ({weightUnit}) ·{' '}
-            <strong className="text-white">Col 7:</strong> Actual Reps ·{' '}
-            <strong className="text-white">Col 8:</strong> Notes ·{' '}
-            <strong className="text-white">Col 9:</strong> Video URL
+            <strong className="text-white">Col 1:</strong> Day ·{' '}
+            <strong className="text-white">Col 2:</strong> Exercises ·{' '}
+            <strong className="text-white">Col 3:</strong> Sets ·{' '}
+            <strong className="text-white">Col 4:</strong> Reps ·{' '}
+            <strong className="text-white">Col 5:</strong> RPE ·{' '}
+            <strong className="text-white">Col 6:</strong> RIR / RIP ·{' '}
+            <strong className="text-white">Col 7:</strong> Weight ({weightUnit}) ·{' '}
+            <strong className="text-white">Col 8:</strong> Actual Reps ·{' '}
+            <strong className="text-white">Col 9:</strong> Notes ·{' '}
+            <strong className="text-white">Col 10:</strong> Video URL
           </p>
         </div>
         <button
@@ -1525,7 +1526,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
               value={newDayInput}
               onChange={(e) => setNewDayInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addCustomDayHeader(); } }}
-              placeholder="Add day / split header (e.g. Day 1, Torso, Limbs, Chest)"
+              placeholder="Add day header (e.g. Day 1, Day 2, Day 3)"
               className="bg-neutral-950 border border-white/10 focus:border-amber-500/60 rounded-lg px-2.5 py-1.5 text-xs text-white outline-none flex-1 min-w-[200px]"
             />
             <button
@@ -1554,7 +1555,7 @@ export const SheetUploader: React.FC<SheetUploaderProps> = ({
                 setManualTitle(e.target.value);
               }
             }}
-            placeholder="e.g. Torso / Limbs — Week 1 (or any split)"
+            placeholder="e.g. 4-Week Program — Phase 1"
             className="bg-neutral-900 border border-white/10 focus:border-red-500/60 rounded-xl px-3 py-2 text-sm text-white outline-none"
           />
         </label>

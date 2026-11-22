@@ -1283,17 +1283,24 @@ export function formatWaterIntakeTelegramMessage(
   memberName: string,
   glassesToday: number,
   goalGlasses = 8,
-  note?: string
+  note?: string,
+  targetLiters?: number
 ): string {
-  const remaining = Math.max(0, goalGlasses - glassesToday);
-  const pct = Math.min(100, Math.round((glassesToday / Math.max(1, goalGlasses)) * 100));
+  const safeGoal = Math.max(1, Math.round(goalGlasses || 8));
+  const consumedLiters = Number((glassesToday * 0.25).toFixed(2));
+  const resolvedTargetLiters =
+    typeof targetLiters === 'number' && Number.isFinite(targetLiters) && targetLiters > 0
+      ? Number(targetLiters.toFixed(2))
+      : Number((safeGoal * 0.25).toFixed(2));
+  const remaining = Math.max(0, safeGoal - glassesToday);
+  const pct = Math.min(100, Math.round((glassesToday / safeGoal) * 100));
   const filled = Math.round(pct / 10);
   const bar = `${'█'.repeat(filled)}${'░'.repeat(10 - filled)} ${pct}%`;
 
   return (
     `💧 <b>Gym Workout — Water Intake Reminder</b>\n\n` +
     `Athlete: <b>${escapeHtml(memberName)}</b>\n` +
-    `Today's Intake: <b>${glassesToday} / ${goalGlasses}</b> glasses\n` +
+    `Today's Intake: <b>${glassesToday} / ${safeGoal}</b> glasses (<b>${consumedLiters} / ${resolvedTargetLiters} L</b>)\n` +
     `Progress: <code>${bar}</code>\n` +
     (remaining > 0
       ? `Remaining: <b>${remaining} glass${remaining === 1 ? '' : 'es'}</b> left for today's hydration target.\n`

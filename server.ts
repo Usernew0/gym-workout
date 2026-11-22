@@ -7,6 +7,7 @@ import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   TELEGRAM_BOT_COMMANDS,
+  computeUserWaterGoal,
   escapeHtml,
   exportServerWaterIntakeOverrides,
   fetchFirestoreTelegramConfig,
@@ -475,7 +476,7 @@ Return a structured JSON object containing:
 
         const mergedUser = { ...user, waterIntake: effectiveWater };
         const glasses = getUserTodayWaterGlasses(mergedUser) ?? 0;
-        const goal = 8;
+        const { goalGlasses: goal, targetLiters } = computeUserWaterGoal(mergedUser);
         const memberName = user.displayName?.trim() || user.username;
         const note =
           glasses >= goal
@@ -486,7 +487,8 @@ Return a structured JSON object containing:
           glasses,
           goal,
           note,
-          effectiveWater?.timezoneOffsetMinutes
+          effectiveWater?.timezoneOffsetMinutes,
+          targetLiters
         );
 
         try {
@@ -532,6 +534,8 @@ Return a structured JSON object containing:
         username,
         date,
         glasses,
+        goalGlasses,
+        targetLiters,
         updatedAt,
         timezoneOffsetMinutes,
         reminderEnabled,
@@ -542,9 +546,17 @@ Return a structured JSON object containing:
         return res.status(400).json({ success: false, error: 'Missing username or date' });
       }
       const cleanGlasses = Math.max(0, Math.min(40, Math.floor(Number(glasses) || 0)));
+      const parsedGoal = Number(goalGlasses);
+      const parsedLiters = Number(targetLiters);
       upsertServerWaterIntakeOverride(uname, {
         date: String(date),
         glasses: cleanGlasses,
+        ...(Number.isFinite(parsedGoal) && parsedGoal >= 4 && parsedGoal <= 40
+          ? { goalGlasses: Math.round(parsedGoal) }
+          : {}),
+        ...(Number.isFinite(parsedLiters) && parsedLiters >= 0.5 && parsedLiters <= 10
+          ? { targetLiters: Number(parsedLiters.toFixed(2)) }
+          : {}),
         updatedAt: typeof updatedAt === 'string' && updatedAt ? updatedAt : new Date().toISOString(),
         ...(typeof timezoneOffsetMinutes === 'number' && Number.isFinite(timezoneOffsetMinutes)
           ? { timezoneOffsetMinutes }
